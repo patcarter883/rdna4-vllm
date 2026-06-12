@@ -1,62 +1,69 @@
-# Fully-from-source gfx1201 build: compile the three wheels in-container instead
-# of fetching them from a Release. Use this for full reproducibility / when you
-# don't trust prebuilt binaries. SLOW: ~2-4h (flash-attention alone is ~2h /
-# 2669 CK FMHA steps). For the fast path use the default Dockerfile.
+# Fully-from-source RDNA4 build: compile the three wheels in-container instead of
+# fetching them from a Release. Use this for full reproducibility, when you don't
+# trust prebuilt binaries, or — importantly — to target **gfx1200** (Navi44: RX
+# 9060 XT / 9060), since the published Release wheels are gfx1201-only and AMD code
+# objects are arch-exact. SLOW: ~2-4h (flash-attention alone is ~2h / 2669 CK FMHA
+# steps); a fat gfx1200;gfx1201 build is slower again. For the fast path on a 9070
+# (gfx1201) use the default Dockerfile.
 #
+#   # both RDNA4 dies (default):
 #   docker compose -f docker-compose.yml -f docker-compose.fromsource.yml build
-# (or)
-#   docker build -f Dockerfile.fromsource -t vllm-gfx1201:latest .
+#   # one die only (halves build time), e.g. a 9060:
+#   docker build -f Dockerfile.fromsource --build-arg GPU_ARCHS=gfx1200 -t vllm-rdna4 .
 #
-# PREREQUISITE: the three PATCHED source trees must be reachable as git refs.
-# They were developed as local branches; push them (or fork + cherry-pick the
-# commits below) and set the *_REPO / *_REF build-args. Exact commits the wheels
-# were built from:
-#   vllm            (branch gfx1201) @ 29db1b1b3   (6ca428e89/0595e16a6/c51747f13 + w4a8 WNA16 route)
-#   aiter           (branch gfx1201) @ 51eeb39d8
-#   flash-attention (branch gfx1201) @ 675dc40f
-# Submodule/pin gotchas: flash-attention needs `csrc/composable_kernel` inited;
-# aiter must build with PREBUILD_KERNELS=0 on gfx1201.
+# Builds from the patched forks. Tips (gfx1201 branch) with gfx1200 enabled:
+#   vllm            @ 414ae057e   (_ON_GFX1200/on_gfx1200, aiter gate, fat w4a8)
+#   aiter           @ 971f2e583   (gfx1200 CU-num + LDS-cap)
+#   flash-attention @ 675dc40f    (enable_wmma already covers gfx11/gfx12)
+# Gotchas: flash-attention needs `csrc/composable_kernel` inited; aiter must build
+# with PREBUILD_KERNELS=0 on RDNA4.
 
 ARG BASE_IMAGE=rocm/vllm-dev:nightly-therock714
+# Default fat binary covers BOTH RDNA4 dies. Override to a single arch (gfx1200
+# or gfx1201) to roughly halve build time if you only have one card type.
+ARG GPU_ARCHS=gfx1200;gfx1201
 
 # ===========================================================================
-# Stage 1: build the three gfx1201 wheels from source.
+# Stage 1: build the three RDNA4 wheels from source.
 # ===========================================================================
 FROM ${BASE_IMAGE} AS builder
-ENV GPU_ARCHS=gfx1201 PYTORCH_ROCM_ARCH=gfx1201 AITER_ROCM_ARCH=gfx1201 CU_NUM=64 MAX_JOBS=16
+ARG GPU_ARCHS
+ENV GPU_ARCHS=${GPU_ARCHS} PYTORCH_ROCM_ARCH=${GPU_ARCHS} AITER_ROCM_ARCH=${GPU_ARCHS} MAX_JOBS=16
 # TheRock LLVM bin (ld.lld / amdclang) — required for FlyDSL AOT compiles.
 ENV PATH=/opt/rocm/lib/llvm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 ARG AITER_REPO=https://github.com/patcarter883/aiter-gfx1201.git
-ARG AITER_REF=51eeb39d8
+ARG AITER_REF=971f2e583
 ARG FA_REPO=https://github.com/patcarter883/flash-attention-gfx1201.git
 ARG FA_REF=675dc40f
 ARG VLLM_REPO=https://github.com/patcarter883/vllm-gfx1201.git
-ARG VLLM_REF=29db1b1b3
+ARG VLLM_REF=414ae057e
 
 RUN pip install -U "setuptools-scm" "vcs_versioning" packaging psutil ninja || true
 
-# aiter
+# aiter — PREBUILD_KERNELS=0 on RDNA4 (kernels JIT at runtime; PREBUILD hardcodes a
+# gfx950 matrix that fails). CU_NUM is irrelevant with PREBUILD=0 (no baked kernels).
 RUN git clone "$AITER_REPO" /src/aiter && cd /src/aiter && git checkout "$AITER_REF" && \
     git submodule update --init --recursive || true && \
-    GPU_ARCHS=gfx1201 CU_NUM=64 PREBUILD_KERNELS=0 python setup.py bdist_wheel && \
+    PREBUILD_KERNELS=0 python setup.py bdist_wheel && \
     mkdir -p /wheels && cp dist/amd_aiter-*.whl /wheels/
 
-# flash-attention (CK submodule required; ~2h)
+# flash-attention (CK submodule required; ~2h, more for a fat build)
 RUN git clone "$FA_REPO" /src/fa && cd /src/fa && git checkout "$FA_REF" && \
     git submodule update --init csrc/composable_kernel && \
-    GPU_ARCHS=gfx1201 python setup.py bdist_wheel && cp dist/flash_attn-*.whl /wheels/
+    python setup.py bdist_wheel && cp dist/flash_attn-*.whl /wheels/
 
 # vLLM (relabel the stale setuptools_scm tag so version gates behave)
 RUN git clone "$VLLM_REPO" /src/vllm && cd /src/vllm && git checkout "$VLLM_REF" && \
-    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM=0.22.0 GPU_ARCHS=gfx1201 PYTORCH_ROCM_ARCH=gfx1201 \
+    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM=0.22.0 \
     python setup.py bdist_wheel && cp dist/vllm-*.whl /wheels/
 
 # ===========================================================================
 # Stage 2: assemble (same as the default Dockerfile, but wheels come from stage 1).
 # ===========================================================================
 FROM ${BASE_IMAGE}
-ENV PYTORCH_ROCM_ARCH=gfx1201 GPU_ARCHS=gfx1201 AITER_ROCM_ARCH=gfx1201
+ARG GPU_ARCHS
+ENV PYTORCH_ROCM_ARCH=${GPU_ARCHS} GPU_ARCHS=${GPU_ARCHS} AITER_ROCM_ARCH=${GPU_ARCHS}
 
 COPY --from=builder /wheels/ /tmp/gfx1201-wheels/
 RUN set -e; \
@@ -81,7 +88,8 @@ COPY w4a8_fp8_wmma/ /opt/w4a8_fp8_wmma/
 RUN set -e; \
     if [ "$WITH_W4A8" = "1" ]; then \
       export PATH="$ROCM_PATH/lib/llvm/bin:$PATH"; \
-      cd /opt/w4a8_fp8_wmma && GPU_ARCHS=gfx1201 pip install . --no-build-isolation --no-deps; \
+      # setup.py reads GPU_ARCHS (env above) -> fat gfx1200;gfx1201 kernel by default.
+      cd /opt/w4a8_fp8_wmma && pip install . --no-build-isolation --no-deps; \
       # Verify from / after removing the source tree (else cwd shadows the install).
       cd / && rm -rf /opt/w4a8_fp8_wmma; \
       python3 -c "import w4a8_fp8_wmma, w4a8_fp8_wmma._C; print('[w4a8] import OK')"; \

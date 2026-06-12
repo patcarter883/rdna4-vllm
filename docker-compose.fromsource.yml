@@ -1,18 +1,27 @@
 # Overlay that switches every profile to the from-source Dockerfile (compile the
-# three wheels in-container, ~2-4h, no Release needed).
+# three wheels in-container, ~2-4h, no Release needed). This is also the route to
+# target gfx1200 (RX 9060 XT / 9060), since the published wheels are gfx1201-only.
 #
+#   # both RDNA4 dies (default GPU_ARCHS=gfx1200;gfx1201):
 #   docker compose -f docker-compose.yml -f docker-compose.fromsource.yml \
-#     --profile tp2-baseline up --build
+#     --profile single up --build
+#   # one die only (halves build time): set GPU_ARCHS in .env, e.g. GPU_ARCHS=gfx1200
 #
-# Set the *_REPO / *_REF build-args (see Dockerfile.fromsource) to point at your
-# pushed/forked patched trees.
+# Override the *_REPO / *_REF build-args (see Dockerfile.fromsource) to build from
+# your own forks.
 services:
   tp2-baseline:
     build:
       dockerfile: Dockerfile.fromsource
+      args:
+        GPU_ARCHS: ${GPU_ARCHS:-gfx1200;gfx1201}
   tp2-w4a8:
     build:
       dockerfile: Dockerfile.fromsource
+      args:
+        GPU_ARCHS: ${GPU_ARCHS:-gfx1200;gfx1201}
   single:
     build:
       dockerfile: Dockerfile.fromsource
+      args:
+        GPU_ARCHS: ${GPU_ARCHS:-gfx1200;gfx1201}

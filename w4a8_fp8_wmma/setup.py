@@ -15,14 +15,19 @@ import os
 from setuptools import setup, find_packages
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
-TARGET_ARCH = os.environ.get("GPU_ARCHS", "gfx1201").split(";")[0]
+# Accept one or more RDNA4 archs (";" or "," separated). Default builds a fat
+# binary covering BOTH RDNA4 dies — gfx1200 (Navi44: RX 9060 XT / 9060) and
+# gfx1201 (Navi48: RX 9070 XT / 9070) — so one .so runs on either card. AMD code
+# objects are arch-exact, so a single-arch build will NOT load on the other die.
+TARGET_ARCHS = [a for a in os.environ.get("GPU_ARCHS", "gfx1200;gfx1201")
+                .replace(",", ";").split(";") if a]
 
 extra_compile_args = {
     "cxx": ["-O3", "-std=c++17", "-fPIC"],
     "nvcc": [
         "-O3",
         "-std=c++17",
-        f"--offload-arch={TARGET_ARCH}",
+        *[f"--offload-arch={a}" for a in TARGET_ARCHS],
         "-Wno-unused-result",
         "-Wno-unused-variable",
     ],

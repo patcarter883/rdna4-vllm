@@ -93,6 +93,41 @@ means routing the ViT through flash_attn / disabling AOTriton SDPA — out of sc
 
 ---
 
+## gfx1200 (RX 9060 XT / 9060) — yes, you're invited
+
+gfx1200 (Navi 44) is the smaller RDNA4 die and shares the exact ISA this stack targets
+(FP8 WMMA, wave32, no TDM). It's fully enabled in the code — the vLLM platform gate
+(`on_gfx1200()`), the aiter arch tables, and the W4A8 kernel (which gates on
+`on_gfx12x()` and builds a fat `gfx1200;gfx1201` binary by default). So a 9060 is a
+first-class target here, not an afterthought.
+
+**Build-and-run today (works now), one command:**
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.fromsource.yml \
+  --profile single up --build
+# only have a 9060? put GPU_ARCHS=gfx1200 in .env first to halve the build
+```
+
+This compiles a fat `gfx1200;gfx1201` stack in-container (~2-4h, unattended) and serves.
+Why from source: the published Release wheels are gfx1201-only, and AMD GPU code objects
+are arch-exact — a gfx1201 binary won't load on a gfx1200 device.
+
+**Instant prebuilt path (no building):** fat `gfx1200;gfx1201` Release wheels are being
+published so a 9060 can use the normal `docker compose --profile … up --build` with zero
+compiling — track it on [issue #2](https://github.com/patcarter883/rdna4-vllm/issues/2);
+this section flips to lead with it the moment they land.
+
+> ⚠️ **Untested on hardware** — there's no gfx1200 card in the lab. The code path is
+> complete and the identical RDNA4 stack is validated on gfx1201, but a 9060 owner should
+> expect to shake out the first real-hardware bugs (please post on issue #2!). Notes: the
+> aiter A8W8 tuning configs and the kernel crossover cache were tuned on gfx1201's 64-CU
+> die, so they'll be suboptimal — not broken — on the 32-CU Navi 44; and the 35B MoE
+> needs ~23 GB, i.e. two **16 GB** 9060 XTs (the 8 GB cards host only smaller models via
+> the `single` profile).
+
+---
+
 ## The W4A8-FP8-WMMA MoE kernel
 
 `w4a8_fp8_wmma/` is a custom HIP kernel that expands packed INT4 expert weights to
