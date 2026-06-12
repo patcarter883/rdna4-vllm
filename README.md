@@ -12,6 +12,7 @@
   <img src="https://img.shields.io/badge/ROCm-TheRock_7.14-ED1C24?logo=amd&logoColor=white" alt="ROCm" />
   <img src="https://img.shields.io/badge/vLLM-0.22.0-4B2E83" alt="vLLM" />
   <img src="https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white" alt="Docker" />
+  <a href="https://github.com/patcarter883/rdna4-vllm/actions/workflows/build-image.yml"><img src="https://github.com/patcarter883/rdna4-vllm/actions/workflows/build-image.yml/badge.svg" alt="build-image" /></a>
 </p>
 
 ---
