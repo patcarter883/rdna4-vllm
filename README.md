@@ -17,12 +17,12 @@
 
 ---
 
-This repo brings up [vLLM](https://github.com/vllm-project/vllm) on **AMD RDNA4
-(gfx1201)** GPUs — the RX 9070 XT and RX 9070 — which the stock ROCm vLLM image
-does not support. It ships three prebuilt gfx1201 wheels (vLLM, aiter,
-flash-attention), the two source fixes needed to load Qwen3.5/3.6 MoE models, and
-an optional **W4A8-FP8-WMMA MoE kernel**. The goal is: clone, set one env var,
-`docker compose up`.
+This repo brings up [vLLM](https://github.com/vllm-project/vllm) on **AMD RDNA4** GPUs —
+gfx1201 (RX 9070 XT / 9070) and gfx1200 (RX 9060 XT / 9060) — which the stock ROCm vLLM
+image does not support. It ships three prebuilt **fat `gfx1200;gfx1201`** wheels (vLLM,
+aiter, flash-attention) that run on either die, the two source fixes needed to load
+Qwen3.5/3.6 MoE models, and an optional **W4A8-FP8-WMMA MoE kernel**. The goal is: clone,
+set one env var, `docker compose up`.
 
 > ⚠️ **This is overwhelmingly other people's work.** The serving engine is vLLM;
 > the kernels are AMD aiter, Dao-AILab flash-attention, and Composable Kernel; the
@@ -93,38 +93,32 @@ means routing the ViT through flash_attn / disabling AOTriton SDPA — out of sc
 
 ---
 
-## gfx1200 (RX 9060 XT / 9060) — yes, you're invited
+## gfx1200 (RX 9060 XT / 9060) — same fast path, no extra steps
 
 gfx1200 (Navi 44) is the smaller RDNA4 die and shares the exact ISA this stack targets
-(FP8 WMMA, wave32, no TDM). It's fully enabled in the code — the vLLM platform gate
-(`on_gfx1200()`), the aiter arch tables, and the W4A8 kernel (which gates on
-`on_gfx12x()` and builds a fat `gfx1200;gfx1201` binary by default). So a 9060 is a
-first-class target here, not an afterthought.
-
-**Build-and-run today (works now), one command:**
+(FP8 WMMA, wave32, no TDM), so it's a first-class target. **The default Release wheels
+are fat `gfx1200;gfx1201`** — one set runs on either die — so a 9060 uses the **same
+`docker compose up`** as a 9070, nothing special required:
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.fromsource.yml \
-  --profile single up --build
-# only have a 9060? put GPU_ARCHS=gfx1200 in .env first to halve the build
+docker compose --profile single up --build      # or tp2-baseline on two 16 GB 9060 XTs
 ```
 
-This compiles a fat `gfx1200;gfx1201` stack in-container (~2-4h, unattended) and serves.
-Why from source: the published Release wheels are gfx1201-only, and AMD GPU code objects
-are arch-exact — a gfx1201 binary won't load on a gfx1200 device.
+(How: AMD GPU code objects are arch-exact, so the wheels carry *both* arches' objects —
+verified: flash-attn 2662 gfx1200 + 2662 gfx1201; the vLLM `_C/_moe_C/_rocm_C` likewise;
+aiter JITs per-arch at runtime. The W4A8 kernel is built fat in-image too.)
 
-**Instant prebuilt path (no building):** fat `gfx1200;gfx1201` Release wheels are being
-published so a 9060 can use the normal `docker compose --profile … up --build` with zero
-compiling — track it on [issue #2](https://github.com/patcarter883/rdna4-vllm/issues/2);
-this section flips to lead with it the moment they land.
+A from-source build (`docker-compose.fromsource.yml`, `GPU_ARCHS` selectable) is there if
+you want to compile it yourself or trim to one die.
 
-> ⚠️ **Untested on hardware** — there's no gfx1200 card in the lab. The code path is
-> complete and the identical RDNA4 stack is validated on gfx1201, but a 9060 owner should
-> expect to shake out the first real-hardware bugs (please post on issue #2!). Notes: the
-> aiter A8W8 tuning configs and the kernel crossover cache were tuned on gfx1201's 64-CU
-> die, so they'll be suboptimal — not broken — on the 32-CU Navi 44; and the 35B MoE
-> needs ~23 GB, i.e. two **16 GB** 9060 XTs (the 8 GB cards host only smaller models via
-> the `single` profile).
+> ⚠️ **Built for it, not yet hardware-validated** — there's no gfx1200 card in the lab.
+> The binaries provably contain gfx1200 code objects and the identical RDNA4 stack is
+> validated on gfx1201, but a 9060 owner should expect to shake out the first real-hardware
+> bugs — **please post on [issue #2](https://github.com/patcarter883/rdna4-vllm/issues/2).**
+> Notes: the aiter A8W8 tuning configs and the kernel crossover cache were tuned on
+> gfx1201's 64-CU die, so they'll be suboptimal (not broken) on the 32-CU Navi 44; and the
+> 35B MoE needs ~23 GB, i.e. two **16 GB** 9060 XTs (8 GB cards host only smaller models
+> via the `single` profile).
 
 ---
 

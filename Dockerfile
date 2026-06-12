@@ -15,9 +15,13 @@
 ARG BASE_IMAGE=rocm/vllm-dev:nightly-therock714
 FROM ${BASE_IMAGE}
 
-ENV PYTORCH_ROCM_ARCH=gfx1201
-ENV GPU_ARCHS=gfx1201
-ENV AITER_ROCM_ARCH=gfx1201
+# Both RDNA4 dies — gfx1200 (Navi44: RX 9060 XT / 9060) and gfx1201 (Navi48: RX
+# 9070 XT / 9070). The default Release wheels are fat (carry both arches), so one
+# image runs on either card. This value also drives the in-image W4A8 kernel build
+# (fat) and is the aiter runtime-JIT arch hint.
+ENV PYTORCH_ROCM_ARCH=gfx1200;gfx1201
+ENV GPU_ARCHS=gfx1200;gfx1201
+ENV AITER_ROCM_ARCH=gfx1200;gfx1201
 # Do NOT bake CU_NUM: aiter's get_cu_num() uses CU_NUM if set, else auto-detects
 # the live GPU's Compute Unit count via rocminfo. The reference host is
 # heterogeneous (RX 9070 XT = 64 CU, RX 9070 = 56 CU), so leaving CU_NUM unset
@@ -26,11 +30,13 @@ ENV AITER_ROCM_ARCH=gfx1201
 # with ROCR_VISIBLE_DEVICES (excludes any iGPU) at run time.
 
 # ---------------------------------------------------------------------------
-# 1. Fetch + install the three gfx1201 wheels.
+# 1. Fetch + install the three RDNA4 wheels (fat gfx1200;gfx1201 by default).
 # ---------------------------------------------------------------------------
-ARG WHEELS_BASE=https://github.com/patcarter883/rdna4-vllm/releases/download/v0.22.0-gfx1201
+# v0.22.0-rdna4 = fat wheels (both dies). For the gfx1201-only set, point
+# WHEELS_BASE at .../v0.22.0-gfx1201 and AITER_WHL at the dev264 build.
+ARG WHEELS_BASE=https://github.com/patcarter883/rdna4-vllm/releases/download/v0.22.0-rdna4
 ARG VLLM_WHL=vllm-0.22.0+rocm714-cp312-cp312-linux_x86_64.whl
-ARG AITER_WHL=amd_aiter-0.1.14rc1.dev264+g2e93b80ab.d20260611-cp312-cp312-linux_x86_64.whl
+ARG AITER_WHL=amd_aiter-0.1.14rc1.dev266+g971f2e583-cp312-cp312-linux_x86_64.whl
 ARG FA_WHL=flash_attn-2.8.4-cp312-cp312-linux_x86_64.whl
 
 RUN set -e; \
@@ -98,7 +104,7 @@ COPY w4a8_fp8_wmma/ /opt/w4a8_fp8_wmma/
 RUN set -e; \
     if [ "$WITH_W4A8" = "1" ]; then \
       export PATH="$ROCM_PATH/lib/llvm/bin:$PATH"; \
-      cd /opt/w4a8_fp8_wmma && GPU_ARCHS=gfx1201 pip install . --no-build-isolation --no-deps; \
+      cd /opt/w4a8_fp8_wmma && pip install . --no-build-isolation --no-deps; \
       # Verify from / AFTER removing the source tree: importing while cwd is the
       # source dir shadows the installed build (no _C.so there) -> ImportError.
       cd / && rm -rf /opt/w4a8_fp8_wmma; \

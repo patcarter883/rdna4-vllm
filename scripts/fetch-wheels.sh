@@ -9,9 +9,9 @@
 # Usage: WHEELS_BASE=https://github.com/<you>/vllm-gfx1201/releases/download/<tag> ./scripts/fetch-wheels.sh
 set -euo pipefail
 
-WHEELS_BASE="${WHEELS_BASE:-https://github.com/patcarter883/rdna4-vllm/releases/download/v0.22.0-gfx1201}"
+WHEELS_BASE="${WHEELS_BASE:-https://github.com/patcarter883/rdna4-vllm/releases/download/v0.22.0-rdna4}"
 VLLM_WHL="${VLLM_WHL:-vllm-0.22.0+rocm714-cp312-cp312-linux_x86_64.whl}"
-AITER_WHL="${AITER_WHL:-amd_aiter-0.1.14rc1.dev264+g2e93b80ab.d20260611-cp312-cp312-linux_x86_64.whl}"
+AITER_WHL="${AITER_WHL:-amd_aiter-0.1.14rc1.dev266+g971f2e583-cp312-cp312-linux_x86_64.whl}"
 FA_WHL="${FA_WHL:-flash_attn-2.8.4-cp312-cp312-linux_x86_64.whl}"
 
 DEST="$(cd "$(dirname "$0")/.." && pwd)/wheels"
