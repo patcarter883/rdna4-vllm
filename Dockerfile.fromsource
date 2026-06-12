@@ -82,5 +82,7 @@ RUN set -e; \
     if [ "$WITH_W4A8" = "1" ]; then \
       export PATH="$ROCM_PATH/lib/llvm/bin:$PATH"; \
       cd /opt/w4a8_fp8_wmma && GPU_ARCHS=gfx1201 pip install . --no-build-isolation --no-deps; \
-      python3 -c "import w4a8_fp8_wmma; print('[w4a8] import OK')"; \
+      # Verify from / after removing the source tree (else cwd shadows the install).
+      cd / && rm -rf /opt/w4a8_fp8_wmma; \
+      python3 -c "import w4a8_fp8_wmma, w4a8_fp8_wmma._C; print('[w4a8] import OK')"; \
     fi

@@ -99,7 +99,10 @@ RUN set -e; \
     if [ "$WITH_W4A8" = "1" ]; then \
       export PATH="$ROCM_PATH/lib/llvm/bin:$PATH"; \
       cd /opt/w4a8_fp8_wmma && GPU_ARCHS=gfx1201 pip install . --no-build-isolation --no-deps; \
-      python3 -c "import w4a8_fp8_wmma; print('[w4a8] import OK')"; \
+      # Verify from / AFTER removing the source tree: importing while cwd is the
+      # source dir shadows the installed build (no _C.so there) -> ImportError.
+      cd / && rm -rf /opt/w4a8_fp8_wmma; \
+      python3 -c "import w4a8_fp8_wmma, w4a8_fp8_wmma._C; print('[w4a8] import OK')"; \
     else \
       echo "WITH_W4A8=0 — skipping W4A8 kernel build"; \
     fi
