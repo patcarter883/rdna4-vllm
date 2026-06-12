@@ -1,0 +1,38 @@
+vllm-gfx1201
+============
+
+This project packages and lightly extends a large body of other people's work.
+It would not exist without the following. Please preserve this NOTICE and the
+upstream licenses in any redistribution.
+
+The ONLY original contributions in this repository are:
+  - the gfx1201 (RDNA4) enablement edits to vLLM / aiter / flash-attention,
+  - the Docker build/inject packaging and compose profiles, and
+  - the W4A8-FP8-WMMA MoE kernel (w4a8_fp8_wmma/).
+Everything else is upstream, credited below.
+
+Upstream projects and people
+----------------------------
+- vLLM — vllm-project/vllm (Apache-2.0). The entire serving engine. Our gfx1201
+  vLLM wheel is built from the ROCm/vllm fork's `micah/therock-nightly` branch;
+  thanks to @micah and the ROCm vLLM team. Our changes are a small ROCm
+  platform-enablement edit plus the moe_wna16 tp_size fix (a generic upstream
+  bug — owed back as a PR).
+- AMD ROCm / TheRock — the base image rocm/vllm-dev:nightly-therock714, the
+  ROCm 7.14 SDK, and the torch/triton nightlies (various AMD/OSS licenses).
+- AMD aiter — ROCm/aiter (MIT/Apache). Our aiter wheel is their tree plus
+  gfx1201 enablement. The five A8W8 GEMM config JSONs come directly from
+  @carhuang's `carhuang/gfx1201_silu_and_mul_and_a8w8_configs_rebased` branch.
+- Dao-AILab flash-attention — Dao-AILab/flash-attention (BSD-3-Clause), and
+  ROCm Composable Kernel (ROCm/composable_kernel, MIT) for the CK FMHA backend.
+  Thanks to @tridao.
+- tilelang — the Qwen3_5Moe linear-attention (MHC) kernel path (upstream
+  integration PR #43679).
+- @kyuz0 — prior gfx1201 vLLM / ROCm-on-RDNA4 containers and PRs (e.g. the ViT
+  attention-backend fix) that informed this enablement.
+- cyankiwi — the AWQ-INT4 quantized models we run and benchmark
+  (Qwen3.6-35B-A3B-AWQ-4bit, Mellum2-12B-A2.5B). The Qwen team for the base
+  models.
+- The gfx1151 sibling project (vllm-awq4-qwen) — the repository structure,
+  compose, and README template, and the RDNA3.5 wave32 kernel-design lineage the
+  W4A8 kernel was scaffolded from.

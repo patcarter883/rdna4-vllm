@@ -1,0 +1,8 @@
+{
+  "_comment": "AOT ours-vs-Triton crossover cache for gfx1201 (RX 9070 XT). Key = 'N,K,group' -> smallest M (token count) at which the FP8-WMMA kernel beats Triton W4A16 (2% margin); null = never (always Triton). Regenerate per GPU/model with tune_crossover.py. Unknown shapes default to Triton.",
+  "2048,4096,128": null,
+  "4096,4096,128": 3072,
+  "11008,4096,128": 2560,
+  "4096,11008,128": null,
+  "4096,14336,128": 3072
+}

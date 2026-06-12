@@ -1,0 +1,86 @@
+# Fully-from-source gfx1201 build: compile the three wheels in-container instead
+# of fetching them from a Release. Use this for full reproducibility / when you
+# don't trust prebuilt binaries. SLOW: ~2-4h (flash-attention alone is ~2h /
+# 2669 CK FMHA steps). For the fast path use the default Dockerfile.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.fromsource.yml build
+# (or)
+#   docker build -f Dockerfile.fromsource -t vllm-gfx1201:latest .
+#
+# PREREQUISITE: the three PATCHED source trees must be reachable as git refs.
+# They were developed as local branches; push them (or fork + cherry-pick the
+# commits below) and set the *_REPO / *_REF build-args. Exact commits the wheels
+# were built from:
+#   vllm            micah/therock-nightly @ 6ca428e89, 0595e16a6, c51747f13
+#   aiter           main                  @ 51eeb39d8
+#   flash-attention tridao                @ 675dc40f
+# Submodule/pin gotchas: flash-attention needs `csrc/composable_kernel` inited;
+# aiter must build with PREBUILD_KERNELS=0 on gfx1201.
+
+ARG BASE_IMAGE=rocm/vllm-dev:nightly-therock714
+
+# ===========================================================================
+# Stage 1: build the three gfx1201 wheels from source.
+# ===========================================================================
+FROM ${BASE_IMAGE} AS builder
+ENV GPU_ARCHS=gfx1201 PYTORCH_ROCM_ARCH=gfx1201 AITER_ROCM_ARCH=gfx1201 CU_NUM=64 MAX_JOBS=16
+# TheRock LLVM bin (ld.lld / amdclang) — required for FlyDSL AOT compiles.
+ENV PATH=/opt/rocm/lib/llvm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+ARG AITER_REPO=https://github.com/CHANGEME/aiter.git
+ARG AITER_REF=51eeb39d8
+ARG FA_REPO=https://github.com/CHANGEME/flash-attention.git
+ARG FA_REF=675dc40f
+ARG VLLM_REPO=https://github.com/CHANGEME/vllm.git
+ARG VLLM_REF=c51747f13
+
+RUN pip install -U "setuptools-scm" "vcs_versioning" packaging psutil ninja || true
+
+# aiter
+RUN git clone "$AITER_REPO" /src/aiter && cd /src/aiter && git checkout "$AITER_REF" && \
+    git submodule update --init --recursive || true && \
+    GPU_ARCHS=gfx1201 CU_NUM=64 PREBUILD_KERNELS=0 python setup.py bdist_wheel && \
+    mkdir -p /wheels && cp dist/amd_aiter-*.whl /wheels/
+
+# flash-attention (CK submodule required; ~2h)
+RUN git clone "$FA_REPO" /src/fa && cd /src/fa && git checkout "$FA_REF" && \
+    git submodule update --init csrc/composable_kernel && \
+    GPU_ARCHS=gfx1201 python setup.py bdist_wheel && cp dist/flash_attn-*.whl /wheels/
+
+# vLLM (relabel the stale setuptools_scm tag so version gates behave)
+RUN git clone "$VLLM_REPO" /src/vllm && cd /src/vllm && git checkout "$VLLM_REF" && \
+    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM=0.22.0 GPU_ARCHS=gfx1201 PYTORCH_ROCM_ARCH=gfx1201 \
+    python setup.py bdist_wheel && cp dist/vllm-*.whl /wheels/
+
+# ===========================================================================
+# Stage 2: assemble (same as the default Dockerfile, but wheels come from stage 1).
+# ===========================================================================
+FROM ${BASE_IMAGE}
+ENV PYTORCH_ROCM_ARCH=gfx1201 GPU_ARCHS=gfx1201 AITER_ROCM_ARCH=gfx1201
+
+COPY --from=builder /wheels/ /tmp/gfx1201-wheels/
+RUN set -e; \
+    python3 -c "import torch,triton; open('/tmp/c.txt','w').write(f'torch=={torch.__version__}\ntriton=={triton.__version__}\n')"; \
+    pip install --force-reinstall --no-deps /tmp/gfx1201-wheels/flash_attn-*.whl; \
+    pip install -c /tmp/c.txt /tmp/gfx1201-wheels/amd_aiter-*.whl; \
+    pip install -c /tmp/c.txt /tmp/gfx1201-wheels/vllm-*.whl; \
+    pip install "apache-tvm-ffi==0.1.10"; \
+    rm -rf /tmp/gfx1201-wheels /tmp/c.txt
+
+COPY patches/moe_wna16.py /tmp/moe_wna16.patched.py
+RUN set -e; \
+    dest="$(find /opt/python/lib -path '*vllm/model_executor/layers/quantization/moe_wna16.py' -type f | head -1)"; \
+    test -n "$dest" || { echo "moe_wna16.py not found"; exit 1; }; \
+    cp /tmp/moe_wna16.patched.py "$dest"; \
+    grep -q 'moe_config.tp_size' "$dest"; \
+    python3 -c "import ast; ast.parse(open('$dest').read())"; \
+    rm -f /tmp/moe_wna16.patched.py
+
+ARG WITH_W4A8=1
+COPY w4a8_fp8_wmma/ /opt/w4a8_fp8_wmma/
+RUN set -e; \
+    if [ "$WITH_W4A8" = "1" ]; then \
+      export PATH="$ROCM_PATH/lib/llvm/bin:$PATH"; \
+      cd /opt/w4a8_fp8_wmma && GPU_ARCHS=gfx1201 pip install . --no-build-isolation --no-deps; \
+      python3 -c "import w4a8_fp8_wmma; print('[w4a8] import OK')"; \
+    fi

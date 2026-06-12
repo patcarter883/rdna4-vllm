@@ -1,0 +1,18 @@
+# Local env + secrets
+.env
+
+# Fetched / built wheels (live in a GitHub Release, not git)
+wheels/
+*.whl
+
+# Persistent caches (compose mounts these by default)
+.triton-cache/
+.vllm-cache/
+.hf-cache/
+
+# Build artifacts from the W4A8 kernel package
+w4a8_fp8_wmma/build/
+w4a8_fp8_wmma/**/*.so
+w4a8_fp8_wmma/**/*.o
+**/__pycache__/
+*.egg-info/

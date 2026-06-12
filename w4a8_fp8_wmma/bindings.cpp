@@ -1,0 +1,157 @@
+// torch bindings for the W4A8-FP8 MMQ HIP custom op (gfx1201 / RDNA4).
+//
+// Exposes torch.ops.w4a8_fp8_wmma.mmq_fp8_gemm(x, w_packed, scales, w_zeros,
+// version) -> out.
+//
+//   version: 0 = v0 scalar fp8 reference (always correct), 1 = v1 WMMA (stub).
+//
+// Tensor contracts (match vLLM compressed_tensors_wNa16 / the gfx1151 ref):
+//   x         : (M, K)        fp16,  CUDA, contiguous
+//   w_packed  : (N, K/8)      int32, CUDA, contiguous  (8 uint4b8 per int32)
+//   scales    : (N, K/32)     fp16,  CUDA, contiguous  (group_size=32)
+//   w_zeros   : (N/8, K/32)   int32, CUDA, contiguous, optional (empty=symmetric)
+//   out       : (M, N)        fp16,  CUDA, contiguous, allocated here
+
+#include <torch/extension.h>
+#include <torch/library.h>
+#include <ATen/cuda/CUDAContext.h>
+
+void launch_mmq_fp8_gemm_gfx1201(
+    const at::Tensor& x,
+    const at::Tensor& w_packed,
+    const at::Tensor& scales,
+    const at::Tensor& w_zeros,
+    at::Tensor& out,
+    int64_t version);
+
+void launch_mmq_fp8_moe_gemm_gfx1201(
+    const at::Tensor& x,
+    const at::Tensor& w_packed,
+    const at::Tensor& scales,
+    const at::Tensor& w_zeros,
+    const at::Tensor& sorted_token_ids,
+    const at::Tensor& expert_ids,
+    const at::Tensor& num_tokens_post_padded,
+    at::Tensor& out,
+    int64_t top_k,
+    int64_t block_m,
+    int64_t version);
+
+namespace {
+
+constexpr int64_t kPackFactor = 8;
+
+at::Tensor mmq_fp8_gemm_forward(
+    const at::Tensor& x,
+    const at::Tensor& w_packed,
+    const at::Tensor& scales,
+    const at::Tensor& w_zeros,
+    int64_t version) {
+
+    TORCH_CHECK(x.is_cuda() && w_packed.is_cuda() && scales.is_cuda(),
+                "x, w_packed, scales must be CUDA");
+    TORCH_CHECK(x.scalar_type() == at::kHalf, "x must be fp16");
+    TORCH_CHECK(w_packed.scalar_type() == at::kInt, "w_packed must be int32");
+    TORCH_CHECK(scales.scalar_type() == at::kHalf, "scales must be fp16");
+    TORCH_CHECK(x.dim() == 2 && w_packed.dim() == 2 && scales.dim() == 2,
+                "all inputs must be 2D");
+    TORCH_CHECK(x.is_contiguous() && w_packed.is_contiguous() && scales.is_contiguous(),
+                "all inputs must be contiguous");
+
+    const int64_t M = x.size(0);
+    const int64_t K = x.size(1);
+    const int64_t N = w_packed.size(0);
+
+    TORCH_CHECK(w_packed.size(1) * kPackFactor == K,
+                "w_packed last dim mismatch: expected K/8 = ", K / kPackFactor,
+                " got ", w_packed.size(1));
+    TORCH_CHECK(scales.size(0) == N, "scales.size(0) must equal N=", N);
+    const int64_t group_size = K / scales.size(1);
+    TORCH_CHECK(scales.size(1) * group_size == K,
+                "K not divisible by scales' K dim");
+    TORCH_CHECK(group_size % 16 == 0 && group_size <= 128,
+                "group_size must be a multiple of 16 and <= 128; got ", group_size);
+    TORCH_CHECK(version >= 0 && version <= 5,
+                "version must be 0..5 (5 = raw-builtin direct-load)");
+
+    if (w_zeros.defined() && w_zeros.numel() > 0) {
+        TORCH_CHECK(w_zeros.is_cuda() && w_zeros.scalar_type() == at::kInt,
+                    "w_zeros must be CUDA int32 (packed)");
+        TORCH_CHECK(w_zeros.dim() == 2 && w_zeros.size(0) * 8 == N && w_zeros.size(1) == scales.size(1),
+                    "w_zeros shape mismatch: expected (", N / 8, ", ", scales.size(1), ")");
+        TORCH_CHECK(w_zeros.is_contiguous(), "w_zeros must be contiguous");
+    }
+
+    auto out = at::empty({M, N}, x.options());
+    launch_mmq_fp8_gemm_gfx1201(x, w_packed, scales, w_zeros, out, version);
+    return out;
+}
+
+at::Tensor mmq_fp8_moe_gemm_forward(
+    const at::Tensor& x,
+    const at::Tensor& w_packed,
+    const at::Tensor& scales,
+    const at::Tensor& w_zeros,
+    const at::Tensor& sorted_token_ids,
+    const at::Tensor& expert_ids,
+    const at::Tensor& num_tokens_post_padded,
+    int64_t top_k,
+    int64_t block_m,
+    int64_t version) {
+
+    TORCH_CHECK(x.is_cuda() && w_packed.is_cuda() && scales.is_cuda(),
+                "x, w_packed, scales must be CUDA");
+    TORCH_CHECK(x.scalar_type() == at::kHalf, "x must be fp16");
+    TORCH_CHECK(w_packed.scalar_type() == at::kInt, "w_packed must be int32");
+    TORCH_CHECK(scales.scalar_type() == at::kHalf, "scales must be fp16");
+    TORCH_CHECK(x.dim() == 2, "x must be (T, K)");
+    TORCH_CHECK(w_packed.dim() == 3 && scales.dim() == 3,
+                "w_packed (E,N,K/8) and scales (E,N,K/group) must be 3D");
+    TORCH_CHECK(sorted_token_ids.scalar_type() == at::kInt &&
+                expert_ids.scalar_type() == at::kInt &&
+                num_tokens_post_padded.scalar_type() == at::kInt,
+                "routing tensors must be int32");
+    TORCH_CHECK(x.is_contiguous() && w_packed.is_contiguous() &&
+                scales.is_contiguous(), "x, w_packed, scales must be contiguous");
+
+    const int64_t K = x.size(1);
+    const int64_t N = w_packed.size(1);
+    const int64_t P = sorted_token_ids.size(0);
+    TORCH_CHECK(w_packed.size(2) * kPackFactor == K,
+                "w_packed last dim must be K/8=", K / kPackFactor);
+    TORCH_CHECK(P % block_m == 0, "P=", P, " not divisible by block_m=", block_m);
+    TORCH_CHECK(expert_ids.size(0) == P / block_m,
+                "expert_ids must have P/block_m=", P / block_m, " entries");
+    TORCH_CHECK(version == 0 || version == 5, "moe version must be 0 or 5");
+
+    if (w_zeros.defined() && w_zeros.numel() > 0) {
+        TORCH_CHECK(w_zeros.scalar_type() == at::kInt && w_zeros.dim() == 3 &&
+                    w_zeros.size(1) * 8 == N && w_zeros.size(2) == scales.size(2),
+                    "w_zeros must be (E, N/8, K/group) int32");
+    }
+
+    auto out = at::empty({P, N}, x.options());
+    launch_mmq_fp8_moe_gemm_gfx1201(
+        x, w_packed, scales, w_zeros, sorted_token_ids, expert_ids,
+        num_tokens_post_padded, out, top_k, block_m, version);
+    return out;
+}
+
+}  // namespace
+
+TORCH_LIBRARY(w4a8_fp8_wmma, m) {
+    m.def("mmq_fp8_gemm(Tensor x, Tensor w_packed, Tensor scales, Tensor w_zeros, int version) -> Tensor");
+    m.def("mmq_fp8_moe_gemm(Tensor x, Tensor w_packed, Tensor scales, Tensor w_zeros, "
+          "Tensor sorted_token_ids, Tensor expert_ids, Tensor num_tokens_post_padded, "
+          "int top_k, int block_m, int version) -> Tensor");
+}
+
+TORCH_LIBRARY_IMPL(w4a8_fp8_wmma, CUDA, m) {
+    m.impl("mmq_fp8_gemm", &mmq_fp8_gemm_forward);
+    m.impl("mmq_fp8_moe_gemm", &mmq_fp8_moe_gemm_forward);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.doc() = "W4A8-FP8 MMQ kernel for gfx1201. "
+              "torch.ops.w4a8_fp8_wmma.mmq_fp8_gemm(x, w_packed, scales, w_zeros, version)";
+}

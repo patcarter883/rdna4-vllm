@@ -1,0 +1,18 @@
+# Overlay that switches every profile to the from-source Dockerfile (compile the
+# three wheels in-container, ~2-4h, no Release needed).
+#
+#   docker compose -f docker-compose.yml -f docker-compose.fromsource.yml \
+#     --profile tp2-baseline up --build
+#
+# Set the *_REPO / *_REF build-args (see Dockerfile.fromsource) to point at your
+# pushed/forked patched trees.
+services:
+  tp2-baseline:
+    build:
+      dockerfile: Dockerfile.fromsource
+  tp2-w4a8:
+    build:
+      dockerfile: Dockerfile.fromsource
+  single:
+    build:
+      dockerfile: Dockerfile.fromsource
