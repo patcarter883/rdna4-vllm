@@ -169,6 +169,16 @@ are documented inline in the [Dockerfile](Dockerfile).
 
 ---
 
+## The story
+
+[`DIARY.md`](DIARY.md) is a development diary of how this stack came together — the
+RDNA4-vs-gfx1250 kernel reframing, the three sequential model-load blockers (and the
+gdb/py-spy detective work behind each), the VRAM wall that forces TP=2, the
+W4A8-FP8-WMMA kernel, and the packaging decisions behind this repo. Read it before you
+debug something here — most walls already have a door.
+
+---
+
 ## Credits & license
 
 See [NOTICE](NOTICE) for the full acknowledgments. This repo's own glue code is
