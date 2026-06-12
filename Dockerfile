@@ -28,7 +28,7 @@ ENV AITER_ROCM_ARCH=gfx1201
 # ---------------------------------------------------------------------------
 # 1. Fetch + install the three gfx1201 wheels.
 # ---------------------------------------------------------------------------
-ARG WHEELS_BASE=https://github.com/CHANGEME/vllm-gfx1201/releases/download/v0.22.0-gfx1201
+ARG WHEELS_BASE=https://github.com/patcarter883/rdna4-vllm/releases/download/v0.22.0-gfx1201
 ARG VLLM_WHL=vllm-0.22.0+rocm714-cp312-cp312-linux_x86_64.whl
 ARG AITER_WHL=amd_aiter-0.1.14rc1.dev264+g2e93b80ab.d20260611-cp312-cp312-linux_x86_64.whl
 ARG FA_WHL=flash_attn-2.8.4-cp312-cp312-linux_x86_64.whl

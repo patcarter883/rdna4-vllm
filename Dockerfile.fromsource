@@ -11,9 +11,9 @@
 # They were developed as local branches; push them (or fork + cherry-pick the
 # commits below) and set the *_REPO / *_REF build-args. Exact commits the wheels
 # were built from:
-#   vllm            micah/therock-nightly @ 6ca428e89, 0595e16a6, c51747f13
-#   aiter           main                  @ 51eeb39d8
-#   flash-attention tridao                @ 675dc40f
+#   vllm            (branch gfx1201) @ 29db1b1b3   (6ca428e89/0595e16a6/c51747f13 + w4a8 WNA16 route)
+#   aiter           (branch gfx1201) @ 51eeb39d8
+#   flash-attention (branch gfx1201) @ 675dc40f
 # Submodule/pin gotchas: flash-attention needs `csrc/composable_kernel` inited;
 # aiter must build with PREBUILD_KERNELS=0 on gfx1201.
 
@@ -27,12 +27,12 @@ ENV GPU_ARCHS=gfx1201 PYTORCH_ROCM_ARCH=gfx1201 AITER_ROCM_ARCH=gfx1201 CU_NUM=6
 # TheRock LLVM bin (ld.lld / amdclang) — required for FlyDSL AOT compiles.
 ENV PATH=/opt/rocm/lib/llvm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-ARG AITER_REPO=https://github.com/CHANGEME/aiter.git
+ARG AITER_REPO=https://github.com/patcarter883/aiter-gfx1201.git
 ARG AITER_REF=51eeb39d8
-ARG FA_REPO=https://github.com/CHANGEME/flash-attention.git
+ARG FA_REPO=https://github.com/patcarter883/flash-attention-gfx1201.git
 ARG FA_REF=675dc40f
-ARG VLLM_REPO=https://github.com/CHANGEME/vllm.git
-ARG VLLM_REF=c51747f13
+ARG VLLM_REPO=https://github.com/patcarter883/vllm-gfx1201.git
+ARG VLLM_REF=29db1b1b3
 
 RUN pip install -U "setuptools-scm" "vcs_versioning" packaging psutil ninja || true
 

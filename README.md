@@ -33,7 +33,7 @@ an optional **W4A8-FP8-WMMA MoE kernel**. The goal is: clone, set one env var,
 ## Quick start
 
 ```bash
-git clone https://github.com/CHANGEME/vllm-gfx1201 && cd vllm-gfx1201
+git clone https://github.com/patcarter883/rdna4-vllm && cd rdna4-vllm
 cp .env.template .env
 $EDITOR .env                       # set HF_HOME (+ HF_TOKEN for the download), and WHEELS_BASE
 

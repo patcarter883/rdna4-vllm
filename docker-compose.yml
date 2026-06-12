@@ -13,7 +13,7 @@ x-gfx1201-common: &gfx1201-common
     dockerfile: Dockerfile
     args:
       # Override to point at your own Release of the three wheels.
-      WHEELS_BASE: ${WHEELS_BASE:-https://github.com/CHANGEME/vllm-gfx1201/releases/download/v0.22.0-gfx1201}
+      WHEELS_BASE: ${WHEELS_BASE:-https://github.com/patcarter883/rdna4-vllm/releases/download/v0.22.0-gfx1201}
       WITH_W4A8: ${WITH_W4A8:-1}
   image: vllm-gfx1201:latest
   # Manual control only — never auto-restart. If a kernel test wedges a card we
