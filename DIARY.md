@@ -233,26 +233,38 @@ two TP ranks disagree wildly — rank0 COMM 14.9%, rank1 61% — because the all
 heterogeneous-TP sync bubble** — the 64-CU XT finishing ahead of the 56-CU 9070 and spinning.
 Real e2e waste, but not a compute cost.
 
-**Where the decode step actually goes** (Qwen3.6-35B-A3B-AWQ, rank0, eager):
+**Where the decode step actually goes.** A clean 16-cell `triton`-only sweep (stock vs W4A8 ×
+two models × four batch regimes) settled it. The breakdown is **strongly batch- and
+model-dependent** — which is itself the lesson (rank0 self-CUDA %, decode regime):
 
-| bucket | M=32 | M=6 |
-|---|---|---|
-| MoE experts (stock Triton) | 40.8% | 32.1% |
-| dense fp16 (hipBLASLt) | 20.2% | 26.7% |
-| COMM (RCCL all-reduce) | 14.9% | 17.5% |
-| GDN/Mamba linear-attn | 12.5% | 7.8% |
-| **full attention** | **1.8%** | **1.7%** |
+| bucket — **35B MoE** | share |  | bucket — **27B dense** | share |
+|---|---|---|---|---|
+| dense fp16 GEMM (`aten::mm`→Tensile) | ~33% |  | **int4 GEMM** (`triton_w4a16_gemm`) | **~57%** |
+| MoE experts (`fused_moe_kernel_gptq_awq`) | ~19% |  | dense fp16 GEMM | ~5% |
+| COMM (RCCL all-reduce) | ~14% |  | COMM (RCCL all-reduce) | ~23% |
+| GDN/Mamba linear-attn | ~5–8% |  | — | — |
+| **full attention** | **~1.6%** |  | full attention | **<2%** |
 
-**The verdict — a kernel-chapter closer:**
-- **A custom attention kernel is not worth building.** Full attention is ~1.8% of decode,
-  batch-invariant. The head_dim=256 ROCM_ATTN→Triton fallback we found (the `head_size==128`
-  HIP gate fails) is real but e2e-irrelevant.
-- **GDN/Mamba is only ~12.5%** — well under prior estimate; not dominant either.
-- **The addressable compute is MoE (41%) and dense fp16 (20%)** — but our MoE kernel is already
-  e2e-neutral there, and the dense lever is online-fp8 quant (a quality risk), not a new kernel.
-  The remaining honest win is the **TP sync bubble** — a scheduling problem (CU balancing / comm
-  overlap / cudagraphs), not a HIP kernel.
-- Net: **the int4→fp8-WMMA research has hit e2e diminishing returns on this model.**
+On the 35B MoE the MoE share climbs to ~29% at the large batch (dense fp16 dominates at small
+batch); on the dense 27B the **int4 GEMM is the whole game, ~57–69% across every regime** —
+exactly what W4A8 targets.
+
+**The verdict — three findings, one chapter-closer:**
+- **No custom attention kernel.** Full attention is ~1.6% of decode, confirmed across both models
+  and all batch sizes. The attention-backend axis is moot a second way: **AITER attention is
+  arch-rejected on gfx1201** (`'gfx1201' is invalid or not supported` at engine init), so Triton
+  is the only viable backend — there is no faster one to switch to.
+- **W4A8 doesn't win on the MoE model.** Stock→W4A8 across regimes: decode **1.01×**, mid
+  **0.94×**, large **0.95×**, prefill **0.99×** — neutral at the tiny batch, *negative* elsewhere.
+  The MoE GEMM we replace is only ~19–29% of decode while comm + dense fp16 dominate, so a
+  per-GEMM-competitive kernel buys ~0 end-to-end.
+- **W4A8's ideal case can't even load.** The dense 27B *is* int4-GEMM-bound (~57%) — the one place
+  a faster W4 path should win big — but the W4A8 adapter **OOMs at weight conversion**
+  (`vllm_adapter.py:168` materializes the full `(N,K,8)`-expanded int4 unpack), all four regimes
+  dead on a 16 GB card. The favorable case is blocked by a **load-time memory bug, not a compute
+  limit** — fixable, but it means there is no dense-path A/B yet.
+- Net: **on this hardware the int4→fp8-WMMA kernel is e2e-neutral where it runs and can't run
+  where it would help.** The kernel chapter closes; the dense-path OOM is the one concrete lead.
 
 **The war story that came free.** The sweep wrote ~300 MB kineto traces per cell into a
 **RAM-backed `/tmp` (45 GB tmpfs)** while TP=2 vLLM held both cards — and this box swapped to a
@@ -261,10 +273,14 @@ memory; no OOM-kill ever fires). The host hard-hung mid-sweep, power-cycle requi
 reboot wiped the tmpfs with every trace not already hand-copied. **Lessons:** never swap to a
 ZFS zvol (zram + a capped ARC instead); write big profiler output to real disk, not tmpfs; and
 transcribe the bucketed numbers *as they land* — the conclusion is the deliverable, not the
-300 MB blob. (The table above survived because it was written down before the crash.)
+300 MB blob. (The first run's numbers survived only because they were transcribed by hand; the
+table above is the cleaner 16-cell re-run, written to the repo on disk.)
 
-*Caveat: shares are eager-mode (cudagraphs off) — ratios hold, absolute COMM/launch overhead is
-inflated; a cudagraph re-profile + the dense-27B contrast cell are in flight to close the loop.*
+*Method notes: numbers are from the 16-cell `triton`-only sweep — the AITER backends were dropped
+as unsupported, and the `large` cells needed a 30-min per-cell cap to clear their cold Triton
+autotune. Shares are eager-mode, so the compute *ratios* hold but absolute comm/launch overhead is
+inflated; W4A8 cudagraph capture is separately confirmed to work, and the heterogeneous-TP sync
+bubble has a drafted 64:56 proportional-sharding fix.*
 
 ---
 
