@@ -208,6 +208,123 @@ Decisions that shaped the repo:
 
 ---
 
+## Act VI — the profiling reckoning: measure before you build
+
+The W4A8 kernel works — but a quieter question loomed. The dense fp8-WMMA kernels (v10/v11)
+**never engage** on the target checkpoints (dense layers stay fp16; only experts are int4),
+and the MoE kernel wins per-GEMM yet is e2e-neutral. So before scaffolding *another* kernel —
+paged attention for the head_dim=256 layers, or an FLA/GDN linear-attention kernel — the honest
+move was to **measure the decode step**, not estimate it. The MoE saga had already taught this
+in blood: a fast kernel for a non-bottleneck bucket buys ~0 end-to-end.
+
+**The tool that doesn't work here.** The instinct was rocprofv3 `--kernel-trace` for GPU-side
+truth. On this stack it sees **nothing useful**: a TP=2 dense run logged 1633 launches across 19
+names — *all* torch-native HIP copies/fills/elementwise + RCCL, zero `paged_attention` /
+`delta_rule` / GEMM. The entire decode compute is **Triton-compiled**, and rocprofv3 doesn't
+capture Triton kernels here. (It did confirm the one thing it can — the comm/copy glue — and the
+old TP=2 rocprof deadlock is gone with `NCCL_PROTO=SIMPLE` + `HSA_NO_SCRATCH_RECLAIM=1`.) What
+*does* see through Triton is vLLM's built-in **torch profiler** (`VLLM_TORCH_PROFILER_DIR` +
+`start_profile`/`stop_profile`) via kineto, eager mode for clean per-op attribution.
+
+**The two-rank trap.** The first bucketed trace screamed COMM = 61% of the step. Artifact. The
+two TP ranks disagree wildly — rank0 COMM 14.9%, rank1 61% — because the all-reduce kernel
+**spin-waits**: on the rank that arrives early, the nccl kernel's wall-time is mostly idle spin.
+**Read rank0 (the busy/critical rank) as compute truth; rank1's COMM inflation IS the
+heterogeneous-TP sync bubble** — the 64-CU XT finishing ahead of the 56-CU 9070 and spinning.
+Real e2e waste, but not a compute cost.
+
+**Where the decode step actually goes** (Qwen3.6-35B-A3B-AWQ, rank0, eager):
+
+| bucket | M=32 | M=6 |
+|---|---|---|
+| MoE experts (stock Triton) | 40.8% | 32.1% |
+| dense fp16 (hipBLASLt) | 20.2% | 26.7% |
+| COMM (RCCL all-reduce) | 14.9% | 17.5% |
+| GDN/Mamba linear-attn | 12.5% | 7.8% |
+| **full attention** | **1.8%** | **1.7%** |
+
+**The verdict — a kernel-chapter closer:**
+- **A custom attention kernel is not worth building.** Full attention is ~1.8% of decode,
+  batch-invariant. The head_dim=256 ROCM_ATTN→Triton fallback we found (the `head_size==128`
+  HIP gate fails) is real but e2e-irrelevant.
+- **GDN/Mamba is only ~12.5%** — well under prior estimate; not dominant either.
+- **The addressable compute is MoE (41%) and dense fp16 (20%)** — but our MoE kernel is already
+  e2e-neutral there, and the dense lever is online-fp8 quant (a quality risk), not a new kernel.
+  The remaining honest win is the **TP sync bubble** — a scheduling problem (CU balancing / comm
+  overlap / cudagraphs), not a HIP kernel.
+- Net: **the int4→fp8-WMMA research has hit e2e diminishing returns on this model.**
+
+**The war story that came free.** The sweep wrote ~300 MB kineto traces per cell into a
+**RAM-backed `/tmp` (45 GB tmpfs)** while TP=2 vLLM held both cards — and this box swapped to a
+**ZFS zvol**, which deadlocks under memory pressure (the writeback path needs memory to free
+memory; no OOM-kill ever fires). The host hard-hung mid-sweep, power-cycle required, and the
+reboot wiped the tmpfs with every trace not already hand-copied. **Lessons:** never swap to a
+ZFS zvol (zram + a capped ARC instead); write big profiler output to real disk, not tmpfs; and
+transcribe the bucketed numbers *as they land* — the conclusion is the deliverable, not the
+300 MB blob. (The table above survived because it was written down before the crash.)
+
+*Caveat: shares are eager-mode (cudagraphs off) — ratios hold, absolute COMM/launch overhead is
+inflated; a cudagraph re-profile + the dense-27B contrast cell are in flight to close the loop.*
+
+---
+
+## Act VII — a second front: the ZAYA1-8B port
+
+Running in parallel on the same gfx1201 stack — a separate vLLM-v0.22 therock-branch overlay at
+`code/zaya/vllm-therock/` — is a port of **Zyphra's ZAYA1-8B**, a different animal entirely.
+ZAYA1 is a **hybrid** model: 80 layers alternating **CCA (Compressed Convolutional Attention)**
+with **MoE** (16 experts, top-1), a bf16 high-precision router, and *recurrent convolutional
+state* like Mamba. Unlike Qwen3.6 it isn't a transformer with a KV cache — it carries conv +
+temporal state, which reframes every systems decision below.
+
+**The differentiator: a fused CCA decode kernel.** The eager Python decode path ran the CCA step
+as ~1.4M tiny ATen launches — death by a thousand kernels. The port's answer is
+`cca_decode_qk_kernel` (`mamba/cca_hip/cca_kernel.hip`): one block-per-token pass that fuses the
+two-stage causal conv + GQA grouped-means + per-head RMSNorm + conv-state window roll, emitting
+normalized q|k directly — no extra HBM round-trip. wave32 intra-wave shuffle reduction, one LDS
+sync for the cross-wave norm. Gated `ZAYA_CCA_HIP=1` (eager fallback otherwise); optimized
+**102 µs → 53 µs per call (+7.7% e2e)**.
+
+**State as a first-class block-manager citizen.** `ZayaForCausalLM(IsHybrid)` + `CCA(MambaBase)`
+register conv_states + prev_hs into vLLM's Mamba/hybrid cache via `cca_state_shape/dtype/copy`
+(`mamba_utils.py`), at **float32** (`--mamba-cache-dtype float32` — CCA numerics demand it).
+Per-spec-position rollback lives in *separate block slots*, not sliced columns — the groundwork
+for state-fork speculation.
+
+**The walls (different from Qwen's):**
+- **CCA has no TP>1.** Per-head RMSNorm + grouped-mean state break under column-wise tensor
+  splits; `zaya.py` warns and runs every rank as TP=1. So serving is **DP=2 + expert-parallel**
+  (replicate the model across both cards), never TP.
+- **Spec-decode / prefix-caching is default-off.** The "all" mamba-cache layout overflows
+  gfx1201's **64 KB LDS** in `chunked_prefill_paged_decode`, so only *align* mode runs;
+  `ZAYA_SPEC_ALL=1` (prefix-cache reuse + per-position state-fork) stays off and unvalidated —
+  the per-position `_decode_verify_spec` machinery exists, but the actual multi-branch *tree*
+  spec is unbuilt.
+- **Same tilelang ABI skew** as the Qwen side (apache-tvm-ffi) — handled with a
+  `has_tilelang=False` overlay; the router is pinned to bf16 under quantization
+  (`quant_config=None`) so it's never quantized.
+- **Quant is W8A8** here — INT8 (bitsandbytes LLM.int8(), proven on RDNA3) with FP8 e4m3 staged
+  (offline CPU expert quant → compressed-tensors). It shares the FP8-WMMA *hardware* path with
+  this repo but **not** the W4A8 kernels.
+
+**Test-time compute is in scope.** ZAYA1 is built to run **RSA (Recursive Self-Aggregation)** —
+N=16 parallel rollouts, K=4 subset aggregation, T=2 rounds (per the ZAYA1 paper) — via a
+client-side OpenAI-compatible proxy (`rsa/server.py`) + a capacity bench harness, plus a
+streaming `zaya_xml` tool-call parser and a qwen3 reasoning parser.
+
+**Status: architecturally complete, GPU bring-up in progress.** Everything imports (model
+registry resolves, state-copy funcs + parser load on CPU), the CCA kernel compiles, and the RSA
+harness passed 5/5 AIME on an *old RDNA3 bf16* stack. End-to-end inference on gfx1201 is being
+brought up — test containers are stood up and torn down as the work iterates, so container state
+isn't a status signal. The next unchecked box is the simplest one: a coherence gate — send one
+chat, read the output. Much of the "frontier" wishlist
+(fused conv-attention, first-class recurrent state,
+per-position state-fork, test-time-compute orchestration) is *already built*; what's left is
+bring-up and the genuinely hard one — **prefix-cache reuse of recurrent state**, which isn't
+prefix-sliceable and needs checkpoint/fork semantics.
+
+---
+
 ## The short list of things that cost the most time
 
 1. Assuming gfx1250 kernels would port to gfx1201. They don't — no TDM.
@@ -216,9 +333,17 @@ Decisions that shaped the repo:
 3. Mistaking a slow in-process Triton compile for a hang. py-spy is the arbiter.
 4. ABI mismatches from host-built artifacts. Build inside the target image.
 5. Letting an iGPU into the build/detect arch list.
+6. Reaching for rocprofv3 when the whole decode compute is Triton — it captures none of it,
+   only the comm/copy glue. And trusting rank1's 61% COMM share (a heterogeneous-TP spin-wait
+   artifact; rank0 is the truth).
 
 ## What actually works, today
 
 Qwen3.6-35B-A3B-AWQ-4bit serving on two RX 9070-class cards, TP=2, coherent text,
 **298 dec / 1887 total tok/s** on the stock path; the W4A8-FP8-WMMA MoE kernel validated
 end-to-end on the same model; all of it reproducible from a clone and a `docker compose up`.
+
+And we now know where to *stop*: a per-op decode profile puts full attention at ~1.8% and the
+dominant buckets (MoE ~41%, dense fp16 ~20%) at ones we already understand — so the
+int4→fp8-WMMA kernel chapter closes on evidence. The ZAYA1 hybrid-CCA port is the open front,
+waiting on a gfx1201 bring-up window.
