@@ -258,13 +258,16 @@ exactly what W4A8 targets.
   **0.94×**, large **0.95×**, prefill **0.99×** — neutral at the tiny batch, *negative* elsewhere.
   The MoE GEMM we replace is only ~19–29% of decode while comm + dense fp16 dominate, so a
   per-GEMM-competitive kernel buys ~0 end-to-end.
-- **W4A8's ideal case can't even load.** The dense 27B *is* int4-GEMM-bound (~57%) — the one place
-  a faster W4 path should win big — but the W4A8 adapter **OOMs at weight conversion**
-  (`vllm_adapter.py:168` materializes the full `(N,K,8)`-expanded int4 unpack), all four regimes
-  dead on a 16 GB card. The favorable case is blocked by a **load-time memory bug, not a compute
-  limit** — fixable, but it means there is no dense-path A/B yet.
-- Net: **on this hardware the int4→fp8-WMMA kernel is e2e-neutral where it runs and can't run
-  where it would help.** The kernel chapter closes; the dense-path OOM is the one concrete lead.
+- **W4A8's ideal case was unloadable — now fixed.** The dense 27B *is* int4-GEMM-bound (~57%) —
+  the one place a faster W4 path should win big — but in the sweep the W4A8 adapter **OOM'd at
+  weight conversion**, materializing the full `(N,K,8)`-expanded int4 unpack and killing all four
+  27B regimes on a 16 GB card. That load-time memory bug has since been fixed (chunked/in-place
+  unpack in `vllm_adapter.py`), so the dense-path A/B is now **runnable but not yet measured** —
+  and it's the one open datapoint that could still move the verdict, being the kernel's most
+  favorable workload.
+- Net: **on the MoE model the int4→fp8-WMMA kernel is e2e-neutral; its best case — the dense,
+  int4-GEMM-bound 27B — is now loadable and awaiting an A/B.** The kernel chapter is closing,
+  pending that one dense comparison.
 
 **The war story that came free.** The sweep wrote ~300 MB kineto traces per cell into a
 **RAM-backed `/tmp` (45 GB tmpfs)** while TP=2 vLLM held both cards — and this box swapped to a
