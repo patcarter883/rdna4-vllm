@@ -477,7 +477,10 @@ def _run_grouped_moe(x, w1, w2, w1_s, w2_s, w1_zp, w2_zp,
     scales ``(E, N, K//g)``. This is the single validated implementation
     (``test_moe_experts.py`` mirrors it; 11/11 on gfx1201)."""
     import w4a8_fp8_wmma
-    from vllm.model_executor.layers.fused_moe.activation import apply_moe_activation
+    from vllm.model_executor.layers.fused_moe.activation import (
+        MoEActivation,
+        apply_moe_activation,
+    )
     from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
         moe_align_block_size,
     )
@@ -551,14 +554,32 @@ def _run_grouped_moe(x, w1, w2, w1_s, w2_s, w1_zp, w2_zp,
     x16 = x_in.to(torch.float16) if x_in.dtype != torch.float16 else x_in
     x16 = x16.contiguous()
 
-    # gemm1 (w13): padded-sorted (P, 2*inter)
-    out1 = mmq(x16, w1, w1_s, sorted_ids, expert_ids, ntp,
-               top_k, block_m, version=gver, w_zeros=w1_zp)
-
-    # gate * up -> (P, inter)
-    act_dim = out1.size(1) // 2 if activation.is_gated else out1.size(1)
-    buf2 = torch.empty((P, act_dim), dtype=torch.float16, device=dev)
-    apply_moe_activation(activation, buf2, out1)
+    # gemm1 (w13) -> (gate * silu(up)) -> (P, inter). The WMMA path (v5/v6) fuses
+    # silu_and_mul into gemm1's epilogue (mmq_fp8_moe_gemm1_silu), so gemm1 writes
+    # the post-activation (P, inter) DIRECTLY -- dropping the (P, 2*inter) out1 +
+    # (P, inter) buf2 HBM round-trip and the separate silu launch (ROADMAP Task 3,
+    # the prefill/mid intermediate-traffic win; at DECODE the wall is gemm2's
+    # weight-read BW, not these buffers -- so the use_gemv decode branch keeps the
+    # unfused v7 path). Fused only for gated SILU on v5/v6; everything else (v0
+    # golden, GELU/other activations, the GEMV decode path) takes the unfused
+    # gemm1 + apply_moe_activation. Bit-exact to the unfused path (see the kernel's
+    # moe_silu_and_mul_h). Env-gated for A/B + bit-exact verification.
+    fuse_silu = os.environ.get(
+        "VLLM_ROCM_W4A8_FP8_WMMA_MOE_FUSE_SILU", "1") == "1"
+    can_fuse = (fuse_silu and not use_gemv and gver in (5, 6)
+                and activation.is_gated and activation == MoEActivation.SILU)
+    if can_fuse:
+        buf2 = w4a8_fp8_wmma.mmq_fp8_moe_gemm1_silu(
+            x16, w1, w1_s, sorted_ids, expert_ids, ntp,
+            top_k, block_m, version=gver, w_zeros=w1_zp)     # (P, inter)
+    else:
+        # gemm1 (w13): padded-sorted (P, 2*inter)
+        out1 = mmq(x16, w1, w1_s, sorted_ids, expert_ids, ntp,
+                   top_k, block_m, version=gver, w_zeros=w1_zp)
+        # gate * up -> (P, inter)
+        act_dim = out1.size(1) // 2 if activation.is_gated else out1.size(1)
+        buf2 = torch.empty((P, act_dim), dtype=torch.float16, device=dev)
+        apply_moe_activation(activation, buf2, out1)
 
     if apply_router_weight_on_input:
         tw_flat = torch.ones(M * top_k, dtype=torch.float32, device=dev)

@@ -69,6 +69,47 @@ def mmq_fp8_moe_gemm(
         num_tokens_post_padded, top_k, block_m, version)
 
 
+def mmq_fp8_moe_gemm1_silu(
+    x: torch.Tensor,
+    w_packed: torch.Tensor,
+    scales: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    top_k: int,
+    block_m: int,
+    version: int = 6,
+    w_zeros: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Fused gemm1 + silu_and_mul for the gated MoE (gfx1201).
+
+    Runs the gated gemm1 (w13, N = 2*inter = [gate | up]) AND the silu_and_mul
+    activation in one kernel, returning the post-activation ``(P, inter)`` directly
+    -- dropping the separate silu launch and the (P, 2*inter) out1 / (P, inter)
+    buf2 HBM round-trip the unfused ``mmq_fp8_moe_gemm`` + ``silu_and_mul`` pays.
+
+    Bit-exact to ``mmq_fp8_moe_gemm(x, w13, ..., version)`` followed by
+    ``torch.ops._C.silu_and_mul`` (each half rounded to fp16 exactly as gemm1's
+    store, silu in fp32 then fp16, final half*half multiply).
+
+    Args:
+        x: (T, K) fp16 token activations.
+        w_packed: (E, 2*inter, K/8) int32 stacked w13 ([gate|up] along dim 1).
+        scales: (E, 2*inter, K/group) fp16.
+        version: 5 (A+B LDS) or 6 (A-out-of-LDS, served default). Only the WMMA
+                 tiles support the fused epilogue.
+        w_zeros: (E, (2*inter)/8, K/group) int32 (AWQ) or None (uint4b8 zp=8).
+
+    Returns:
+        (P, inter) fp16 post-activation in the padded sorted layout.
+    """
+    if w_zeros is None:
+        w_zeros = torch.empty(0, dtype=torch.int32, device=x.device)
+    return torch.ops.w4a8_fp8_wmma.mmq_fp8_moe_gemm1_silu(
+        x, w_packed, scales, w_zeros, sorted_token_ids, expert_ids,
+        num_tokens_post_padded, top_k, block_m, version)
+
+
 def mmq_fp8_moe_gemm_scatter(
     x: torch.Tensor,
     w_packed: torch.Tensor,

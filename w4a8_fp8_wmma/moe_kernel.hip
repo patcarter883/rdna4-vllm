@@ -517,6 +517,339 @@ __global__ void __launch_bounds__(MV5_MAX_WARPS * 32) moe_gemm_v6_kernel(
 }
 
 // ============================================================
+// gemm1 + silu_and_mul FUSED epilogue (gemm1-only, non-scatter). The gated MoE's
+// gemm1 produces (P, 2*inter) [gate | up], which the stock apply then runs through
+// a SEPARATE silu_and_mul launch -> (P, inter) buf2 -> gemm2. That stages out1
+// (P,2*inter) AND buf2 (P,inter) through HBM. These kernels fuse the activation
+// into gemm1's epilogue: ONE block computes BOTH the gate N-tile [block_n,
+// block_n+BN) and the matching up N-tile [block_n+inter, ...) for the same expert,
+// then writes silu(gate)*up directly to (P, inter) -- dropping buf2 and the silu
+// launch, and halving gemm1's output HBM write.
+//
+// BIT-EXACT to the unfused gemm1 + torch.ops._C.silu_and_mul path: each half-tile
+// accumulator is rounded to fp16 EXACTLY as the unfused gemm1 store would be
+// (__float2half(acc*asc)), then silu is computed in fp32 and cast to fp16
+// (vllm::silu_kernel<half>: (half)((float)x/(1+expf(-x)))), and the final product
+// is a HALF*HALF multiply (vllm act_first compute: ACT_FN(x)*y) -- matching
+// activation_kernels.cu silu_and_mul and test_moe_experts.fp8_ref_moe.
+__device__ __forceinline__ __half moe_silu_and_mul_h(float gate_f, float up_f) {
+    const __half gate_h = __float2half(gate_f);  // == unfused gemm1's gate store
+    const __half up_h = __float2half(up_f);      // == unfused gemm1's up store
+    const float g = __half2float(gate_h);
+    const __half silu_h = __float2half(g / (1.0f + expf(-g)));  // silu_kernel<half>
+    return __hmul(silu_h, up_h);                 // half*half (act_first compute)
+}
+
+// v5-based fused gemm1+silu (A+B in LDS). block_n spans the GATE columns; the
+// expert's up weights live at row (inter + abs_n), so we stage TWO B-slabs/group
+// and keep TWO accumulator sets. group_size BK; A_tile then gate B_tile then up
+// B_tile in dynamic LDS.
+template<int BN>
+__global__ void __launch_bounds__(MV5_MAX_WARPS * 32) moe_gemm1_silu_v5_kernel(
+    const unsigned char* __restrict__ x_fp8,
+    const float*         __restrict__ act_scales,
+    const int*           __restrict__ w_packed,
+    const __half*        __restrict__ w_scales,
+    const int*           __restrict__ w_zeros,
+    const int*           __restrict__ sorted_token_ids,
+    const int*           __restrict__ expert_ids,
+    const int*           __restrict__ num_tokens_post_padded,
+    __half*              __restrict__ out,       // (P, inter)
+    int T, int N, int K, int group_size, int top_k, int block_m,
+    int num_valid_tokens, int inter) {
+
+    constexpr int NFRAG = BN / WMMA_DIM;
+    const int block_idx = blockIdx.y;
+    const int row0 = block_idx * block_m;
+    const int P_valid = num_tokens_post_padded[0];
+    if (row0 >= P_valid) return;
+
+    const int block_n = blockIdx.x * BN;         // gate column base in [0, inter)
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+    const int lrow = lane & 15;
+    const int khalf = (lane >> 4) * 8;
+    const int frag_col = lane & 15;
+    const int frag_row0 = (lane >> 4) * 8;
+    const int n_warps = block_m / WMMA_DIM;
+    if (warp_id >= n_warps) return;
+
+    const int e = expert_ids[block_idx];
+    const int num_groups = K / group_size;
+    const int ppr = K / PACK_FACTOR;
+    const int* wq_e = w_packed + (long)e * N * ppr;
+    const __half* ws_e = w_scales + (long)e * N * num_groups;
+    const int* wz_e = (w_zeros != nullptr)
+                      ? w_zeros + (long)e * (N / 8) * num_groups : nullptr;
+
+    const int BK = group_size;
+    const int LDSBK = BK + LDS_PAD;
+    extern __shared__ unsigned char smem[];
+    unsigned char* A_tile = smem;                     // block_m rows
+    unsigned char* Bg_tile = A_tile + block_m * LDSBK;     // gate B
+    unsigned char* Bu_tile = Bg_tile + BN * LDSBK;         // up B
+
+    float run_g[NFRAG][8], run_u[NFRAG][8];
+    #pragma unroll
+    for (int f = 0; f < NFRAG; ++f)
+        #pragma unroll
+        for (int ee = 0; ee < 8; ++ee) { run_g[f][ee] = 0.0f; run_u[f][ee] = 0.0f; }
+
+    const int total_threads = n_warps * 32;
+    const int njobs = BN * (BK / PACK_FACTOR);
+    for (int g = 0; g < num_groups; ++g) {
+        const int k0 = g * BK;
+        // stage activations (shared by both halves).
+        for (int idx = tid * 4; idx < block_m * BK; idx += total_threads * 4) {
+            const int r = idx / BK, k = idx % BK;
+            unsigned int v = 0u;
+            const int offs_token = sorted_token_ids[row0 + r];
+            if (offs_token < num_valid_tokens) {
+                const int src = offs_token / top_k;
+                v = *reinterpret_cast<const unsigned int*>(&x_fp8[(long)src * K + k0 + k]);
+            }
+            *reinterpret_cast<unsigned int*>(&A_tile[r * LDSBK + k]) = v;
+        }
+        // stage BOTH weight slabs: gate row (block_n+n), up row (inter+block_n+n).
+        for (int j = tid; j < njobs; j += total_threads) {
+            const int n = j / (BK / PACK_FACTOR), k8 = j % (BK / PACK_FACTOR);
+            const int ang = block_n + n;            // gate output row
+            const int anu = inter + block_n + n;    // up output row
+            int wg = 0, zg = 8, wu = 0, zu = 8;
+            if (ang < inter) {
+                wg = wq_e[ang * ppr + (k0 / PACK_FACTOR) + k8];
+                if (wz_e != nullptr)
+                    zg = (wz_e[(ang / 8) * num_groups + g] >> ((ang % 8) * 4)) & 0xF;
+                wu = wq_e[anu * ppr + (k0 / PACK_FACTOR) + k8];
+                if (wz_e != nullptr)
+                    zu = (wz_e[(anu / 8) * num_groups + g] >> ((anu % 8) * 4)) & 0xF;
+            }
+            unsigned char* dg = &Bg_tile[n * LDSBK + k8 * PACK_FACTOR];
+            unsigned char* du = &Bu_tile[n * LDSBK + k8 * PACK_FACTOR];
+            #pragma unroll
+            for (int jj = 0; jj < PACK_FACTOR; ++jj) {
+                dg[jj] = (ang < inter) ? int4_signed_to_e4m3(((wg >> (jj * 4)) & 0xF) - zg) : 0;
+                du[jj] = (ang < inter) ? int4_signed_to_e4m3(((wu >> (jj * 4)) & 0xF) - zu) : 0;
+            }
+        }
+        __syncthreads();
+
+        v8f_t accg[NFRAG], accu[NFRAG];
+        #pragma unroll
+        for (int f = 0; f < NFRAG; ++f) {
+            accg[f] = v8f_t{0,0,0,0,0,0,0,0}; accu[f] = v8f_t{0,0,0,0,0,0,0,0};
+        }
+        const int k_sub = BK / WMMA_DIM;
+        const int a_base = (warp_id * WMMA_DIM + lrow) * LDSBK + khalf;
+        const int b_base = lrow * LDSBK + khalf;
+        for (int kt = 0; kt < k_sub; ++kt) {
+            const int ko = kt * WMMA_DIM;
+            v2i_t a_cur = *reinterpret_cast<const v2i_t*>(&A_tile[a_base + ko]);
+            #pragma unroll
+            for (int f = 0; f < NFRAG; ++f) {
+                v2i_t bg = *reinterpret_cast<const v2i_t*>(
+                    &Bg_tile[b_base + f * WMMA_DIM * LDSBK + ko]);
+                v2i_t bu = *reinterpret_cast<const v2i_t*>(
+                    &Bu_tile[b_base + f * WMMA_DIM * LDSBK + ko]);
+                accg[f] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a_cur, bg, accg[f]);
+                accu[f] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a_cur, bu, accu[f]);
+            }
+        }
+        #pragma unroll
+        for (int f = 0; f < NFRAG; ++f) {
+            const int abs_n = block_n + f * WMMA_DIM + frag_col;
+            const float wscg = (abs_n < inter)
+                ? __half2float(ws_e[abs_n * num_groups + g]) : 0.0f;
+            const float wscu = (abs_n < inter)
+                ? __half2float(ws_e[(inter + abs_n) * num_groups + g]) : 0.0f;
+            #pragma unroll
+            for (int ee = 0; ee < 8; ++ee) {
+                run_g[f][ee] += accg[f][ee] * wscg;
+                run_u[f][ee] += accu[f][ee] * wscu;
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int ee = 0; ee < 8; ++ee) {
+        const int r = warp_id * WMMA_DIM + frag_row0 + ee;
+        if (r >= block_m) continue;
+        const int row_pad = row0 + r;
+        const int offs_token = sorted_token_ids[row_pad];
+        if (offs_token >= num_valid_tokens) continue;
+        const float asc = act_scales[offs_token / top_k];
+        #pragma unroll
+        for (int f = 0; f < NFRAG; ++f) {
+            const int abs_n = block_n + f * WMMA_DIM + frag_col;
+            if (abs_n < inter)
+                out[(long)row_pad * inter + abs_n] =
+                    moe_silu_and_mul_h(run_g[f][ee] * asc, run_u[f][ee] * asc);
+        }
+    }
+}
+
+// v6-based fused gemm1+silu (A out of LDS via warp-shuffle, B-only LDS). Served
+// default (version 6). Same two-slab gate/up structure as the v5 fused kernel; B
+// LDS holds gtile groups x (gate + up) slabs.
+template<int BN>
+__global__ void __launch_bounds__(MV5_MAX_WARPS * 32) moe_gemm1_silu_v6_kernel(
+    const unsigned char* __restrict__ x_fp8,
+    const float*         __restrict__ act_scales,
+    const int*           __restrict__ w_packed,
+    const __half*        __restrict__ w_scales,
+    const int*           __restrict__ w_zeros,
+    const int*           __restrict__ sorted_token_ids,
+    const int*           __restrict__ expert_ids,
+    const int*           __restrict__ num_tokens_post_padded,
+    __half*              __restrict__ out,       // (P, inter)
+    int T, int N, int K, int group_size, int top_k, int block_m,
+    int num_valid_tokens, int gtile, int inter) {
+
+    constexpr int NFRAG = BN / WMMA_DIM;
+    const int block_idx = blockIdx.y;
+    const int row0 = block_idx * block_m;
+    const int P_valid = num_tokens_post_padded[0];
+    if (row0 >= P_valid) return;
+
+    const int block_n = blockIdx.x * BN;         // gate column base in [0, inter)
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+    const int lrow = lane & 15;
+    const int khalf = (lane >> 4) * 8;
+    const int frag_col = lane & 15;
+    const int frag_row0 = (lane >> 4) * 8;
+    const int n_warps = block_m / WMMA_DIM;
+    if (warp_id >= n_warps) return;
+
+    const int e = expert_ids[block_idx];
+    const int num_groups = K / group_size;
+    const int ppr = K / PACK_FACTOR;
+    const int* wq_e = w_packed + (long)e * N * ppr;
+    const __half* ws_e = w_scales + (long)e * N * num_groups;
+    const int* wz_e = (w_zeros != nullptr)
+                      ? w_zeros + (long)e * (N / 8) * num_groups : nullptr;
+
+    const int BK = group_size;
+    const int LDSBK = BK + LDS_PAD;
+    extern __shared__ unsigned char smem[];
+    unsigned char* B_tile = smem;                 // gtile x (gate|up) slabs, B only
+
+    // hoisted per-lane activation gather (constant across the K loop), as in v6.
+    const int a_my_row = row0 + warp_id * WMMA_DIM + (lane >> 1);
+    const int a_offs = sorted_token_ids[a_my_row];
+    const bool a_valid = a_offs < num_valid_tokens;
+    const int a_src = a_offs / top_k;
+    const int a_kh = (lane & 1) * 8;
+    const int a_src_lane = 2 * (lane & 15) + (lane >> 4);
+
+    float run_g[NFRAG][8], run_u[NFRAG][8];
+    #pragma unroll
+    for (int f = 0; f < NFRAG; ++f)
+        #pragma unroll
+        for (int ee = 0; ee < 8; ++ee) { run_g[f][ee] = 0.0f; run_u[f][ee] = 0.0f; }
+
+    const int total_threads = n_warps * 32;
+    const int k_sub = BK / WMMA_DIM;
+    const int b_base = lrow * LDSBK + khalf;
+    const int slab = BN * LDSBK;                   // bytes for one (BN, BK) slab
+    const int njobs = BN * (BK / PACK_FACTOR);
+    for (int gt = 0; gt < num_groups; gt += gtile) {
+        const int gend = (gt + gtile < num_groups) ? (gt + gtile) : num_groups;
+        for (int gi = gt; gi < gend; ++gi) {
+            const int k0 = gi * BK;
+            // two slabs per group: gate then up.
+            unsigned char* Bg = B_tile + (long)(gi - gt) * 2 * slab;
+            unsigned char* Bu = Bg + slab;
+            for (int j = tid; j < njobs; j += total_threads) {
+                const int n = j / (BK / PACK_FACTOR), k8 = j % (BK / PACK_FACTOR);
+                const int ang = block_n + n;
+                const int anu = inter + block_n + n;
+                int wg = 0, zg = 8, wu = 0, zu = 8;
+                if (ang < inter) {
+                    wg = wq_e[ang * ppr + (k0 / PACK_FACTOR) + k8];
+                    if (wz_e != nullptr)
+                        zg = (wz_e[(ang / 8) * num_groups + gi] >> ((ang % 8) * 4)) & 0xF;
+                    wu = wq_e[anu * ppr + (k0 / PACK_FACTOR) + k8];
+                    if (wz_e != nullptr)
+                        zu = (wz_e[(anu / 8) * num_groups + gi] >> ((anu % 8) * 4)) & 0xF;
+                }
+                unsigned char* dg = &Bg[n * LDSBK + k8 * PACK_FACTOR];
+                unsigned char* du = &Bu[n * LDSBK + k8 * PACK_FACTOR];
+                #pragma unroll
+                for (int jj = 0; jj < PACK_FACTOR; ++jj) {
+                    dg[jj] = (ang < inter) ? int4_signed_to_e4m3(((wg >> (jj * 4)) & 0xF) - zg) : 0;
+                    du[jj] = (ang < inter) ? int4_signed_to_e4m3(((wu >> (jj * 4)) & 0xF) - zu) : 0;
+                }
+            }
+        }
+        __syncthreads();
+
+        for (int gi = gt; gi < gend; ++gi) {
+            const int k0 = gi * BK;
+            unsigned char* Bg = B_tile + (long)(gi - gt) * 2 * slab;
+            unsigned char* Bu = Bg + slab;
+            v8f_t accg[NFRAG], accu[NFRAG];
+            #pragma unroll
+            for (int f = 0; f < NFRAG; ++f) {
+                accg[f] = v8f_t{0,0,0,0,0,0,0,0}; accu[f] = v8f_t{0,0,0,0,0,0,0,0};
+            }
+            for (int kt = 0; kt < k_sub; ++kt) {
+                const int gk = k0 + kt * WMMA_DIM + a_kh;
+                v2i_t av = v2i_t{0, 0};
+                if (a_valid)
+                    av = *reinterpret_cast<const v2i_t*>(&x_fp8[(long)a_src * K + gk]);
+                v2i_t a_cur;
+                a_cur[0] = __shfl(av[0], a_src_lane);
+                a_cur[1] = __shfl(av[1], a_src_lane);
+                #pragma unroll
+                for (int f = 0; f < NFRAG; ++f) {
+                    v2i_t bg = *reinterpret_cast<const v2i_t*>(
+                        &Bg[b_base + f * WMMA_DIM * LDSBK + kt * WMMA_DIM]);
+                    v2i_t bu = *reinterpret_cast<const v2i_t*>(
+                        &Bu[b_base + f * WMMA_DIM * LDSBK + kt * WMMA_DIM]);
+                    accg[f] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a_cur, bg, accg[f]);
+                    accu[f] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a_cur, bu, accu[f]);
+                }
+            }
+            #pragma unroll
+            for (int f = 0; f < NFRAG; ++f) {
+                const int abs_n = block_n + f * WMMA_DIM + frag_col;
+                const float wscg = (abs_n < inter)
+                    ? __half2float(ws_e[abs_n * num_groups + gi]) : 0.0f;
+                const float wscu = (abs_n < inter)
+                    ? __half2float(ws_e[(inter + abs_n) * num_groups + gi]) : 0.0f;
+                #pragma unroll
+                for (int ee = 0; ee < 8; ++ee) {
+                    run_g[f][ee] += accg[f][ee] * wscg;
+                    run_u[f][ee] += accu[f][ee] * wscu;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int ee = 0; ee < 8; ++ee) {
+        const int r = warp_id * WMMA_DIM + frag_row0 + ee;
+        if (r >= block_m) continue;
+        const int row_pad = row0 + r;
+        const int offs_token = sorted_token_ids[row_pad];
+        if (offs_token >= num_valid_tokens) continue;
+        const float asc = act_scales[offs_token / top_k];
+        #pragma unroll
+        for (int f = 0; f < NFRAG; ++f) {
+            const int abs_n = block_n + f * WMMA_DIM + frag_col;
+            if (abs_n < inter)
+                out[(long)row_pad * inter + abs_n] =
+                    moe_silu_and_mul_h(run_g[f][ee] * asc, run_u[f][ee] * asc);
+        }
+    }
+}
+
+// ============================================================
 // grouped v7: DECODE-specialised grouped GEMV -- the MoE analogue of dense v11.
 // One warp per output column n of ONE expert; the 32 lanes stream that column's
 // K/8 int32 weight row coalesced (b128 = v4i = 32 fp8/lane), expand int4->fp8
@@ -875,7 +1208,101 @@ __global__ void moe_gather_reduce_kernel(
 
 }  // namespace w4a8_fp8_moe
 
+// run body for the fused gemm1+silu: act-fp8-quant then the gate/up two-slab GEMM
+// with the silu_and_mul epilogue, writing (P, inter). gemm1-only / non-scatter.
+static void run_moe_gemm1_silu(
+    const at::Tensor& x, const at::Tensor& w_packed, const at::Tensor& scales,
+    const int* wz, const at::Tensor& sorted_token_ids,
+    const at::Tensor& expert_ids, const at::Tensor& num_tokens_post_padded,
+    __half* out, int N, int inter, int num_valid_tokens, int top_k, int block_m,
+    int version) {
+    using namespace w4a8_fp8_moe;
+    const int T = x.size(0);
+    const int K = x.size(1);
+    const int group_size = K / scales.size(2);
+    const int P = sorted_token_ids.size(0);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    auto x_fp8 = at::empty({T, K}, x.options().dtype(at::kByte));
+    auto act_scales = at::empty({T}, x.options().dtype(at::kFloat));
+    moe_compute_act_fp8_kernel<<<dim3(T), dim3(ACTQUANT_BLOCK), 0, stream>>>(
+        reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),
+        x_fp8.data_ptr<unsigned char>(), act_scales.data_ptr<float>(), T, K);
+
+    const __half* wsc = reinterpret_cast<const __half*>(scales.data_ptr<at::Half>());
+    const int* sti = sorted_token_ids.data_ptr<int>();
+    const int* eid = expert_ids.data_ptr<int>();
+    const int* ntp = num_tokens_post_padded.data_ptr<int>();
+    const unsigned char* xf = x_fp8.data_ptr<unsigned char>();
+    const float* asc = act_scales.data_ptr<float>();
+    const int* wq = w_packed.data_ptr<int>();
+
+    // Same BN / gtile knobs as the unfused v5/v6 path; the grid spans `inter`
+    // (gate columns), each block also pulling the matching up tile.
+    int bn = MV5_BN;
+    if (const char* e = std::getenv("VLLM_W4A8_MOE_BN")) bn = std::atoi(e);
+    int gt6 = 4;
+    if (const char* e = std::getenv("VLLM_W4A8_MOE_GTILE")) gt6 = std::atoi(e);
+    const int ng = K / group_size;
+    if (gt6 < 1) gt6 = 1; if (gt6 > ng) gt6 = ng;
+    // two slabs/group (gate + up) -> half the 40KB B budget per group-pair.
+    const size_t per_grp = (size_t)2 * bn * (group_size + LDS_PAD);
+    while (gt6 > 1 && per_grp * gt6 > 40960) gt6--;
+    dim3 block((block_m / WMMA_DIM) * 32);
+    dim3 grid((inter + bn - 1) / bn, P / block_m);
+    if (version == 6) {
+        const size_t smem6 = per_grp * gt6;  // 2 slabs (gate|up) x gtile groups
+        #define G1SILU_V6(BN_T) moe_gemm1_silu_v6_kernel<BN_T><<<grid, block, smem6, stream>>>( \
+            xf, asc, wq, wsc, wz, sti, eid, ntp, out, T, N, K, group_size, \
+            top_k, block_m, num_valid_tokens, gt6, inter)
+        if (bn == 128) G1SILU_V6(128); else G1SILU_V6(MV5_BN);
+        #undef G1SILU_V6
+    } else {  // version 5: A+B LDS, gate + up B slabs + A tile
+        const size_t smem5 = (size_t)(block_m + 2 * bn) * (group_size + LDS_PAD);
+        #define G1SILU_V5(BN_T) moe_gemm1_silu_v5_kernel<BN_T><<<grid, block, smem5, stream>>>( \
+            xf, asc, wq, wsc, wz, sti, eid, ntp, out, T, N, K, group_size, \
+            top_k, block_m, num_valid_tokens, inter)
+        if (bn == 128) G1SILU_V5(128); else G1SILU_V5(MV5_BN);
+        #undef G1SILU_V5
+    }
+}
+
 // =================== Host launchers ===================
+// Fused gemm1 + silu_and_mul: runs the gated gemm1 (w13, output 2*inter) and the
+// silu_and_mul activation in ONE kernel, writing the post-activation (P, inter)
+// directly. Drops the separate silu launch + the (P,2*inter) out1 / (P,inter) buf2
+// HBM round-trip. v5/v6 only (the WMMA tiles); bit-exact to gemm1 + _C.silu_and_mul.
+void launch_mmq_fp8_moe_gemm1_silu_gfx1201(
+    const at::Tensor& x,                 // (T, K) fp16
+    const at::Tensor& w_packed,          // (E, 2*inter, K/8) int32 (w13)
+    const at::Tensor& scales,            // (E, 2*inter, K/group) fp16
+    const at::Tensor& w_zeros,           // (E, (2*inter)/8, K/group) int32 or empty
+    const at::Tensor& sorted_token_ids,  // (P,) int32
+    const at::Tensor& expert_ids,        // (P/block_m,) int32
+    const at::Tensor& num_tokens_post_padded,  // (1,) int32
+    at::Tensor& out,                     // (P, inter) fp16
+    int64_t top_k, int64_t block_m, int64_t version) {
+
+    using namespace w4a8_fp8_moe;
+    const int N = w_packed.size(1);           // 2*inter (gate|up)
+    const int inter = N / 2;
+    const int num_valid_tokens = x.size(0) * (int)top_k;
+    const int group_size = x.size(1) / scales.size(2);
+    TORCH_CHECK(group_size % WMMA_DIM == 0 && group_size <= MAX_GROUP_SIZE,
+                "group_size must be mult of 16 and <=128; got ", group_size);
+    TORCH_CHECK(version == 5 || version == 6,
+                "fused gemm1+silu needs version 5 or 6; got ", version);
+    TORCH_CHECK(block_m % WMMA_DIM == 0 && block_m <= 128,
+                "fused gemm1+silu block_m must be mult of 16 and <=128; got ", block_m);
+    const int* wz = (w_zeros.defined() && w_zeros.numel() > 0)
+                    ? w_zeros.data_ptr<int>() : nullptr;
+    run_moe_gemm1_silu(
+        x, w_packed, scales, wz, sorted_token_ids, expert_ids,
+        num_tokens_post_padded,
+        reinterpret_cast<__half*>(out.data_ptr<at::Half>()), N, inter,
+        num_valid_tokens, (int)top_k, (int)block_m, (int)version);
+}
+
 void launch_mmq_fp8_moe_gemm_gfx1201(
     const at::Tensor& x,                 // (T, K) fp16
     const at::Tensor& w_packed,          // (E, N, K/8) int32
