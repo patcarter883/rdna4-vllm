@@ -62,8 +62,8 @@ def main():
         b = triton_w4a16_gemm(x0, bq, tsc, None, G, 8).float()
         rel = ((a - b).abs().mean() / b.abs().mean().clamp_min(1e-6)).item()
         print(f"\n=== K={K} N={N}  (us; best-ours/triton; v5~triton rel={rel:.2e}) ===")
-        print(f"{'M':>5} | {'triton':>8} {'v11':>8} {'v10':>8} {'v5':>8} | "
-              f"{'best':>8} {'best/tri':>9} {'winner':>7}")
+        print(f"{'M':>5} | {'triton':>8} {'v11':>8} {'v10':>8} {'v6':>8} "
+              f"{'v5':>8} | {'best':>8} {'best/tri':>9} {'winner':>7}")
         for M in Ms:
             x = torch.randn(M, K, dtype=torch.float16, device=dev) * 0.5
             tt = bench(lambda: triton_w4a16_gemm(x, bq, tsc, None, G, 8)) * 1e6
@@ -72,12 +72,17 @@ def main():
                 cand["v11"] = bench(lambda: op(x, wp, sc, empty, 11)) * 1e6
             if v10_ok:
                 cand["v10"] = bench(lambda: op(x, wp, sc, empty, 10)) * 1e6
+            # v6 (b128 double-K) -- the mid-M lever; needs G % 32 == 0. Bit-exact
+            # vs v5, so include it as a candidate and let the winner column show
+            # where it beats v5/v10/Triton (-> sets VLLM_ROCM_W4A8_V6_{MIN,MAX}_M).
+            if G % 32 == 0:
+                cand["v6"] = bench(lambda: op(x, wp, sc, empty, 6)) * 1e6
             cand["v5"] = bench(lambda: op(x, wp, sc, empty, 5)) * 1e6
             bestk = min(cand, key=cand.get)
             best = cand[bestk]
             g = lambda k: f"{cand[k]:8.1f}" if k in cand else f"{'-':>8}"
-            print(f"{M:>5} | {tt:8.1f} {g('v11')} {g('v10')} {g('v5')} | "
-                  f"{best:8.1f} {best/tt:9.2f} {bestk:>7}")
+            print(f"{M:>5} | {tt:8.1f} {g('v11')} {g('v10')} {g('v6')} "
+                  f"{g('v5')} | {best:8.1f} {best/tt:9.2f} {bestk:>7}")
 
 
 if __name__ == "__main__":

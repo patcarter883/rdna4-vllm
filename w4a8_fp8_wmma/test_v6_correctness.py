@@ -1,8 +1,16 @@
 """v6 (K-extension) correctness vs v0 (scalar golden) and v5 (raw b64 WMMA).
 
 v6 loads byte-identical operands to v5 via b128 dual-subtile reads, so it must
-match v5 to ~fp rounding and v0 to fp8-quant tolerance. Run on GPU1:
+match v5 EXACTLY (the loaded bytes are bit-identical; only the LDS load width /
+WMMA issue order differ -- WMMA accumulation order is unchanged) and v0 to
+fp8-quant tolerance. Run on GPU1:
     HIP_VISIBLE_DEVICES=1 python /tmp/test_v6_correctness.py
+
+Expected tolerance (the served-dispatch gate VLLM_ROCM_W4A8_V6_{MIN,MAX}_M relies
+on this): v6-vs-v5 relmean < 1e-3 (effectively 0 -- identical operands & MMA
+order; any nonzero is fp16-store rounding noise), v6-vs-v0 relmean < 0.06 (the
+shared fp8 activation-quant tolerance, same bound v5 meets). Covers every
+group_size the gate can engage (gs % 32 == 0, <= 128: 32/64/96/128), sym + asym.
 """
 import torch
 import w4a8_fp8_wmma  # noqa: F401  loads torch.ops.w4a8_fp8_wmma
@@ -68,6 +76,8 @@ if __name__ == "__main__":
         (2048, 4096, 11008, 128, False),
         (37, 4096, 4096, 128, False),   # M tail
         (4096, 4096, 4096, 64, True),   # G=64
+        (768, 4608, 4096, 96, False),   # G=96 (gate also engages here)
+        (768, 4608, 4096, 96, True),
     ]
     for (M, K, N, G, asym) in cases:
         r65, r60 = run_case(M, K, N, G, asym)
