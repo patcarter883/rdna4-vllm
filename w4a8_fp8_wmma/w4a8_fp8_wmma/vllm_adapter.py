@@ -47,6 +47,37 @@ def _force_mode() -> str:
     return "auto"
 
 
+def _v6_band() -> tuple[int, int] | None:
+    """Optional mid-M band routed to kernel v6 (b128 double-K loads).
+
+    v6 issues TWO back-to-back WMMAs per b128 (16-fp8) LDS read, halving the LDS
+    load-instruction count vs v5's b64-per-subtile. It loads BIT-IDENTICAL
+    operands to v5 (a permuted LDS layout, see the v6 kernel header) so it is
+    bit-exact vs v5 — only the instruction mix changes. It is the ROADMAP Task-4
+    lever for the mid-M band (~512-2048) where the served path currently trails
+    Triton (DIARY Act VI/VIII, 0.66-0.9x). v6 reuses v5's V2_BM=256/V2_BN=64 tile
+    and needs group_size % 32 == 0 (k_sub even for the dual-subtile pairing).
+
+    OFF by default: returns None unless BOTH band bounds are set, so the served
+    dispatch is byte-identical to before until v6 is benchmarked on the target GPU
+    (the pathway never regresses unmeasured). To engage, after measuring v6's
+    crossover (bench_v6.py / bench_dense_vs_triton.py):
+      VLLM_ROCM_W4A8_V6_MIN_M=<lo> VLLM_ROCM_W4A8_V6_MAX_M=<hi>
+    routes M in [lo, hi] (with gs%32==0) to v6 instead of the v10/v5 it would
+    otherwise pick. The band is closed [lo, hi]; set hi huge for an open suffix."""
+    lo = os.environ.get("VLLM_ROCM_W4A8_V6_MIN_M")
+    hi = os.environ.get("VLLM_ROCM_W4A8_V6_MAX_M")
+    if lo is None or hi is None:
+        return None
+    try:
+        lo_i, hi_i = int(lo), int(hi)
+    except ValueError:
+        return None
+    if hi_i < lo_i:
+        return None
+    return (lo_i, hi_i)
+
+
 def _layout_mode() -> str:
     """Weight-layout mode — controls whether the Triton-fallback weight copy is built.
 
@@ -422,7 +453,12 @@ class RocmW4A8Fp8WmmaLinearKernel(MPLinearKernel):
         # Kernel selection by M (all bit-exact; each wins its regime):
         #   decode (M<=DECODE_MAX): v11 streaming GEMV   -> beats Triton ~1.4-1.9x
         #   prefill (M>=prefill_min): v10 A-shuffle WMMA -> beats fp16/Triton
+        #   mid-M band (opt-in): v6 b128 double-K WMMA   -> ROADMAP Task 4 lever
         #   middle / unsupported shapes: Triton W4A16 fallback (safe).
+        # NB seam (actquant-fusion task): the op stages activations to fp8 ONCE in
+        # the host launcher (compute_act_fp8_and_scales_kernel) and ALL versions
+        # (v6 included) consume the same x_fp8/act_scales -- this adapter only picks
+        # the weight-side kernel + load width, never the activation staging.
         # v10 needs group_size in {32,128} (compile-time); v11 needs K%1024==0,
         # group_size%32==0, and M*K<=65536 (activations fit LDS).
         v10_ok = gs in (32, 128)
@@ -462,7 +498,23 @@ class RocmW4A8Fp8WmmaLinearKernel(MPLinearKernel):
             else:
                 use_v5 = True
 
-        if use_v11 or use_v10 or use_v5:
+        # v6 mid-M band (b128 double-K). OFF unless VLLM_ROCM_W4A8_V6_{MIN,MAX}_M
+        # are BOTH set (see _v6_band). When engaged for M in [lo,hi] with gs%32==0,
+        # route to v6 IN PLACE OF the kernel the ladder already chose -- v6 is
+        # bit-exact vs v5/v10 (identical operands; only LDS load width differs), so
+        # this never changes numerics. It only re-targets a WMMA M-range that was
+        # already going to our kernel (so force=='off' still stays on Triton, and an
+        # M that would fall back to Triton is NOT yanked onto v6 -- the band tunes
+        # ours-vs-ours, not ours-vs-Triton, which the crossover cache already gates).
+        use_v6 = False
+        v6_band = _v6_band()
+        if (v6_band is not None and (gs % 32 == 0)
+                and (use_v10 or use_v5)
+                and v6_band[0] <= M <= v6_band[1]):
+            use_v6 = True
+            use_v10 = use_v5 = False
+
+        if use_v11 or use_v10 or use_v6 or use_v5:
             w_q, _w_s_native, w_zp, _ = self._get_weight_params(layer)
             w_s = layer._w4a8_fp8_w_s
             x16 = x_2d if x_2d.dtype == torch.float16 else x_2d.to(torch.float16)
@@ -470,7 +522,7 @@ class RocmW4A8Fp8WmmaLinearKernel(MPLinearKernel):
                 zp_in = w_zp
             else:
                 zp_in = torch.empty(0, dtype=torch.int32, device=x.device)
-            ver = 11 if use_v11 else (10 if use_v10 else 5)
+            ver = 11 if use_v11 else (10 if use_v10 else (6 if use_v6 else 5))
             out = torch.ops.w4a8_fp8_wmma.mmq_fp8_gemm(x16, w_q, w_s, zp_in, ver)
             if orig_dtype != torch.float16:
                 out = out.to(orig_dtype)
