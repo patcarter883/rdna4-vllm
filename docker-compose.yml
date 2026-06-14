@@ -30,6 +30,7 @@ x-combined-common: &combined-common
   security_opt: [seccomp=unconfined, label=disable]
   cap_add: [SYS_PTRACE]
   ipc: host
+  runtime: amd
   shm_size: "16gb"
   ports:
     - "${VLLM_HOST_PORT:-8000}:8000"
@@ -49,6 +50,8 @@ x-combined-common: &combined-common
     VLLM_ROCM_USE_W4A8_FP8_WMMA: "${USE_W4A8:-1}"
     VLLM_ROCM_W4A8_FP8_WMMA_MOE: "1"
     VLLM_ROCM_W4A8_FP8_WMMA_MOE_VERSION: "6"
+    VLLM_ROCM_W4A8_FP8_WMMA_MOE_MIN_M: "1"
+    WITH_HET_TP: "1"
 
 services:
   # --- TP=2 combined: tuned attention + W4A8, both Qwen3.6 cards (64+56 CU heterogeneous) ---
@@ -59,16 +62,18 @@ services:
     environment:
       <<: *combined-env
       ROCR_VISIBLE_DEVICES: "0,1"
+      HIP_VISIBLE_DEVICES: "0,1"
       CU_NUM: "56"                       # lower of the two cards (conservative even-TP fallback).
       # Proportional het-TP: uncomment once the image is built with WITH_HET_TP=1. "64,56" =
       # CU counts of the 9070 XT + 9070; the helper fail-safes to even if unset/unbuilt.
-      # VLLM_TP_CU_WEIGHTS: "64,56"
+      VLLM_TP_CU_WEIGHTS: "64,56"
     command:                             # entrypoint prepends `vllm serve`
       - ${VLLM_MODEL_ID:-cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit}
       - --host=0.0.0.0
       - --port=8000
       - --tensor-parallel-size=2
       - --limit-mm-per-prompt={"image":0,"video":0}
+      - --kv-cache-dtype=fp8_per_token_head
       # W4A8 MoE apply OOMs at the 8192-token profiling batch on 16 GB cards — keep caps low.
       - --max-model-len=${VLLM_MAX_MODEL_LEN:-4096}
       - --max-num-batched-tokens=${VLLM_MAX_BATCHED:-4096}
