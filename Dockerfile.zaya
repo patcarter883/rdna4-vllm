@@ -28,6 +28,10 @@
 ARG BASE_IMAGE=vllm22-w4a8:combined
 FROM ${BASE_IMAGE}
 
+# Re-scope BASE_IMAGE into this build stage so it substitutes in the RUN below
+# (an ARG declared before FROM is out of scope after it; with `set -u` an
+# unsubstituted ${BASE_IMAGE} aborts the layer).
+ARG BASE_IMAGE
 ARG GPU_ARCHS=gfx1201
 ENV ROCM_HOME=/opt/rocm-7.2.1 \
     GPU_ARCHS=${GPU_ARCHS} \
@@ -56,19 +60,9 @@ RUN set -eu; \
     cd /app/vllm; patch -p1 < /tmp/zaya/zaya_vllm_0.22.69.patch; \
     # CPU sanity: every touched python file parses (full import + registry
     # resolution is the GPU-window coherence gate, see zaya/ZAYA_HANDOFF.md).
-    python - <<'PY'; \
-import ast, glob
-roots = [
-    "/app/vllm/vllm/model_executor/models/zaya.py",
-    "/app/vllm/vllm/model_executor/layers/mamba/cca.py",
-    "/app/vllm/vllm/model_executor/layers/mamba/mamba_utils.py",
-    "/app/vllm/vllm/config/model.py",
-    "/app/vllm/vllm/model_executor/layers/fused_moe/fused_moe.py",
-]
-for f in roots:
-    ast.parse(open(f).read())
-print("[zaya] overlay + patched files parse OK")
-PY
+    # NB: python -c one-liner, NOT a RUN heredoc — a `<<'PY'` heredoc inside this
+    # backslash-continued RUN trips BuildKit ("unterminated heredoc").
+    python -c 'import ast; roots=["/app/vllm/vllm/model_executor/models/zaya.py", "/app/vllm/vllm/model_executor/layers/mamba/cca.py", "/app/vllm/vllm/model_executor/layers/mamba/mamba_utils.py", "/app/vllm/vllm/config/model.py", "/app/vllm/vllm/model_executor/layers/fused_moe/fused_moe.py"]; [ast.parse(open(f).read()) for f in roots]; print("[zaya] overlay + patched files parse OK")'; \
     rm -rf /tmp/zaya; \
     echo "[zaya] ZAYA1-8B + CCA support layered on ${BASE_IMAGE}"
 
