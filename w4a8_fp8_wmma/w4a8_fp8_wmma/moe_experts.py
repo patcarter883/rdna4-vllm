@@ -102,25 +102,157 @@ def _moe_min_m() -> int:
 _MOE_XOVER = None
 
 
-def _moe_crossover_for(E, hidden, inter, group, top_k):
+def _moe_cache_path():
+    return os.environ.get(
+        "VLLM_ROCM_W4A8_FP8_WMMA_MOE_CACHE",
+        os.path.join(os.path.dirname(__file__), "moe_crossover_cache.json"))
+
+
+def _moe_load_cache():
     global _MOE_XOVER
     if _MOE_XOVER is None:
-        path = os.environ.get(
-            "VLLM_ROCM_W4A8_FP8_WMMA_MOE_CACHE",
-            os.path.join(os.path.dirname(__file__), "moe_crossover_cache.json"))
         try:
-            with open(path) as f:
+            with open(_moe_cache_path()) as f:
                 _MOE_XOVER = json.load(f)
         except (OSError, ValueError):
             _MOE_XOVER = {}
-    return _MOE_XOVER.get(f"{E},{hidden},{inter},{group},{top_k}")
+    return _MOE_XOVER
 
 
-def _moe_should_engage(M, w13_op, w2_op, w13_s, topk_ids) -> bool:
+def _moe_crossover_for(E, hidden, inter, group, top_k):
+    return _moe_load_cache().get(f"{E},{hidden},{inter},{group},{top_k}")
+
+
+def _moe_autotune_enabled() -> bool:
+    """On a MoE crossover-cache MISS, run a quick A/B microbench (our grouped op
+    vs stock Triton moe_wna16) for that exact (sharded) expert shape, then persist
+    the winning M-window(s) (subsequent loads are O(1)). VLLM_ROCM_W4A8_AUTOTUNE:
+    'on' (default) / 'off'. Off -> unknown shapes stay stock, the prior behaviour.
+    Shares the dense path's env so one switch governs both gates."""
+    v = os.environ.get("VLLM_ROCM_W4A8_AUTOTUNE", "on").strip().lower()
+    return v not in ("0", "off", "false", "no")
+
+
+# M sweep + win margin for the MoE autotune A/B (matches tune_moe_crossover.py so
+# the value the autotuner writes is what the AOT tuner would write).
+_MOE_AUTOTUNE_MGRID = (16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024)
+_MOE_AUTOTUNE_MARGIN = 0.02  # require ours/stock < 1-margin to count as a win
+
+
+def _moe_winning_intervals(wins):
+    """Pure selection (no GPU): given `wins` = list of (M, won) over the sweep
+    grid, return the contiguous winning [lo, hi] intervals (or None if no win).
+
+    The win region can be non-contiguous (a mid-M dip), so a single [min,max]
+    would wrongly engage the loss zone; each proven-win run is stored separately.
+    Mirrors tune_moe_crossover.tune_shape()'s interval extraction exactly."""
+    intervals, run = [], None
+    for m, w in wins:
+        if w:
+            run = [m, m] if run is None else [run[0], m]
+        elif run is not None:
+            intervals.append(run)
+            run = None
+    if run is not None:
+        intervals.append(run)
+    return intervals or None
+
+
+def _moe_persist_crossover(E, hidden, inter, group, top_k, value):
+    """Merge {key: value} into the MoE crossover cache JSON + in-process table.
+    value is the [[lo,hi],...] window list or None (never engage). Best-effort:
+    a write failure must not break load (we still use the value in-memory)."""
+    key = f"{E},{hidden},{inter},{group},{top_k}"
+    table = _moe_load_cache()
+    table[key] = value
+    try:
+        with open(_moe_cache_path(), "w") as f:
+            json.dump(table, f, indent=1, sort_keys=True)
+    except OSError:
+        pass
+
+
+def _moe_autotune_crossover(layer, E, hidden, inter, group, top_k):
+    """First-batch A/B microbench (GPU): time our grouped FP8-WMMA MoE op vs stock
+    Triton moe_wna16 (`fused_experts`) across _MOE_AUTOTUNE_MGRID for THIS exact
+    (sharded) expert shape, find the contiguous winning M-window(s), persist them,
+    and return the window list. ROBUSTNESS: ANY failure raises (the caller's
+    try/except caches None -> stock) so the served pathway never regresses.
+
+    Reuses the weights already on `layer`: our op-layout copies (_w4a8_w13/..) for
+    the OURS side and the WNA16 hook's still-registered original uint8 standard-
+    format weights (w13_qweight/..) for the STOCK side -- exactly the two layouts
+    tune_moe_crossover.py builds. Mirrors that tuner's measurement (grouped op vs
+    fused_experts, 1-margin win rule, contiguous intervals), but at first-batch
+    time for the actual served shape (top_k only materialises per-batch, so this is
+    the natural seam; runs once per shape, then the cache makes it O(1))."""
+    import time
+
+    from vllm.model_executor.layers.fused_moe import fused_experts
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.config import (
+        int4_w4a16_moe_quant_config,
+    )
+
+    w13_op, w2_op = layer._w4a8_w13, layer._w4a8_w2
+    w13_s, w2_s = layer._w4a8_w13s, layer._w4a8_w2s
+    w13_z, w2_z = layer._w4a8_w13z, layer._w4a8_w2z
+    dev = w13_op.device
+
+    # Stock fused_experts reference: the original uint8 standard-format weights the
+    # WNA16 hook leaves registered (it ran _orig_process first; our op-layout views
+    # share their storage). Same quant_config the runtime stock path would use.
+    w13_u8 = layer.w13_qweight.data
+    w2_u8 = layer.w2_qweight.data
+    qc = int4_w4a16_moe_quant_config(
+        w1_scale=layer.w13_scales.data, w2_scale=layer.w2_scales.data,
+        w1_zp=layer.w13_qzeros.data if w13_z is not None else None,
+        w2_zp=layer.w2_qzeros.data if w2_z is not None else None,
+        block_shape=[0, group])
+
+    def _bench(fn, it=30, warmup=10):
+        for _ in range(warmup):
+            fn()
+        torch.cuda.synchronize()
+        t = time.perf_counter()
+        for _ in range(it):
+            fn()
+        torch.cuda.synchronize()
+        return (time.perf_counter() - t) / it
+
+    wins = []
+    for M in _MOE_AUTOTUNE_MGRID:
+        x = (torch.randn(M, hidden, dtype=torch.float16, device=dev) * 0.5)
+        tids = torch.stack(
+            [torch.randperm(E, device=dev)[:top_k] for _ in range(M)]).to(torch.int32)
+        tw = torch.rand(M, top_k, dtype=torch.float32, device=dev)
+        ours = lambda: _run_grouped_moe(
+            x, w13_op, w2_op, w13_s, w2_s, w13_z, w2_z, tw, tids,
+            MoEActivation.SILU, E, None, False, _moe_version(), out_dtype=x.dtype)
+        stock = lambda: fused_experts(
+            x, w13_u8, w2_u8, topk_weights=tw, topk_ids=tids,
+            activation=MoEActivation.SILU, apply_router_weight_on_input=False,
+            global_num_experts=E, expert_map=None, quant_config=qc)
+        r = _bench(ours) / _bench(stock)
+        wins.append((M, r < (1.0 - _MOE_AUTOTUNE_MARGIN)))
+    window = _moe_winning_intervals(wins)
+    _moe_persist_crossover(E, hidden, inter, group, top_k, window)
+    return window
+
+
+def _moe_should_engage(M, w13_op, w2_op, w13_s, topk_ids, layer=None) -> bool:
     """Whether to run our grouped op (vs falling back to stock) for this batch.
     Env VLLM_ROCM_W4A8_FP8_WMMA_MOE_MIN_M forces a simple M>=threshold (tuning /
     forcing). Otherwise consult the AOT crossover cache for this exact (sharded)
-    expert shape: engage iff lo<=M<=hi; unknown shape -> stock (never regress)."""
+    expert shape: engage iff lo<=M<=hi; unknown shape -> stock (never regress).
+
+    On a cache MISS (a shape that wasn't AOT-tuned) the grouped op would be DEAD
+    WEIGHT (always-stock); so if VLLM_ROCM_W4A8_AUTOTUNE is on (default) and the
+    caller passed `layer` (it carries the converted weights needed for the A/B),
+    we autotune this exact shape ONCE on the first batch that hits it, persist the
+    window, and use it. top_k only materialises per-batch, so first-batch (not
+    load-time) is the natural seam. ROBUST: any autotune failure caches an empty
+    window -> stock, so the served pathway is always >= stock, tuned or not."""
     force = _force_mode()
     if force == "on":
         return True
@@ -135,6 +267,15 @@ def _moe_should_engage(M, w13_op, w2_op, w13_s, topk_ids) -> bool:
     top_k = topk_ids.size(1)
     group = hidden // w13_s.size(2)
     win = _moe_crossover_for(E, hidden, inter, group, top_k)
+    if (win is None
+            and layer is not None
+            and _moe_autotune_enabled()
+            and f"{E},{hidden},{inter},{group},{top_k}" not in _moe_load_cache()):
+        try:
+            win = _moe_autotune_crossover(layer, E, hidden, inter, group, top_k)
+        except Exception:  # pragma: no cover - defensive; never regress
+            _moe_persist_crossover(E, hidden, inter, group, top_k, None)
+            win = None
     if not win:
         return False
     # list of proven-winning [lo, hi] intervals; engage iff M lands in one.
@@ -1026,7 +1167,7 @@ def register_moe_wna16(verbose: bool = True) -> bool:
         # Safe because this hook keeps the original uint8 weights (the int32
         # conversion is a zero-copy view), so _orig_apply still has what it needs.
         if not _moe_should_engage(x2.size(0), layer._w4a8_w13, layer._w4a8_w2,
-                                  layer._w4a8_w13s, topk_ids):
+                                  layer._w4a8_w13s, topk_ids, layer=layer):
             return _orig_apply(self, layer, x, topk_weights, topk_ids,
                                shared_experts, shared_experts_input)
         act = layer.activation
