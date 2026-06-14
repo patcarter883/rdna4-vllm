@@ -1,0 +1,14 @@
+# vLLM ONLINE int8: quantize MoE experts to int8 at load from the bf16 model.
+# No custom checkpoint, no zaya.py loader patch. Needs two ROCm-gate fixes:
+# triton_moe.py (int8 MoE backend) + rocm.py (allow experts_int8).
+services:
+  vllm:
+    command: >-
+      vllm serve Zyphra/ZAYA1-8B --served-model-name model
+      --max-num-batched-tokens 8192 --max-num-seqs 8 --max-model-len 60000
+      --mamba-cache-dtype float32 --dtype bfloat16 --reasoning-parser qwen3
+      --enable-auto-tool-choice --tool-call-parser zaya_xml --trust-remote-code
+      --quantization experts_int8
+    volumes:
+      - /home/pat/projects/vllm-zaya/vllm/model_executor/layers/fused_moe/experts/triton_moe.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/experts/triton_moe.py:ro
+      - /home/pat/projects/vllm-zaya/vllm/platforms/rocm.py:/usr/local/lib/python3.12/dist-packages/vllm/platforms/rocm.py:ro

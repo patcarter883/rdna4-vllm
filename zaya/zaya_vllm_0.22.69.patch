@@ -1,0 +1,262 @@
+# ZAYA1-8B + CCA registration hooks for vLLM 0.22.69 (combined image /app/vllm).
+#
+# Applied by Dockerfile.combined's WITH_ZAYA slot: `cd /app/vllm && patch -p1 < this`.
+# This is the SURGICAL, additive half of ZAYA support (the new files — zaya.py,
+# cca.py, the cca_hip kernel, configs/zaya.py, zaya_tool_parser.py, cca_attn.py —
+# are copied separately by the overlay step). Every hunk here is a pure insertion
+# at a registration point; NO existing logic is modified except fused_moe.py,
+# which adds a generic torch.compile-safety guard (skip NVML/filesystem tracing)
+# that ZAYA's MoE needs under full-graph compile and upstream 0.22.69 lacks.
+#
+# Re-derived & dry-run-validated against tcclaviger/vllm22:dev (vLLM 0.22.69) on
+# 2026-06-14: `patch -p1 --dry-run` => all 16 hunks apply, exit 0. The original
+# overlay was authored on 0.22-therock; all anchors + attrs (incl.
+# model_arch_config.text_model_type) exist unchanged on 0.22.69.
+#
+diff --git a/vllm/config/compilation.py b/vllm/config/compilation.py
+index a191aca4f..1e14cf94e 100644
+--- a/vllm/config/compilation.py
++++ b/vllm/config/compilation.py
+@@ -759,6 +759,7 @@ class CompilationConfig:
+         "vllm::mamba_mixer2",
+         "vllm::mamba_mixer",
+         "vllm::short_conv",
++        "vllm::cca",
+         "vllm::linear_attention",
+         "vllm::plamo2_mamba_mixer",
+         "vllm::qwen_gdn_attention_core",
+diff --git a/vllm/config/model.py b/vllm/config/model.py
+index 2f22140be..e881925f0 100644
+--- a/vllm/config/model.py
++++ b/vllm/config/model.py
+@@ -1292,6 +1292,8 @@ class ModelConfig:
+         # the tensor parallel size. We will replicate the KV heads in the
+         # case where the number of KV heads is smaller than the tensor
+         # parallel size so each GPU has at least one KV head.
++        if self.model_arch_config.text_model_type == "zaya":
++            return total_num_kv_heads
+         return max(1, total_num_kv_heads // parallel_config.tensor_parallel_size)
+ 
+     def get_num_attention_heads(self, parallel_config: ParallelConfig) -> int:
+@@ -1362,6 +1364,10 @@ class ModelConfig:
+                         return self.get_num_layers(parallel_config)
+                 return sum(t == block_type for t in layers_block_type_value[start:end])
+ 
++            if hasattr(self.hf_text_config, "model_type") and (
++                self.hf_text_config.model_type == "zaya"
++            ):
++                return self.hf_text_config.num_hidden_layers
+             # Hybrid model Minimax
+             attn_type_list = getattr(self.hf_config, "attn_type_list", None)
+             if attn_type_list:
+diff --git a/vllm/model_executor/layers/fused_moe/fused_moe.py b/vllm/model_executor/layers/fused_moe/fused_moe.py
+index 49957c8f5..e6e58b704 100644
+--- a/vllm/model_executor/layers/fused_moe/fused_moe.py
++++ b/vllm/model_executor/layers/fused_moe/fused_moe.py
+@@ -999,7 +999,7 @@ def zero_experts_compute_triton(
+ def get_config_file_name(
+     E: int, N: int, dtype: str | None, block_shape: list[int] | None = None
+ ) -> str:
+-    device_name = current_platform.get_device_name().replace(" ", "_")
++    device_name = _get_moe_config_device_name().replace(" ", "_")
+     # Set device_name to H200 if a device from the H200 family is detected
+     if "H200" in device_name.split("_"):
+         device_name = "NVIDIA_H200"
+@@ -1032,6 +1032,11 @@ def get_moe_configs(
+     if envs.VLLM_BATCH_INVARIANT:
+         return None
+ 
++    # Tuned-config discovery is performance-only. Avoid tracing filesystem
++    # operations such as realpath/exists/open through torch.compile.
++    if torch.compiler.is_compiling():
++        return None
++
+     # First look up if an optimized configuration is available in the configs
+     # directory
+     block_shape = [block_n, block_k] if block_n and block_k else None
+@@ -1076,6 +1081,19 @@ def get_moe_configs(
+     return None
+ 
+ 
++@functools.lru_cache
++def _get_moe_config_device_name_eager() -> str:
++    return current_platform.get_device_name()
++
++
++def _get_moe_config_device_name() -> str:
++    # Device-name lookup is only used to select an optional tuned MoE config
++    # file. Avoid tracing NVML-backed metadata queries through torch.compile.
++    if torch.compiler.is_compiling():
++        return current_platform.device_name
++    return _get_moe_config_device_name_eager()
++
++
+ def _ensure_block_size_k_divisible(
+     size_k: int, block_size_k: int, group_size: int
+ ) -> int:
+diff --git a/vllm/model_executor/layers/mamba/mamba_utils.py b/vllm/model_executor/layers/mamba/mamba_utils.py
+index 0c86c7879..291f32a00 100644
+--- a/vllm/model_executor/layers/mamba/mamba_utils.py
++++ b/vllm/model_executor/layers/mamba/mamba_utils.py
+@@ -104,6 +104,15 @@ class MambaStateDtypeCalculator:
+         conv_state_dtype = get_kv_cache_torch_dtype(mamba_cache_dtype, model_dtype)
+         return (conv_state_dtype,)
+ 
++    @classmethod
++    def cca_state_dtype(
++        cls,
++        model_dtype: ModelDType | torch.dtype,
++        mamba_cache_dtype: MambaDType,
++    ) -> tuple[torch.dtype, ...]:
++        state_dtype = get_kv_cache_torch_dtype(mamba_cache_dtype, model_dtype)
++        return (state_dtype, state_dtype)
++
+     @classmethod
+     def gated_delta_net_state_dtype(
+         cls,
+@@ -197,6 +206,31 @@ class MambaStateShapeCalculator:
+         conv_state_shape = cls._orient_conv_shape(conv_dim, conv_kernel - 1)
+         return (conv_state_shape,)
+ 
++    @classmethod
++    def cca_state_shape(
++        cls,
++        tp_world_size: int,
++        conv_kernel_size: int,
++        num_k_heads: int,
++        num_q_heads: int,
++        head_dim: int,
++        hidden_size: int,
++        num_spec: int = 0,
++    ) -> tuple[tuple[int, int], tuple[int]]:
++        latent_k_dim = num_k_heads * head_dim
++        latent_q_dim = num_q_heads * head_dim
++        in_out_ch = latent_k_dim + latent_q_dim
++        # num_spec is accepted for signature parity with the other state-shape
++        # calculators but does NOT widen the conv state: CCA spec-decode stores
++        # the per-spec-position rollback window in separate block slots (like the
++        # temporal state), not extra columns. Block count (1 + num_spec) is
++        # handled by num_speculative_blocks in the cache spec.
++        del num_spec
++        conv_states_shape = (in_out_ch, conv_kernel_size)
++
++        prev_hs_shape = (hidden_size,)
++        return (conv_states_shape, prev_hs_shape)
++
+     @classmethod
+     def extra_groups_for_head_shards(cls, ngroups: int, tp_size: int):
+         """Compute the increase in group numbers to account for
+@@ -321,6 +355,25 @@ def get_conv_copy_spec(
+     )
+ 
+ 
++def get_cca_conv_copy_spec(
++    state: torch.Tensor,
++    block_ids: list[int],
++    cur_block_idx: int,
++    num_accepted_tokens: int,
++) -> MambaCopySpec:
++    """Return a MambaCopySpec for the CCA conv state of the last accepted token.
++
++    CCA stores the conv window for spec-decode position j in a separate block
++    slot (like the temporal state), so the rollback picks the block at the
++    accepted position rather than slicing columns.
++    """
++    src_block_id = block_ids[cur_block_idx + num_accepted_tokens - 1]
++    src_state = state[src_block_id]
++    return MambaCopySpec(
++        start_addr=src_state.data_ptr(), num_elements=src_state.numel()
++    )
++
++
+ def get_temporal_copy_spec(
+     state: torch.Tensor,
+     block_ids: list[int],
+@@ -352,6 +405,16 @@ class MambaStateCopyFuncCalculator:
+     def short_conv_state_copy_func(cls):
+         return (get_conv_copy_spec,)
+ 
++    @classmethod
++    def cca_state_copy_func(cls):
++        # Both CCA states (conv + prev_hs) are stored per-spec-position in
++        # separate block slots, so both roll back by block-index (whole-block
++        # copy) — i.e. get_temporal_copy_spec semantics. The fused align
++        # postprocess only recognizes get_conv_copy_spec / get_temporal_copy_spec;
++        # using get_temporal_copy_spec for the conv state too (conv_width treated
++        # as 0 → block-index copy) matches our per-slot layout.
++        return (get_temporal_copy_spec, get_temporal_copy_spec)
++
+     @classmethod
+     def gated_delta_net_state_copy_func(cls):
+         return (get_conv_copy_spec, get_temporal_copy_spec)
+diff --git a/vllm/model_executor/models/registry.py b/vllm/model_executor/models/registry.py
+index 3fbebaf7d..4a446caf9 100644
+--- a/vllm/model_executor/models/registry.py
++++ b/vllm/model_executor/models/registry.py
+@@ -219,6 +219,7 @@ _TEXT_GENERATION_MODELS = {
+     "TeleFLMForCausalLM": ("teleflm", "TeleFLMForCausalLM"),
+     "XverseForCausalLM": ("llama", "LlamaForCausalLM"),
+     "Zamba2ForCausalLM": ("zamba2", "Zamba2ForCausalLM"),
++    "ZayaForCausalLM": ("zaya", "ZayaForCausalLM"),
+ }
+ 
+ _EMBEDDING_MODELS = {
+diff --git a/vllm/tool_parsers/__init__.py b/vllm/tool_parsers/__init__.py
+index bf832f178..90b3f0740 100644
+--- a/vllm/tool_parsers/__init__.py
++++ b/vllm/tool_parsers/__init__.py
+@@ -178,6 +178,10 @@ _TOOL_PARSERS_TO_REGISTER = {
+         "xlam_tool_parser",
+         "xLAMToolParser",
+     ),
++    "zaya_xml": (
++        "zaya_tool_parser",
++        "ZayaXMLToolParser",
++    ),
+     "gigachat3": (
+         "gigachat3_tool_parser",
+         "GigaChat3ToolParser",
+diff --git a/vllm/transformers_utils/config.py b/vllm/transformers_utils/config.py
+index a5878ca02..843edd9f2 100644
+--- a/vllm/transformers_utils/config.py
++++ b/vllm/transformers_utils/config.py
+@@ -137,6 +137,7 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = LazyConfigDict(
+     laguna="LagunaConfig",
+     lfm2_moe="Lfm2MoeConfig",
+     tarsier2="Tarsier2Config",
++    zaya="ZayaConfig",
+ )
+ 
+ _SPECULATIVE_DECODING_CONFIGS: set[str] = {"eagle", "speculators"}
+diff --git a/vllm/transformers_utils/configs/__init__.py b/vllm/transformers_utils/configs/__init__.py
+index 71f7723e4..269cdd6ec 100644
+--- a/vllm/transformers_utils/configs/__init__.py
++++ b/vllm/transformers_utils/configs/__init__.py
+@@ -83,6 +83,7 @@ _CLASS_TO_MODULE: dict[str, str] = {
+     "Tarsier2Config": "vllm.transformers_utils.configs.tarsier2",
+     # Special case: DeepseekV3Config is from HuggingFace Transformers
+     "DeepseekV3Config": "transformers",
++    "ZayaConfig": "vllm.transformers_utils.configs.zaya",
+ }
+ 
+ __all__ = [
+@@ -150,6 +151,7 @@ __all__ = [
+     "Qwen3_5MoeConfig",
+     "Qwen3_5MoeTextConfig",
+     "Tarsier2Config",
++    "ZayaConfig",
+ ]
+ 
+ 
+diff --git a/vllm/v1/attention/backends/registry.py b/vllm/v1/attention/backends/registry.py
+index 24a59f038..70a869078 100644
+--- a/vllm/v1/attention/backends/registry.py
++++ b/vllm/v1/attention/backends/registry.py
+@@ -159,6 +159,7 @@ class MambaAttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
+     SHORT_CONV = "vllm.v1.attention.backends.short_conv_attn.ShortConvAttentionBackend"
+     LINEAR = "vllm.v1.attention.backends.linear_attn.LinearAttentionBackend"
+     GDN_ATTN = "vllm.v1.attention.backends.gdn_attn.GDNAttentionBackend"
++    CCA = "vllm.v1.attention.backends.cca_attn.CCAAttentionBackend"
+     # Placeholder for third-party/custom backends - must be registered before use
+     # set to None to avoid alias with other backend, whose value is an empty string
+     CUSTOM = None

@@ -1,0 +1,86 @@
+[
+  {
+    "q": "What is 137 times 19? End with 'Answer: <number>'.",
+    "content": "Answer: 2603",
+    "expected": [
+      "2603"
+    ],
+    "ok": true,
+    "finish": "stop",
+    "n_tok": 283
+  },
+  {
+    "q": "What is the 7th prime number? End with 'Answer: <number>'.",
+    "content": "Answer: 17",
+    "expected": [
+      "17"
+    ],
+    "ok": true,
+    "finish": "stop",
+    "n_tok": 317
+  },
+  {
+    "q": "List the first 8 prime numbers, comma separated.",
+    "content": "2,3,5,7,11,13,17,19",
+    "expected": [
+      "2, 3, 5, 7, 11, 13, 17, 19",
+      "2,3,5,7,11,13,17,19"
+    ],
+    "ok": true,
+    "finish": "stop",
+    "n_tok": 1313
+  },
+  {
+    "q": "What is the capital of Australia?",
+    "content": "The capital of Australia is Canberra. Unlike Sydney and Melbourne, which were originally colonized by Britain, Canberra was chosen as the capital city because it was seen as a neutral site between the two rival cities. The Australian government is based in Canberra, and it is home to many governmental and military facilities.",
+    "expected": [
+      "canberra"
+    ],
+    "ok": true,
+    "finish": "stop",
+    "n_tok": 62
+  },
+  {
+    "q": "What is the next number in the sequence 2, 6, 12, 20, 30? End with 'Answer: <number>'.",
+    "content": "Answer: 42",
+    "expected": [
+      "42"
+    ],
+    "ok": true,
+    "finish": "stop",
+    "n_tok": 771
+  },
+  {
+    "q": "What is 15% of 240? End with 'Answer: <number>'.",
+    "content": "Answer: 36",
+    "expected": [
+      "36"
+    ],
+    "ok": true,
+    "finish": "stop",
+    "n_tok": 322
+  },
+  {
+    "q": "What is the square root of 144? End with 'Answer: <number>'.",
+    "content": "Answer: 12",
+    "expected": [
+      "12"
+    ],
+    "ok": true,
+    "finish": "stop",
+    "n_tok": 241
+  },
+  {
+    "q": "Is 91 a prime number? Answer yes or no and give its factors if any.",
+    "content": "91 is not a prime number. Its factors are 7 and 13.",
+    "expected": [
+      "not",
+      "no",
+      "7",
+      "13"
+    ],
+    "ok": true,
+    "finish": "stop",
+    "n_tok": 21
+  }
+]

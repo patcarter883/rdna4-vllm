@@ -1,0 +1,30 @@
+# STAGED override — do NOT apply to the live stack outside a coordination window.
+#
+# Serves the INT8 (W8A8) ZAYA1-8B from ~/models/ZAYA1-8B-int8 and raises
+# --max-num-seqs to match RSA's N=16 fan-out (the freed ~8GB of weight VRAM is
+# what makes this fit). Apply over the base compose in a window:
+#
+#   docker compose -f docker-compose.yml -f quant/docker-compose.int8.yml up -d vllm
+#
+# Revert by re-running plain `docker compose up -d vllm`.
+services:
+  vllm:
+    # Local INT8 checkpoint instead of the HF bf16 repo. --max-num-seqs 16 is
+    # VRAM-gated: vLLM grows the KV/mamba cache into the freed memory, but if
+    # startup OOMs at 60k context, lower it (12) or reduce --max-model-len.
+    command: >-
+      vllm serve /models/ZAYA1-8B-int8
+      --served-model-name model
+      --max-num-batched-tokens 8192
+      --max-num-seqs 16
+      --max-model-len 60000
+      --mamba-cache-dtype float32
+      --dtype bfloat16
+      --reasoning-parser qwen3
+      --enable-auto-tool-choice
+      --tool-call-parser zaya_xml
+      --trust-remote-code
+    volumes:
+      # Mount the staged INT8 model read-only at /models (appended to the base
+      # HF-cache mount).
+      - ~/models:/models:ro

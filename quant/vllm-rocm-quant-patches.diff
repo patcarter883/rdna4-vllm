@@ -1,0 +1,71 @@
+diff --git a/vllm/model_executor/layers/fused_moe/experts/triton_moe.py b/vllm/model_executor/layers/fused_moe/experts/triton_moe.py
+index 45b95b341..128bf88b0 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/triton_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/triton_moe.py
+@@ -81,11 +81,14 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
+         weight_key: QuantKey | None,
+         activation_key: QuantKey | None,
+     ) -> bool:
+-        # INT8 requires at least 7.5 (Turing).
++        # INT8 requires at least 7.5 (Turing) on CUDA. ROCm GPUs (CDNA gfx9
++        # via MFMA, RDNA3+ gfx11/12 via WMMA) have native int8 and the Triton
++        # int8 MoE kernel compiles for them, matching _supports_current_device's
++        # is_cuda_alike() — the narrow is_cuda() gate wrongly excluded ROCm.
+         device_supports_int8 = (
+             current_platform.is_cuda()
+             and current_platform.has_device_capability((7, 5))
+-        )
++        ) or current_platform.is_rocm()
+ 
+         supported: list[tuple[QuantKey | None, QuantKey | None]] = [(None, None)]
+         if device_supports_int8:
+diff --git a/vllm/model_executor/models/zaya.py b/vllm/model_executor/models/zaya.py
+index dbd68a0a1..4e59c399d 100644
+--- a/vllm/model_executor/models/zaya.py
++++ b/vllm/model_executor/models/zaya.py
+@@ -916,12 +916,20 @@ class ZayaForCausalLM(nn.Module, HasInnerState, IsHybrid):
+                     )
+                     continue
+ 
++                # Route by checkpoint suffix to the matching FusedMoE param:
++                #   .weight        (bf16)            -> w13/w2_weight
++                #   .weight_scale  (int-quantized)   -> w13/w2_weight_scale
++                #   .weight_packed (pack-quantized)  -> w13/w2_weight_packed
++                # All are stored out-major, so the merged gate+up (linear_fc1)
++                # splits along dim 0 (the out dim). The FusedMoE weight_loader
++                # transposes is_transposed (wNa16) params internally.
++                suffix = parts[-1]
+                 if parts[-2] == "linear_fc1":
+-                    param_name = f"{fused_moe_prefix}.w13_weight"
++                    param_name = f"{fused_moe_prefix}.w13_{suffix}"
+                     param = params_dict[param_name]
+                     half = loaded_weight.shape[0] // 2
+-                    gate_weight = loaded_weight[:half, :]
+-                    up_weight = loaded_weight[half:, :]
++                    gate_weight = loaded_weight[:half]
++                    up_weight = loaded_weight[half:]
+                     fused_moe_module.weight_loader(
+                         param, gate_weight, chkpt_weight_name, "w1", expert_id
+                     )
+@@ -930,7 +938,7 @@ class ZayaForCausalLM(nn.Module, HasInnerState, IsHybrid):
+                     )
+                     loaded_params.add(param_name)
+                 elif parts[-2] == "linear_fc2":
+-                    param_name = f"{fused_moe_prefix}.w2_weight"
++                    param_name = f"{fused_moe_prefix}.w2_{suffix}"
+                     param = params_dict[param_name]
+                     fused_moe_module.weight_loader(
+                         param, loaded_weight, chkpt_weight_name, "w2", expert_id
+diff --git a/vllm/platforms/rocm.py b/vllm/platforms/rocm.py
+index c75d68954..dcd0334b0 100644
+--- a/vllm/platforms/rocm.py
++++ b/vllm/platforms/rocm.py
+@@ -434,6 +434,8 @@ class RocmPlatform(Platform):
+         "fp8_per_tensor",
+         "fp8_per_block",
+         "online",
++        "experts_int8",
++        "int8_per_channel",
+         "gpt_oss_mxfp4",
+     ]
+ 

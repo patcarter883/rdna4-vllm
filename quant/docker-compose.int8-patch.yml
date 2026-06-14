@@ -1,0 +1,17 @@
+# TEMP pre-rebuild hotpatch — bind-mounts the fixed triton_moe.py (which enables
+# the INT8 Triton MoE backend on ROCm/gfx1100) over the copy baked into the
+# image, so INT8 can be validated without rebuilding vllm-rocm:gfx1100.
+#
+# Once the image is rebuilt from this repo, drop this -f file; the fix is in the
+# source tree (vllm/model_executor/layers/fused_moe/experts/triton_moe.py).
+#
+#   docker compose -f docker-compose.yml \
+#     -f quant/docker-compose.int8.yml \
+#     -f quant/docker-compose.int8-patch.yml up -d vllm
+services:
+  vllm:
+    volumes:
+      # 1) enable INT8 Triton MoE on ROCm; 2) route expert .weight_scale to the
+      # w13/w2_weight_scale params in ZAYA's custom MoE loader.
+      - /home/pat/projects/vllm-zaya/vllm/model_executor/layers/fused_moe/experts/triton_moe.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/experts/triton_moe.py:ro
+      - /home/pat/projects/vllm-zaya/vllm/model_executor/models/zaya.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/zaya.py:ro

@@ -1,0 +1,137 @@
+# ZAYA1-8B + CCA on the combined stack. Builds Dockerfile.zaya (vllm22-zaya:combined,
+# FROM vllm22-w4a8:combined) so ZAYA inherits the tuned attention + W4A8 + het-TP
+# base, and adds the hybrid CCA model + the fused CCA decode HIP kernel.
+#
+# Standalone (does NOT require -f docker-compose.yml) to avoid touching the base
+# compose while it is refactored in a parallel session. The base image
+# vllm22-w4a8:combined must exist first (build it from docker-compose.yml / the
+# combined Dockerfile in a build window).
+#
+#   cp .env.template .env   # set HF_HOME, ZAYA_MODELS_DIR
+#   docker compose -f docker-compose.zaya.yml --profile zaya up --build   # 1-GPU coherence gate
+#
+# Needs a free GPU window — the cards are shared, coordinate (see DIARY).
+# Toggle the fused kernel without rebuild: ZAYA_CCA_HIP=0 -> eager CCA decode path.
+
+x-zaya-common: &zaya-common
+  build:
+    context: .
+    dockerfile: Dockerfile.zaya
+    args:
+      BASE_IMAGE: ${ZAYA_BASE_IMAGE:-vllm22-w4a8:combined}
+      GPU_ARCHS: gfx1201
+  image: vllm22-zaya:combined
+  restart: "no"            # never auto-restart — a wedged card stays down for log inspection
+  devices:
+    - /dev/kfd:/dev/kfd
+    - /dev/dri:/dev/dri
+  group_add: [video]
+  security_opt: [seccomp=unconfined, label=disable]
+  cap_add: [SYS_PTRACE]
+  ipc: host
+  shm_size: "16gb"
+  ports:
+    - "${ZAYA_HOST_PORT:-8001}:8000"
+  volumes:
+    - ${HF_HOME:-./.hf-cache}:/root/.cache/huggingface
+    # Local ZAYA checkpoints (FP8 built by quant/quantize_fp8.py -> ZAYA1-8B-fp8).
+    - ${ZAYA_MODELS_DIR:-~/models}:/models:ro
+    # Persistent Triton cache — the CCA hybrid pays a cold compile + the base's
+    # attention startup autotune on first boot; cache makes it one-time.
+    - ${VLLM_HOST_TRITON_CACHE:-./.triton-cache-combined}:/root/.triton
+  environment: &zaya-env
+    HF_HUB_OFFLINE: "1"
+    GPU_ARCHS: gfx1201
+    ROCM_HOME: /opt/rocm-7.2.1
+    PATH: /opt/rocm-7.2.1/lib/llvm/bin:/app/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    # Fused CCA decode kernel (coalesced-w1 + unroll16, ~8us/call). 0 -> eager.
+    ZAYA_CCA_HIP: "${ZAYA_CCA_HIP:-1}"
+    # Fused CCA PREFILL + mixed kernels. Default ON: the GPU coherence + perf gate
+    # passed (coherent; +37-49% e2e vs eager; bit-exact — docs/zaya/cca-kernel-perf.md).
+    ZAYA_CCA_HIP_PREFILL: "${ZAYA_CCA_HIP_PREFILL:-1}"
+    # Debug: log decode/prefill/mixed fused-path counts (confirms all three CCA
+    # kernels fire). Default off, zero hot-path overhead.
+    ZAYA_CCA_DEBUG_PATHS: "${ZAYA_CCA_DEBUG_PATHS:-0}"
+    # W4A8 is for the AWQ/GPTQ MoE path; ZAYA's experts are FP8, so leave the W4A8
+    # dense/MoE kernels off by default (they don't engage ZAYA's path anyway).
+    VLLM_ROCM_USE_W4A8_FP8_WMMA: "${ZAYA_USE_W4A8:-0}"
+
+services:
+  # --- single GPU coherence gate / dev: ZAYA1-8B FP8 on one card (CCA is TP=1) ---
+  zaya:
+    <<: *zaya-common
+    profiles: ["zaya"]
+    container_name: vllm22-zaya
+    environment:
+      <<: *zaya-env
+      # The combined base bakes HIP_VISIBLE_DEVICES=0,1,2,3, which conflicts with
+      # a single-card ROCR filter (torch: "HIP contains more devices than ROCR").
+      # ROCR_VISIBLE_DEVICES picks the PHYSICAL card and re-indexes it to device
+      # 0, so HIP_VISIBLE_DEVICES must be 0 (the re-indexed slot), NOT the physical
+      # index — HIP=<phys> would be out of range ("No HIP GPUs are available").
+      # Single-GPU (TP=1) ZAYA: ROCR = the card, HIP = 0.
+      ROCR_VISIBLE_DEVICES: "${ZAYA_GPU:-0}"
+      HIP_VISIBLE_DEVICES: "0"
+    command:                                  # entrypoint prepends `vllm serve`
+      - ${ZAYA_MODEL_ID:-/models/ZAYA1-8B-fp8}
+      - --served-model-name=model
+      - --host=0.0.0.0
+      - --port=8000
+      - --trust-remote-code
+      - --dtype=bfloat16
+      - --tensor-parallel-size=1
+      - --max-model-len=${ZAYA_MAX_MODEL_LEN:-32768}
+      - --max-num-seqs=${ZAYA_MAX_NUM_SEQS:-16}
+      - --max-num-batched-tokens=${ZAYA_MAX_BATCHED:-32768}
+      # CCA conv/temporal state numerics demand float32 (DIARY Act VII).
+      - --mamba-cache-dtype=float32
+      - --reasoning-parser=qwen3
+      - --enable-auto-tool-choice
+      - --tool-call-parser=zaya_xml
+      - --gpu-memory-utilization=${ZAYA_GPU_MEMORY_UTIL:-0.90}
+    # Readiness gate so the rsa proxy can wait for a serving backend.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=3).status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 40
+      start_period: 60s
+
+  # --- RSA proxy: Recursive Self-Aggregation test-time compute as an
+  #     OpenAI-compatible shim in front of the ZAYA backend. Standalone,
+  #     client-side, NO GPU. Bring it up alongside the backend:
+  #       docker compose -f docker-compose.zaya.yml --profile zaya --profile rsa up -d
+  #     then POST to :8100 exactly like the backend (adds N rollouts + T
+  #     aggregation rounds; bypass per-request with {"rsa": false}).
+  rsa:
+    build:
+      context: .
+      dockerfile: Dockerfile.rsa
+    image: vllm22-zaya-rsa:combined
+    profiles: ["rsa"]
+    container_name: vllm22-zaya-rsa
+    restart: "no"
+    depends_on:
+      zaya:
+        condition: service_healthy
+    ports:
+      - "${RSA_HOST_PORT:-8100}:8100"
+    volumes:
+      # the proxy loads the model's HF tokenizer for token-exact Markovian tails
+      - ${ZAYA_MODELS_DIR:-~/models}:/models:ro
+    command:
+      - --backend=http://zaya:8000/v1
+      - --host=0.0.0.0
+      - --port=8100
+      - --tokenizer=${ZAYA_MODEL_ID:-/models/ZAYA1-8B-fp8}
+      # ZAYA1-report RSA config (N=16, K=4, T=2, tau=4096); override per-request
+      # via the `rsa` body key, or tune down here for cheaper serving.
+      - --rsa-n=${RSA_N:-16}
+      - --rsa-k=${RSA_K:-4}
+      - --rsa-t=${RSA_T:-2}
+      - --rsa-tail-tokens=${RSA_TAIL:-4096}
+
+  # NOTE: multi-card ZAYA (DP=2 + expert-parallel — CCA has no TP>1, so the model
+  # is REPLICATED per rank with sharded MoE; see DIARY Act VII) is the next profile
+  # to add, but its exact topology (TP-replicated-CCA vs DP+EP) must be re-confirmed
+  # on the combined base in the GPU window before it is committed, not staged blind.

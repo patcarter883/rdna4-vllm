@@ -1,0 +1,86 @@
+[
+  {
+    "q": "What is 137 times 19? End with 'Answer: <number>'.",
+    "content": "Answer: 2603",
+    "expected": [
+      "2603"
+    ],
+    "ok": true,
+    "finish": "stop",
+    "n_tok": 226
+  },
+  {
+    "q": "What is the 7th prime number? End with 'Answer: <number>'.",
+    "content": "Answer: 17",
+    "expected": [
+      "17"
+    ],
+    "ok": true,
+    "finish": "stop",
+    "n_tok": 383
+  },
+  {
+    "q": "List the first 8 prime numbers, comma separated.",
+    "content": "2,3,5,7,11,13,17,19",
+    "expected": [
+      "2, 3, 5, 7, 11, 13, 17, 19",
+      "2,3,5,7,11,13,17,19"
+    ],
+    "ok": true,
+    "finish": "stop",
+    "n_tok": 848
+  },
+  {
+    "q": "What is the capital of Australia?",
+    "content": "The capital of Australia is Canberra. It is located in the southern part of the Australian continent. The city is situated in the Australian Capital Territory (ACT), which is an administrative region that surrounds Canberra.",
+    "expected": [
+      "canberra"
+    ],
+    "ok": true,
+    "finish": "stop",
+    "n_tok": 43
+  },
+  {
+    "q": "What is the next number in the sequence 2, 6, 12, 20, 30? End with 'Answer: <number>'.",
+    "content": "Answer: 42",
+    "expected": [
+      "42"
+    ],
+    "ok": true,
+    "finish": "stop",
+    "n_tok": 889
+  },
+  {
+    "q": "What is 15% of 240? End with 'Answer: <number>'.",
+    "content": "Answer: 36",
+    "expected": [
+      "36"
+    ],
+    "ok": true,
+    "finish": "stop",
+    "n_tok": 659
+  },
+  {
+    "q": "What is the square root of 144? End with 'Answer: <number>'.",
+    "content": "Answer: 12",
+    "expected": [
+      "12"
+    ],
+    "ok": true,
+    "finish": "stop",
+    "n_tok": 262
+  },
+  {
+    "q": "Is 91 a prime number? Answer yes or no and give its factors if any.",
+    "content": "91 is not a prime number. It is a composite number. The factors of 91 are 1, 7, 13, and 91. We can see that 91 is the product of 7 and 13. Thus, 91 is not a prime number because it has factors other than 1 and itself.",
+    "expected": [
+      "not",
+      "no",
+      "7",
+      "13"
+    ],
+    "ok": true,
+    "finish": "stop",
+    "n_tok": 78
+  }
+]

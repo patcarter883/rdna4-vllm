@@ -1,0 +1,28 @@
+# syntax=docker/dockerfile:1
+#
+# RSA serving proxy for ZAYA1 — Recursive Self-Aggregation test-time compute as
+# an OpenAI-compatible shim in front of the vLLM backend (the `zaya` service).
+# This is a STANDALONE client-side orchestrator: it does NOT need the vLLM
+# package or a GPU, only an OpenAI-compatible backend URL. See rsa/README.md.
+#
+# Build: docker build -f Dockerfile.rsa -t vllm22-zaya-rsa:combined .
+# Run:   via the `rsa` profile in docker-compose.zaya.yml (proxy on :8100).
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# Core proxy deps (openai/fastapi/uvicorn/httpx/pydantic) + sympy (math verifier)
+# + transformers for token-exact Markovian tails via the model's HF tokenizer
+# (CPU-only — the fast `tokenizers` backend, no torch pulled).
+RUN pip install --no-cache-dir \
+      openai "fastapi" "uvicorn[standard]" httpx pydantic sympy transformers
+
+# Only the proxy package (the build context excludes rsa/.venv via .dockerignore).
+COPY rsa/ /app/rsa/
+
+ENV PYTHONUNBUFFERED=1 \
+    HF_HUB_OFFLINE=1
+EXPOSE 8100
+
+# Args (backend/port/--rsa-*) come from docker-compose.zaya.yml's command.
+ENTRYPOINT ["python", "-m", "rsa.server"]

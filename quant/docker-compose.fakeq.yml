@@ -1,0 +1,12 @@
+# DIAGNOSTIC: experts int8->bf16 round-tripped, served as plain bf16 (no quant
+# config). Isolates whether int8 *precision* breaks ZAYA vs a quant-path bug.
+services:
+  vllm:
+    command: >-
+      vllm serve /models/ZAYA1-8B-fakeq
+      --served-model-name model --max-num-batched-tokens 8192 --max-num-seqs 8
+      --max-model-len 60000 --mamba-cache-dtype float32 --dtype bfloat16
+      --reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser zaya_xml
+      --trust-remote-code
+    volumes:
+      - ~/models:/models:ro

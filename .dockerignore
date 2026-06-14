@@ -12,3 +12,6 @@ profiling/
 **/build/
 **/*.egg-info/
 **/.pytest_cache/
+
+# client-side venvs (e.g. rsa/.venv) — never ship into an image build context
+**/.venv/
