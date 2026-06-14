@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import logging
 import os
 
 import numpy as np
@@ -35,11 +36,20 @@ _CCA_HIP = os.environ.get("ZAYA_CCA_HIP", "0") == "1"
 # Fused PREFILL kernel (cca_prefill_qk): collapses the flat-buffer
 # scatter/conv/gather + eager grouped-means + fp32 RMS-norm + new-conv-state into
 # one launch (2.4-3x faster than the eager flat-conv path, validated bit-exact).
-# Separate opt-in from decode (ZAYA_CCA_HIP gates the decode kernel); default off
-# until the end-to-end coherence gate runs in a GPU window.
-_CCA_HIP_PREFILL = os.environ.get("ZAYA_CCA_HIP_PREFILL", "0") == "1"
+# Also enables the mixed prefill+decode HIP path (both kernels in one forward).
+# Separate opt-in from decode (ZAYA_CCA_HIP gates the decode kernel). Default ON:
+# the GPU coherence + perf gate passed (coherent; +37-49% e2e vs eager; all three
+# paths bit-exact — see docs/zaya/cca-kernel-perf.md). Set =0 to force eager prefill.
+_CCA_HIP_PREFILL = os.environ.get("ZAYA_CCA_HIP_PREFILL", "1") == "1"
 _cca_hip = None
 _cca_hip_tried = False
+
+# Debug: tally which fused HIP path each forward takes — decode-only, prefill-only
+# (pure-prefill batch), or mixed (prefill+decode in one batch) — so a serving run
+# can confirm all three CCA kernels actually fire. Gated; default off => the guard
+# short-circuits before any bookkeeping, zero hot-path overhead.
+_CCA_DEBUG_PATHS = os.environ.get("ZAYA_CCA_DEBUG_PATHS", "0") == "1"
+_cca_path_counts = {"decode": 0, "prefill": 0, "mixed": 0}
 
 
 def _get_cca_hip():
@@ -439,6 +449,18 @@ class CCA(MambaBase, CustomOp):
         # separate so a mixed batch can concatenate them (decode rows first).
         qk_full_d = None
         qk_full_p = None
+
+        if _CCA_DEBUG_PATHS and use_hip_qk:
+            _path = (
+                "mixed"
+                if (has_decode and has_prefill)
+                else ("decode" if has_decode else "prefill")
+            )
+            _cca_path_counts[_path] += 1
+            if _cca_path_counts[_path] == 1 or sum(_cca_path_counts.values()) % 1000 == 0:
+                logging.getLogger(__name__).info(
+                    "ZAYA CCA HIP path counts: %s", _cca_path_counts
+                )
 
         num_input_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states[:num_actual_tokens]
