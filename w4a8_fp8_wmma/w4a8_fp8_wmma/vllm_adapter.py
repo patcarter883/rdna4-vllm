@@ -58,6 +58,108 @@ def _no_triton_fallback() -> bool:
     return os.environ.get("VLLM_ROCM_W4A8_NO_TRITON_FALLBACK", "0") == "1"
 
 
+def _autotune_enabled() -> bool:
+    """On a crossover-cache MISS, run a quick A/B microbench at model load to
+    learn this exact (N,K,group)'s crossover, then persist it (subsequent loads
+    are O(1) lookups). VLLM_ROCM_W4A8_AUTOTUNE: 'on' (default) / 'off'. Off ->
+    unknown shapes stay _NEVER (always stock Triton), the prior behaviour."""
+    v = os.environ.get("VLLM_ROCM_W4A8_AUTOTUNE", "on").strip().lower()
+    return v not in ("0", "off", "false", "no")
+
+
+# Winning-suffix M grid for the load-time autotune A/B (matches profile_crossover.py
+# so the cached value the autotuner writes is the same shape the AOT tuner would).
+_AUTOTUNE_MGRID = (48, 64, 96, 128, 160, 192, 224, 256)
+_AUTOTUNE_EPS = 1.02  # within 2% of stock counts as "not worse" (parity)
+
+
+def _winning_suffix_crossover(ratios: dict, mgrid=_AUTOTUNE_MGRID,
+                              eps: float = _AUTOTUNE_EPS):
+    """Pure selection (no GPU): given ratios[M] = our_time / triton_time over the
+    sweep grid, return the LOWEST M whose ENTIRE >=M suffix is within `eps`
+    (ours never worse than stock by more than the noise margin), else None.
+
+    v10's mid-M crossover is non-monotonic + shape-dependent (it can win at M=48,
+    dip at M=96, win again at M=192), so a single threshold must be the start of
+    the contiguous winning *suffix* -- the dispatch then never regresses below
+    stock once it engages. Mirrors profile_crossover.crossover()'s suffix rule."""
+    for i, m in enumerate(mgrid):
+        if all(ratios.get(mm) is not None and ratios[mm] <= eps
+               for mm in mgrid[i:]):
+            return m
+    return None
+
+
+def _persist_crossover(N: int, K: int, group: int, value) -> None:
+    """Merge {f"{N},{K},{group}": value} into the crossover cache JSON and update
+    the in-process table. value is the crossover M (int) or None (= never). Best-
+    effort: a write failure must not break load (we still use the value in-mem)."""
+    key = f"{N},{K},{group}"
+    table = _load_crossover_table()
+    table[key] = value
+    path = os.environ.get(
+        "VLLM_ROCM_W4A8_FP8_WMMA_CACHE",
+        os.path.join(os.path.dirname(__file__), "crossover_cache.json"))
+    try:
+        with open(path, "w") as f:
+            json.dump(table, f, indent=1, sort_keys=True)
+    except OSError:
+        pass
+
+
+def _autotune_crossover(layer: torch.nn.Module, w_q_name: str,
+                        N: int, K: int, group: int):
+    """Load-time A/B microbench (GPU): time our v10 fp8-WMMA vs the served stock
+    Triton W4A16 across _AUTOTUNE_MGRID for THIS exact (N,K,group), pick the
+    winning-suffix crossover, persist it, and return it. ROBUSTNESS: ANY failure
+    returns None (-> caller falls back to _NEVER = stock) so the served pathway
+    never regresses. Reuses the weights already on `layer` (no extra VRAM).
+
+    Mirrors profile_crossover.py's measurement (v10 vs stock Triton, 2% suffix
+    rule) but at load time for the actual served shape, instead of an AOT sweep
+    over a hand-listed shape table. v10 needs group in {32,128}; for any other
+    group it returns None (the caller leaves _NEVER, as before)."""
+    import time
+
+    if group not in (32, 128):
+        return None  # v10 (the benched kernel) is compiled only for these groups
+
+    import w4a8_fp8_wmma  # noqa: F401  (ensure the op is loaded)
+    from vllm.model_executor.kernels.linear.mixed_precision.triton_w4a16 import (
+        triton_w4a16_gemm,
+    )
+
+    w_q = getattr(layer, w_q_name).data                # (N, K//8)
+    w_s = layer._w4a8_fp8_w_s                           # (N, K//group) fp16
+    tri_bq = getattr(layer, "_w4a8_tri_bq", None)      # (K, N//8)
+    tri_s = getattr(layer, "_w4a8_tri_s", None)        # (K//group, N)
+    if tri_bq is None or tri_s is None:
+        return None  # no Triton-layout weights to A/B against (single-layout mode)
+    tri_zp = getattr(layer, "_w4a8_tri_zp", None)
+    dev = w_q.device
+    empty = torch.empty(0, dtype=torch.int32, device=dev)
+
+    def _ms(fn, it=50):
+        for _ in range(10):
+            fn()
+        torch.cuda.synchronize()
+        t = time.perf_counter()
+        for _ in range(it):
+            fn()
+        torch.cuda.synchronize()
+        return (time.perf_counter() - t) / it
+
+    ratios = {}
+    for m in _AUTOTUNE_MGRID:
+        x = (torch.randn(m, K, device=dev) * 0.4).to(torch.float16)
+        t_o = _ms(lambda: torch.ops.w4a8_fp8_wmma.mmq_fp8_gemm(x, w_q, w_s, empty, 10))
+        t_t = _ms(lambda: triton_w4a16_gemm(x, tri_bq, tri_s, tri_zp, group, 8))
+        ratios[m] = t_o / t_t if t_t > 0 else None
+    co = _winning_suffix_crossover(ratios)
+    _persist_crossover(N, K, group, co)
+    return co
+
+
 def _load_crossover_table() -> dict:
     """Load the AOT crossover cache (O(1) per-shape Triton<->FP8 thresholds).
     Path: $VLLM_ROCM_W4A8_FP8_WMMA_CACHE or crossover_cache.json next to this
@@ -236,10 +338,29 @@ class RocmW4A8Fp8WmmaLinearKernel(MPLinearKernel):
         # FP8 kernel only where it is actually faster -> pathway is always >=
         # Triton. Cached per (N, K, group) since shapes repeat across layers.
         gs = c.group_size if c.group_size != -1 else K
-        # O(1) lookup of the precomputed crossover (AOT Profile & Cache). NO
-        # benchmarking at load time. Unknown shapes default to "never" (always
-        # Triton) so the pathway is >= Triton even when untuned.
+        # O(1) lookup of the precomputed crossover (AOT Profile & Cache). On a
+        # cache HIT this is benchmark-free. On a MISS (a shape that wasn't AOT-
+        # tuned) the kernel would otherwise be DEAD WEIGHT (always-Triton); so if
+        # VLLM_ROCM_W4A8_AUTOTUNE is on (default) we run a quick load-time A/B
+        # microbench for THIS exact (N,K,group), persist the winning-suffix
+        # crossover to the cache (subsequent loads are O(1)), and use it. ROBUST:
+        # any autotune failure -> _NEVER (always Triton), so the served pathway is
+        # always >= Triton, tuned or not. Env override / FORCE bypass the cache.
         layer._w4a8_min_m = _crossover_for(N, K, gs)
+        miss = (
+            layer._w4a8_min_m == _NEVER
+            and not os.environ.get("VLLM_ROCM_W4A8_FP8_WMMA_MIN_M")
+            and _force_mode() == "auto"
+            and _autotune_enabled()
+            and f"{N},{K},{gs}" not in _load_crossover_table()
+        )
+        if miss:
+            try:
+                co = _autotune_crossover(layer, self.w_q_name, N, K, gs)
+                layer._w4a8_min_m = _NEVER if co is None else int(co)
+            except Exception:  # pragma: no cover - defensive; never regress
+                _persist_crossover(N, K, gs, None)  # cache the miss -> O(1) next
+                layer._w4a8_min_m = _NEVER
 
     def apply_weights(
         self,
