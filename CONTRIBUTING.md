@@ -12,6 +12,13 @@ already have a documented door.
 > (the only compose; `--profile serve` / `--profile single`). The wheel-based from-source
 > Dockerfiles have been **retired** — the base image now provides vLLM.
 
+> **Testing containers?** Follow the protocol in [`CLAUDE.md`](CLAUDE.md): always test the
+> *latest* image (rebuild if the base / `w4a8_fp8_wmma/` / a patch changed; don't run a stale
+> tag), and **always mount the same per-image Triton cache** (`.triton-cache-combined` →
+> `/root/.triton`) so the ~15-30 min FLA-GDN compile is paid once and shared across runs —
+> except start a fresh cache dir when the vLLM/Triton/ROCm/torch/arch changes or you hit cache
+> corruption.
+
 ## What lives where
 
 | If you want to change… | Edit it… |
