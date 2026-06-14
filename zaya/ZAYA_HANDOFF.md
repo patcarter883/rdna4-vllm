@@ -14,9 +14,14 @@ plain KV cache). The differentiator is a **fused CCA decode HIP kernel**
 (`cca_hip/cca_kernel.hip`, `cca_decode_qk`) that replaces ~1.4M tiny eager ATen
 launches per decode step. Current kernel: **coalesced-`w1` transpose + `#pragma
 unroll 16` = 142µs→8µs/call on the 56-CU 9070 (17.6×), bit-exact**, gated
-`ZAYA_CCA_HIP=1` (eager fallback otherwise). CCA has **no TP>1** (per-head RMSNorm
-+ grouped-mean state don't column-split) — multi-card is DP=2 + expert-parallel
-(model replicated per rank), never TP.
+`ZAYA_CCA_HIP=1` (eager fallback otherwise). A twin **PREFILL kernel**
+(`cca_prefill_qk`) refuses the eager flat-conv prefill path (scatter → MIOpen
+Conv1d → gather → eager means/norm → state scatter, ~25-30 ATen ops/layer) into
+one launch: **2.4-3x faster, bit-exact** (`test_cca_prefill_qk.py`,
+`bench_cca_prefill_qk.py`), gated `ZAYA_CCA_HIP_PREFILL=1` (default off, pure-
+prefill batches only). CCA has **no TP>1** (per-head RMSNorm + grouped-mean state
+don't column-split) — multi-card is DP=2 + expert-parallel (model replicated per
+rank), never TP.
 
 ## Layout (what landed where)
 | Piece | Path |
@@ -76,7 +81,11 @@ curl -s localhost:8001/v1/completions -d '{"model":"model","prompt":"17*23=","ma
 **GPU-window checklist (the unchecked boxes):**
 - [ ] image builds (overlay applies, CCA kernel compiles + loads, patch applies).
 - [ ] coherence gate: one chat returns sane text; tool/reasoning parsers load.
-- [ ] CCA kernel A/B: `ZAYA_CCA_HIP=1` vs `=0` — both coherent; `=1` faster.
+- [ ] CCA DECODE kernel A/B: `ZAYA_CCA_HIP=1` vs `=0` — both coherent; `=1` faster.
+- [ ] CCA PREFILL kernel A/B: `ZAYA_CCA_HIP_PREFILL=1` vs `=0` — coherence must be
+      identical (exact refusion of the eager path; standalone bit-exact qk rel
+      ~6e-7, 2.4-3x faster). Default OFF until this passes. Fires only for
+      pure-prefill batches today; mixed prefill+decode -> eager (follow-up).
 - [ ] add + validate the multi-card (DP=2 + EP) profile — topology re-confirmed on
       the combined base, not staged blind.
 

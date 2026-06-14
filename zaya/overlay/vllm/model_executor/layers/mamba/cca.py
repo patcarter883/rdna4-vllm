@@ -32,6 +32,12 @@ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 # roll/scatter into one launch. Opt in with ZAYA_CCA_HIP=1; falls back to the
 # eager path if the extension isn't built.
 _CCA_HIP = os.environ.get("ZAYA_CCA_HIP", "0") == "1"
+# Fused PREFILL kernel (cca_prefill_qk): collapses the flat-buffer
+# scatter/conv/gather + eager grouped-means + fp32 RMS-norm + new-conv-state into
+# one launch (2.4-3x faster than the eager flat-conv path, validated bit-exact).
+# Separate opt-in from decode (ZAYA_CCA_HIP gates the decode kernel); default off
+# until the end-to-end coherence gate runs in a GPU window.
+_CCA_HIP_PREFILL = os.environ.get("ZAYA_CCA_HIP_PREFILL", "0") == "1"
 _cca_hip = None
 _cca_hip_tried = False
 
@@ -411,6 +417,19 @@ class CCA(MambaBase, CustomOp):
             and self.num_spec == 0
             and self.kv_cache[0].dtype == torch.float32
         )
+        # Pure-prefill HIP fast path (mirrors use_full_hip for the prefill region):
+        # one fused kernel does the flat-buffer conv + grouped-means + RMS-norm +
+        # new conv-state, producing qk_full directly. Gated off by default
+        # (_CCA_HIP_PREFILL) until the GPU-window coherence gate; mixed
+        # prefill+decode batches fall back to the eager path, same as decode.
+        use_prefill_hip = (
+            cca_hip is not None
+            and _CCA_HIP_PREFILL
+            and has_prefill
+            and not has_decode
+            and self.num_spec == 0
+            and self.kv_cache[0].dtype == torch.float32
+        )
         qk_full = None
 
         num_input_tokens, hidden_size = hidden_states.shape
@@ -489,38 +508,78 @@ class CCA(MambaBase, CustomOp):
             seg_starts = query_start_loc_p[:-1] + req_idx * tp_pad
             pad_offsets = torch.arange(tp_pad, device=device)
 
-            flat_len = num_prefill_tokens + num_prefills * tp_pad
-            flat_in = qk_packed0_p.new_empty((self.in_out_ch, flat_len))
-            flat_in[:, token_pos] = qk_packed0_p[:, 0, :].t()
+            if use_prefill_hip:
+                # Fused prefill kernel: same flat-segment causal-conv math as the
+                # eager path below, but conv + grouped-means + per-head RMS-norm +
+                # new-conv-state in ONE launch, emitting normalized q|k (qk_full)
+                # directly. The kernel reads the masked cached state (init_states)
+                # and writes conv_states in place (only each request's last token);
+                # the eager flat-buffer scatter/conv/gather/means/norm is skipped.
+                w0f, b0f, w1f, b1f = self._conv_weights_fp32()
+                qk_new_p = qk_packed0_p[:, 0, :].to(torch.float32).contiguous()
+                init_states = conv_states[state_indices_tensor_p].to(torch.float32)
+                init_states = torch.where(
+                    has_initial_states_p.view(-1, 1, 1),
+                    init_states,
+                    init_states.new_zeros(()),
+                ).contiguous()
+                seg_pos = (
+                    token_flat - query_start_loc_p[:-1][token_req]
+                ).to(torch.int32)
+                slot_p = state_indices_tensor_p[token_req].to(torch.int64)
+                is_last_p = token_flat == (query_start_loc_p[1:] - 1)[token_req]
+                qk_full = cca_hip.cca_prefill_qk(
+                    qk_new_p,
+                    conv_states,
+                    init_states,
+                    seg_pos,
+                    token_req.to(torch.int32),
+                    slot_p,
+                    is_last_p,
+                    w0f,
+                    b0f,
+                    w1f,
+                    b1f,
+                    self._temp_eff(),
+                    self.num_q_heads,
+                    self.gqa_groups,
+                    self.latent_q_dim,
+                    float(self.sqrt_head_dim),
+                )  # [P, latent_q+latent_k] normalized q|k; conv_states updated
+            else:
+                flat_len = num_prefill_tokens + num_prefills * tp_pad
+                flat_in = qk_packed0_p.new_empty((self.in_out_ch, flat_len))
+                flat_in[:, token_pos] = qk_packed0_p[:, 0, :].t()
 
-            init_states = conv_states[state_indices_tensor_p].to(flat_in.dtype)
-            init_states = torch.where(
-                has_initial_states_p.view(-1, 1, 1),
-                init_states,
-                init_states.new_zeros(()),
-            )
-            state_pos = (seg_starts.unsqueeze(1) + pad_offsets).reshape(-1)
-            flat_in[:, state_pos] = init_states.permute(1, 0, 2).reshape(
-                self.in_out_ch, -1
-            )
+                init_states = conv_states[state_indices_tensor_p].to(flat_in.dtype)
+                init_states = torch.where(
+                    has_initial_states_p.view(-1, 1, 1),
+                    init_states,
+                    init_states.new_zeros(()),
+                )
+                state_pos = (seg_starts.unsqueeze(1) + pad_offsets).reshape(-1)
+                flat_in[:, state_pos] = init_states.permute(1, 0, 2).reshape(
+                    self.in_out_ch, -1
+                )
 
-            flat_out = self.conv_qk(flat_in.unsqueeze(0))[0]
-            qk_packed3[prefill_slice] = flat_out[:, out_pos].t().unsqueeze(1)
+                flat_out = self.conv_qk(flat_in.unsqueeze(0))[0]
+                qk_packed3[prefill_slice] = flat_out[:, out_pos].t().unsqueeze(1)
 
-            # New conv state: the last total_padding input columns of each
-            # segment (naturally falls back onto the old state when a chunk
-            # is shorter than the conv window).
-            new_state_pos = (
-                (query_start_loc_p[1:] + req_idx * tp_pad).unsqueeze(1) + pad_offsets
-            ).reshape(-1)
-            new_states = (
-                flat_in[:, new_state_pos]
-                .reshape(self.in_out_ch, num_prefills, tp_pad)
-                .permute(1, 0, 2)
-            )
-            conv_states[state_indices_tensor_p] = new_states.to(
-                device=conv_states.device, dtype=conv_states.dtype
-            )
+                # New conv state: the last total_padding input columns of each
+                # segment (naturally falls back onto the old state when a chunk
+                # is shorter than the conv window).
+                new_state_pos = (
+                    (query_start_loc_p[1:] + req_idx * tp_pad).unsqueeze(1)
+                    + pad_offsets
+                ).reshape(-1)
+                new_states = (
+                    flat_in[:, new_state_pos]
+                    .reshape(self.in_out_ch, num_prefills, tp_pad)
+                    .permute(1, 0, 2)
+                )
+                conv_states[state_indices_tensor_p] = new_states.to(
+                    device=conv_states.device, dtype=conv_states.dtype
+                )
 
             # hs2 = previous-token hidden states: shift by one within each
             # request; the first token takes the cached last hidden state of
@@ -681,9 +740,9 @@ class CCA(MambaBase, CustomOp):
         k_end = q_end + self.latent_k_dim
         value = value.reshape(num_actual_tokens, self.latent_k_dim)
 
-        if use_full_hip:
+        if use_full_hip or use_prefill_hip:
             # qk_full [num_actual_tokens, latent_q+latent_k] is the normalized
-            # q|k from the fused kernel (means + RMS-norm already applied).
+            # q|k from the fused decode/prefill kernel (means + RMS-norm applied).
             output[:num_actual_tokens, :k_end] = qk_full.to(output.dtype)
             output[:num_actual_tokens, k_end:] = value.to(output.dtype)
             del qk_packed0

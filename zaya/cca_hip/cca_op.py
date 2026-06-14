@@ -34,5 +34,15 @@ def _cca_decode_qk_fake(
     return torch.empty_like(qk_new)
 
 
+@torch.library.register_fake("zaya_cca::cca_prefill_qk")
+def _cca_prefill_qk_fake(
+    qk_new, conv_states, init_states, seg_pos, req_id, slot, is_last,
+    w0, b0, w1, b1, temp_eff, num_q, gqa, latent_q, sqrt_d,
+):
+    # Mutates conv_states in place; returns qk_out shaped/dtyped like qk_new.
+    return torch.empty_like(qk_new)
+
+
 conv_state_decode = torch.ops.zaya_cca.conv_state_decode
 cca_decode_qk = torch.ops.zaya_cca.cca_decode_qk
+cca_prefill_qk = torch.ops.zaya_cca.cca_prefill_qk

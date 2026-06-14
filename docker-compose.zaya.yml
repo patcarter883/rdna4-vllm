@@ -46,6 +46,9 @@ x-zaya-common: &zaya-common
     PATH: /opt/rocm-7.2.1/lib/llvm/bin:/app/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     # Fused CCA decode kernel (coalesced-w1 + unroll16, ~8us/call). 0 -> eager.
     ZAYA_CCA_HIP: "${ZAYA_CCA_HIP:-1}"
+    # Fused CCA PREFILL kernel (2.4-3x vs eager flat-conv). Default OFF until the
+    # coherence A/B passes in a GPU window (see zaya/ZAYA_HANDOFF.md).
+    ZAYA_CCA_HIP_PREFILL: "${ZAYA_CCA_HIP_PREFILL:-0}"
     # W4A8 is for the AWQ/GPTQ MoE path; ZAYA's experts are FP8, so leave the W4A8
     # dense/MoE kernels off by default (they don't engage ZAYA's path anyway).
     VLLM_ROCM_USE_W4A8_FP8_WMMA: "${ZAYA_USE_W4A8:-0}"
