@@ -1,0 +1,11 @@
+# Build artifacts for the CCA HIP kernel — never commit (ABI binds to the image's
+# torch; the .so is built in-image by Dockerfile.zaya). Mirrors the repo's
+# no-prebuilt-.so rule (CONTRIBUTING "the one hard rule: ABI").
+**/build/
+**/*.so
+**/*.egg-info/
+# hipify byproducts (setup.py emits *_hip.cpp / *_hip.hip next to the source)
+**/*_hip.cpp
+**/*_hip.hip
+**/__pycache__/
+**/*.pyc

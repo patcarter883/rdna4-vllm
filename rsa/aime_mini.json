@@ -1,0 +1,27 @@
+[
+  {
+    "id": "aime24-I-1",
+    "question": "Every morning Aya goes for a 9-kilometer-long walk and stops at a coffee shop afterwards. When she walks at a constant speed of $s$ kilometers per hour, the walk takes her 4 hours, including $t$ minutes spent in the coffee shop. When she walks $s+2$ kilometers per hour, the walk takes her 2 hours and 24 minutes, including $t$ minutes spent in the coffee shop. Suppose Aya walks at $s+\\frac{1}{2}$ kilometers per hour. Find the number of minutes the walk takes her, including the $t$ minutes spent in the coffee shop.",
+    "answer": "204"
+  },
+  {
+    "id": "aime24-I-2",
+    "question": "There exist real numbers $x$ and $y$, both greater than 1, such that $\\log_x\\left(y^x\\right) = \\log_y\\left(x^{4y}\\right) = 10$. Find $xy$.",
+    "answer": "25"
+  },
+  {
+    "id": "aime24-II-1",
+    "question": "Among the 900 residents of Aimeville, there are 195 who own a diamond ring, 367 who own a set of golf clubs, and 562 who own a garden spade. In addition, each of the 900 residents owns a bag of candy hearts. There are 437 residents who own exactly two of these things, and 234 residents who own exactly three of these things. Find the number of residents of Aimeville who own all four of these things.",
+    "answer": "73"
+  },
+  {
+    "id": "aime25-I-1",
+    "question": "Find the sum of all integer bases $b > 9$ for which $17_b$ is a divisor of $97_b$.",
+    "answer": "70"
+  },
+  {
+    "id": "aime24-I-4",
+    "question": "Jen enters a lottery by picking 4 distinct numbers from $S = \\{1, 2, 3, \\ldots, 9, 10\\}$. Four numbers are randomly chosen from $S$. She wins a prize if at least two of her numbers were two of the randomly chosen numbers, and wins the grand prize if all four of her numbers were the randomly chosen numbers. The probability of her winning the grand prize given that she won a prize is $\\tfrac{m}{n}$ where $m$ and $n$ are relatively prime positive integers. Find $m+n$.",
+    "answer": "116"
+  }
+]

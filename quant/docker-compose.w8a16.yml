@@ -1,0 +1,23 @@
+# STAGED override — serves the weight-only INT8 (W8A16) ZAYA1-8B from
+# ~/models/ZAYA1-8B-w8a16. Apply in a coordination window over the base, with
+# the loader patch (zaya.py routes .weight_packed / transposed gate-up split):
+#
+#   docker compose -f docker-compose.yml \
+#     -f quant/docker-compose.w8a16.yml \
+#     -f quant/docker-compose.int8-patch.yml up -d vllm
+services:
+  vllm:
+    command: >-
+      vllm serve /models/ZAYA1-8B-w8a16
+      --served-model-name model
+      --max-num-batched-tokens 8192
+      --max-num-seqs 16
+      --max-model-len 60000
+      --mamba-cache-dtype float32
+      --dtype bfloat16
+      --reasoning-parser qwen3
+      --enable-auto-tool-choice
+      --tool-call-parser zaya_xml
+      --trust-remote-code
+    volumes:
+      - ~/models:/models:ro
