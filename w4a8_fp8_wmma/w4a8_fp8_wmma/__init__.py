@@ -164,3 +164,64 @@ def mmq_fp8_moe_gather_reduce(out2, sorted_token_ids, topk_weights,
     """
     return torch.ops.w4a8_fp8_wmma.mmq_fp8_moe_gather_reduce(
         out2, sorted_token_ids, topk_weights, num_tokens_post_padded, top_k)
+
+
+# ---------------------------------------------------------------------------
+# Fake / meta kernels for torch.compile (pt2-compliance).
+#
+# vLLM 0.22.69's full-graph aot_compile traces the model forward; the moment our
+# kernel actually engages (single-layout default / autotuned crossover), Dynamo
+# hits these custom ops and — without an output-shape (fake) impl — raises
+# "unsupported operator: w4a8_fp8_wmma.*". These fakes return an empty tensor of
+# the real output shape/dtype so Dynamo can infer metadata WITHOUT running the
+# kernel; paired with the pt2_compliant_tag on each m.def (bindings.cpp). No GPU
+# work runs in a fake. Output contracts mirror the CUDA impls exactly:
+#   mmq_fp8_gemm:            (M, N) f16        N = w_packed.size(0)   [(N, K//8)]
+#   mmq_fp8_gemm_v15/16/17:  (M, N) f16        N = the `N` arg
+#   mmq_fp8_moe_gemm:        (P, N) f16        P = sorted_ids, N = w_packed.size(1)
+#   mmq_fp8_moe_gemm1_silu:  (P, inter) f16    inter = w_packed.size(1)//2  [(E,2*inter,K//8)]
+#   mmq_fp8_moe_gemm_scatter: () — in-place into `output` (mutating, dormant)
+#   mmq_fp8_moe_gather_reduce:(M, N) f32       M = topk_weights.numel()//top_k
+_register_fake = getattr(getattr(torch, "library", None), "register_fake", None)
+if _register_fake is not None:  # torch >= 2.4 (base is 2.10)
+    @_register_fake("w4a8_fp8_wmma::mmq_fp8_gemm")
+    def _fake_mmq_fp8_gemm(x, w_packed, scales, w_zeros, version):
+        return x.new_empty((x.shape[0], w_packed.shape[0]), dtype=torch.float16)
+
+    @_register_fake("w4a8_fp8_wmma::mmq_fp8_gemm_v15")
+    def _fake_mmq_fp8_gemm_v15(x, w_rep, scales, w_zeros, N):
+        return x.new_empty((x.shape[0], N), dtype=torch.float16)
+
+    @_register_fake("w4a8_fp8_wmma::mmq_fp8_gemm_v16")
+    def _fake_mmq_fp8_gemm_v16(x, w_rep, scales, w_zeros, N):
+        return x.new_empty((x.shape[0], N), dtype=torch.float16)
+
+    @_register_fake("w4a8_fp8_wmma::mmq_w4a16_gemm_v17")
+    def _fake_mmq_w4a16_gemm_v17(x, w_rep, scales, w_zeros, N):
+        return x.new_empty((x.shape[0], N), dtype=torch.float16)
+
+    @_register_fake("w4a8_fp8_wmma::mmq_fp8_moe_gemm")
+    def _fake_mmq_fp8_moe_gemm(x, w_packed, scales, w_zeros, sorted_token_ids,
+                               expert_ids, num_tokens_post_padded, top_k,
+                               block_m, version):
+        return x.new_empty((sorted_token_ids.shape[0], w_packed.shape[1]),
+                           dtype=torch.float16)
+
+    @_register_fake("w4a8_fp8_wmma::mmq_fp8_moe_gemm1_silu")
+    def _fake_mmq_fp8_moe_gemm1_silu(x, w_packed, scales, w_zeros, sorted_token_ids,
+                                     expert_ids, num_tokens_post_padded, top_k,
+                                     block_m, version):
+        return x.new_empty((sorted_token_ids.shape[0], w_packed.shape[1] // 2),
+                           dtype=torch.float16)
+
+    @_register_fake("w4a8_fp8_wmma::mmq_fp8_moe_gemm_scatter")
+    def _fake_mmq_fp8_moe_gemm_scatter(x, w_packed, scales, w_zeros, sorted_token_ids,
+                                       expert_ids, num_tokens_post_padded, topk_weights,
+                                       output, top_k, block_m, version):
+        return None  # in-place accumulate into `output`; nothing returned
+
+    @_register_fake("w4a8_fp8_wmma::mmq_fp8_moe_gather_reduce")
+    def _fake_mmq_fp8_moe_gather_reduce(out2, sorted_token_ids, topk_weights,
+                                        num_tokens_post_padded, top_k):
+        return out2.new_empty((topk_weights.shape[0] // top_k, out2.shape[1]),
+                              dtype=torch.float32)
