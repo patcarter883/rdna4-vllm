@@ -405,32 +405,40 @@ class CCA(MambaBase, CustomOp):
         has_decode = num_decodes > 0
         num_actual_tokens = num_decodes + num_prefill_tokens
 
-        # Pure-decode HIP fast path: one fused kernel does conv + grouped-means
-        # + per-head RMS-norm + state update, producing normalized q|k directly
+        # Fused HIP fast paths: one kernel per region does conv + grouped-means +
+        # per-head RMS-norm + state update, producing normalized q|k directly
         # (qk_full); the shared eager means/normalize/qk-output below is skipped.
-        # Only for pure decode (no prefill) with an fp32 conv-state cache.
+        # Requires an fp32 conv-state cache and non-spec decode. The decode kernel
+        # (cca_decode_qk) is gated by ZAYA_CCA_HIP (implicit in cca_hip being
+        # non-None); the prefill kernel (cca_prefill_qk) additionally by
+        # ZAYA_CCA_HIP_PREFILL.
         cca_hip = _get_cca_hip()
-        use_full_hip = (
+        hip_base = (
             cca_hip is not None
-            and has_decode
-            and not has_prefill
             and self.num_spec == 0
             and self.kv_cache[0].dtype == torch.float32
         )
-        # Pure-prefill HIP fast path (mirrors use_full_hip for the prefill region):
-        # one fused kernel does the flat-buffer conv + grouped-means + RMS-norm +
-        # new conv-state, producing qk_full directly. Gated off by default
-        # (_CCA_HIP_PREFILL) until the GPU-window coherence gate; mixed
-        # prefill+decode batches fall back to the eager path, same as decode.
-        use_prefill_hip = (
-            cca_hip is not None
-            and _CCA_HIP_PREFILL
-            and has_prefill
-            and not has_decode
-            and self.num_spec == 0
-            and self.kv_cache[0].dtype == torch.float32
+        use_decode_hip = hip_base and has_decode
+        use_prefill_hip = hip_base and has_prefill and _CCA_HIP_PREFILL
+        # The unified qk_full output path bakes means+RMS-norm into the kernel and
+        # is all-or-nothing across the batch: take it only when EVERY present
+        # region is HIP-covered. Pure decode needs only ZAYA_CCA_HIP; pure prefill
+        # (and therefore a MIXED prefill+decode batch) also needs
+        # ZAYA_CCA_HIP_PREFILL. In a mixed batch both kernels run: decode and
+        # prefill write disjoint conv-state slots and the prefill kernel reads a
+        # pre-gathered init_states copy (never live conv_states), so the two
+        # launches don't race; their qk outputs are concatenated decode-first at
+        # the output stage. When a present region is not HIP-covered the whole
+        # batch falls back to the eager means/normalize path (unchanged).
+        use_hip_qk = (
+            (has_decode or has_prefill)
+            and (use_decode_hip or not has_decode)
+            and (use_prefill_hip or not has_prefill)
         )
-        qk_full = None
+        # Decode/prefill HIP kernels emit their own region's normalized q|k; kept
+        # separate so a mixed batch can concatenate them (decode rows first).
+        qk_full_d = None
+        qk_full_p = None
 
         num_input_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states[:num_actual_tokens]
@@ -508,10 +516,10 @@ class CCA(MambaBase, CustomOp):
             seg_starts = query_start_loc_p[:-1] + req_idx * tp_pad
             pad_offsets = torch.arange(tp_pad, device=device)
 
-            if use_prefill_hip:
+            if use_hip_qk:
                 # Fused prefill kernel: same flat-segment causal-conv math as the
                 # eager path below, but conv + grouped-means + per-head RMS-norm +
-                # new-conv-state in ONE launch, emitting normalized q|k (qk_full)
+                # new-conv-state in ONE launch, emitting normalized q|k (qk_full_p)
                 # directly. The kernel reads the masked cached state (init_states)
                 # and writes conv_states in place (only each request's last token);
                 # the eager flat-buffer scatter/conv/gather/means/norm is skipped.
@@ -528,7 +536,7 @@ class CCA(MambaBase, CustomOp):
                 ).to(torch.int32)
                 slot_p = state_indices_tensor_p[token_req].to(torch.int64)
                 is_last_p = token_flat == (query_start_loc_p[1:] - 1)[token_req]
-                qk_full = cca_hip.cca_prefill_qk(
+                qk_full_p = cca_hip.cca_prefill_qk(
                     qk_new_p,
                     conv_states,
                     init_states,
@@ -640,13 +648,13 @@ class CCA(MambaBase, CustomOp):
                 hs_d,
             )
 
-            if use_full_hip:
+            if use_hip_qk:
                 # One fused kernel: conv + grouped-means + per-head RMS-norm +
-                # state roll. Produces normalized q|k (qk_full); the shared
+                # state roll. Produces normalized q|k (qk_full_d); the shared
                 # eager means/normalize/qk-output below is skipped for decode.
                 w0f, b0f, w1f, b1f = self._conv_weights_fp32()
                 qk_new = qk_packed0_d[:, 0, :].to(torch.float32).contiguous()  # [S, C]
-                qk_full = cca_hip.cca_decode_qk(
+                qk_full_d = cca_hip.cca_decode_qk(
                     qk_new,
                     conv_states,
                     safe_decode_indices.to(torch.int64),
@@ -740,9 +748,17 @@ class CCA(MambaBase, CustomOp):
         k_end = q_end + self.latent_k_dim
         value = value.reshape(num_actual_tokens, self.latent_k_dim)
 
-        if use_full_hip or use_prefill_hip:
-            # qk_full [num_actual_tokens, latent_q+latent_k] is the normalized
-            # q|k from the fused decode/prefill kernel (means + RMS-norm applied).
+        if use_hip_qk:
+            # Normalized q|k (means + RMS-norm baked in) straight from the fused
+            # kernel(s). V1 lays the batch out decode-first, so a mixed batch
+            # concatenates the decode-region output (rows [0:num_decodes], from
+            # cca_decode_qk) ahead of the prefill-region output (rows
+            # [num_decodes:num_actual_tokens], from cca_prefill_qk). Pure batches
+            # have only one of the two.
+            if qk_full_d is not None and qk_full_p is not None:
+                qk_full = torch.cat([qk_full_d, qk_full_p], dim=0)
+            else:
+                qk_full = qk_full_d if qk_full_d is not None else qk_full_p
             output[:num_actual_tokens, :k_end] = qk_full.to(output.dtype)
             output[:num_actual_tokens, k_end:] = value.to(output.dtype)
             del qk_packed0
