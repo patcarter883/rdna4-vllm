@@ -47,15 +47,49 @@ def _force_mode() -> str:
     return "auto"
 
 
-def _no_triton_fallback() -> bool:
-    """Single-layout mode: skip building the Triton-fallback weight copy.
+def _layout_mode() -> str:
+    """Weight-layout mode — controls whether the Triton-fallback weight copy is built.
 
-    The Triton fallback needs weights in (K, N//8) packing, a *second* full copy
-    alongside our native (N, K//8) — doubling dense weight VRAM. On 16GB cards a
-    ~10GB-weights model (e.g. Qwen3.6-27B at TP=2) OOMs at load building it. With
-    this flag set, we keep only our layout and route ALL M through v11/v10/v5
-    (apply_weights makes the dispatch gap-free)."""
-    return os.environ.get("VLLM_ROCM_W4A8_NO_TRITON_FALLBACK", "0") == "1"
+    The Triton fallback (both stock `triton_w4a16_gemm` and our gfx1201-tuned
+    `triton_w4a16_gemm_gfx1201`) reads weights in (K, N//8) packing — a *second*
+    full copy alongside our native (N, K//8). The two Triton paths share the SAME
+    copy (identical b_q/scales/qzeros contract), so it is one copy, not two: it
+    EXACTLY doubles dense weight VRAM (same int32 byte count as native). On 16GB
+    cards a ~10GB-weights model (e.g. Qwen3.6-27B at TP=2) OOMs at load building it,
+    and that VRAM is otherwise KV cache -> concurrency/throughput.
+
+    Modes (VLLM_ROCM_W4A8_LAYOUT, default 'single'):
+      'single'  — single-layout (NEW DEFAULT): build NO second copy. Frees ~50% of
+                  dense weight VRAM for KV cache. All M route through our v11/v10/v5
+                  (apply_weights makes the ladder gap-free). Trades the dense M=16-64
+                  small-band, where the gfx1201-tuned Triton wins ~1.2-1.4x at g=128
+                  (and is parity at g<=64), for the VRAM — i.e. parity-or-slightly-
+                  below stock ONLY in that narrow band, >= stock everywhere else.
+      'tuned'   — build the (K, N//8) copy and route small-M (M<=32 & g>64) to the
+                  gfx1201-tuned Triton, mid-M to stock Triton. The strictly->=-stock
+                  pathway in EVERY regime (PIECE2_V*); costs 2x dense weight VRAM.
+      'full'    — alias of 'tuned' (kept for clarity / future stock-only variants).
+
+    Reversible: set VLLM_ROCM_W4A8_LAYOUT=tuned to restore the strictly->=-stock
+    small-M behavior at the 2x-VRAM cost. The legacy VLLM_ROCM_W4A8_NO_TRITON_
+    FALLBACK is still honored (1 -> 'single', 0 -> 'tuned') so existing deploys
+    that pinned the old default behavior keep it."""
+    legacy = os.environ.get("VLLM_ROCM_W4A8_NO_TRITON_FALLBACK")
+    if legacy is not None:
+        return "single" if legacy == "1" else "tuned"
+    v = os.environ.get("VLLM_ROCM_W4A8_LAYOUT", "single").strip().lower()
+    if v in ("tuned", "full"):
+        return "tuned"
+    return "single"
+
+
+def _no_triton_fallback() -> bool:
+    """True when NO Triton-fallback weight copy should be built (single-layout).
+
+    The (K, N//8) copy is what the stock + gfx1201-tuned Triton fallbacks read; in
+    single-layout mode it is skipped and ALL M route through v11/v10/v5 (the
+    apply_weights ladder is gap-free). See _layout_mode for the VRAM tradeoff."""
+    return _layout_mode() == "single"
 
 
 def _autotune_enabled() -> bool:
@@ -290,13 +324,18 @@ class RocmW4A8Fp8WmmaLinearKernel(MPLinearKernel):
         if w_zp is not None and not w_zp.is_contiguous():
             self._transform_param(layer, self.w_zp_name, lambda p: p.contiguous())
 
-        # ---- Triton W4A16 fallback weights (used for small M where Triton wins).
-        # triton_w4a16_gemm wants b_q [K, N//8], scales [K//group, N]. Build from
-        # our (N, K//8) / (N, K//group) layout. SKIPPED in single-layout mode: this
-        # is a SECOND full weight copy (Triton packing) that doubles dense weight
-        # VRAM and OOMs ~10GB-weight models on 16GB cards. See _no_triton_fallback.
+        # ---- Triton W4A16 fallback weights (small-M band where Triton wins).
+        # Both the stock triton_w4a16_gemm AND our gfx1201-tuned variant read b_q
+        # [K, N//8], scales [K//group, N] — ONE shared copy, built from our (N, K//8)
+        # / (N, K//group) layout. SKIPPED by default (single-layout mode): this is a
+        # SECOND full weight copy (Triton packing) that EXACTLY doubles dense weight
+        # VRAM (same int32 byte count as native) and OOMs ~10GB-weight models on 16GB
+        # cards — VRAM that is otherwise KV cache. The default frees it; set
+        # VLLM_ROCM_W4A8_LAYOUT=tuned to build it and keep the strictly->=-stock
+        # small-M path (2x VRAM). See _layout_mode for the full tradeoff.
         if _no_triton_fallback() or _force_mode() == "on":
-            # FORCE=on always runs our kernel, so the Triton copy is dead weight.
+            # single-layout, or FORCE=on (always runs our kernel) -> the Triton copy
+            # is dead weight. apply_weights routes ALL M through v11/v10/v5 (gap-free).
             layer._w4a8_tri_bq = None
             layer._w4a8_tri_s = None
             layer._w4a8_tri_zp = None
@@ -405,14 +444,19 @@ class RocmW4A8Fp8WmmaLinearKernel(MPLinearKernel):
         use_v10 = (not use_v11) and v10_ok and M >= prefill_min
         use_v5 = (not use_v11) and (not use_v10) and M >= cached  # gs not 32/128
 
+        # Single-layout (default): no (K,N//8) fallback weights exist, so the Triton
+        # else-branch below would deref None -> ALWAYS route through our kernel here,
+        # gap-free (v10 covers any M for gs in {32,128}; else v5), overriding even a
+        # FORCE=off (which has no stock-Triton weights to fall back to in this mode).
+        have_fallback = getattr(layer, "_w4a8_tri_bq", None) is not None
         # Tuning-gate override (VLLM_ROCM_W4A8_FORCE):
         #   off -> always stock Triton (needs the fallback weights, which were built
-        #          since FORCE!=on at load); on / single-layout -> always our kernel,
-        #          with a gap-free ladder (v10 covers any M for gs in {32,128}; else v5).
+        #          since FORCE!=on AND mode='tuned' at load); on / single-layout ->
+        #          always our kernel, gap-free.
         force = _force_mode()
-        if force == "off":
+        if force == "off" and have_fallback:
             use_v11 = use_v10 = use_v5 = False
-        elif (force == "on" or _no_triton_fallback()) and not (use_v11 or use_v10 or use_v5):
+        elif (force == "on" or not have_fallback) and not (use_v11 or use_v10 or use_v5):
             if v10_ok:
                 use_v10 = True
             else:
