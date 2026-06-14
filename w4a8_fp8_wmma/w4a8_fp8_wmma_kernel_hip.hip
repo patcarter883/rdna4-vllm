@@ -172,6 +172,92 @@ __global__ void compute_act_fp8_and_scales_kernel(
     }
 }
 
+// 2x int32 (= 8 fp8 bytes / lane) vector — the fp8 WMMA A/B fragment unit; also
+// used by the fused act-quant staging below (defined here so the helpers can
+// return it; the GEMM kernels reuse this same alias).
+using v2i_t = int __attribute__((ext_vector_type(2)));
+
+// ============================================================
+// Fused activation-quant prologue (replaces the separate pre-kernel +
+// (M,K) x_fp8 HBM round-trip for the dispatched WMMA path, v5/v10).
+//
+// compute_block_act_scales: every thread cooperatively computes the per-row
+// act scale for this block's `nrows` rows (block_m .. block_m+nrows) directly
+// from the fp16 activations in global memory, writing scale_s[0..nrows) in LDS.
+// The K-loop then quantizes x_fp16 -> e4m3 IN-LINE via stage_act_word (so the
+// fp8 operand is materialized in LDS/registers, never in HBM).
+//
+// BIT-EXACTNESS: the per-row scale is max(|x|)/448 clamped to >=1e-8, reduced in
+// fp32 over the full K row -- identical to compute_act_fp8_and_scales_kernel
+// (max is associative+commutative+exact, so the threads' tiling is irrelevant).
+// stage_act_word emits f32_to_e4m3(x*inv_scale) byte-for-byte as the old
+// pre-kernel did, so the fp8 fed to the WMMA -- and the epilogue scale -- match
+// the validated x_fp8 path exactly. (nthreads must be a multiple of 32.)
+// ============================================================
+__device__ __forceinline__ void compute_block_act_scales(
+    const __half* __restrict__ x, int M, int K,
+    int block_m, int nrows, int tid, int nthreads,
+    float* scale_s) {            // LDS out, >= nrows floats
+    // Each warp fully OWNS a strided set of rows (no cross-warp reduction, so
+    // just ONE __syncthreads() for the whole prologue). Within a warp the 32
+    // lanes split K and warp-shuffle the row max; lane 0 writes the scale.
+    const int lane = tid & 31;
+    const int warp_id = tid >> 5;
+    const int nwarps = nthreads >> 5;
+    for (int r = warp_id; r < nrows; r += nwarps) {
+        const int am = block_m + r;
+        float local_max = 0.0f;
+        if (am < M) {
+            const __half* x_row = x + (long)am * K;
+            for (int k = lane; k < K; k += 32) {
+                float v = fabsf(__half2float(x_row[k]));
+                if (v > local_max) local_max = v;
+            }
+        }
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            float other = __shfl_xor(local_max, offset);
+            if (other > local_max) local_max = other;
+        }
+        if (lane == 0) {
+            float scale = local_max / E4M3_MAX;
+            if (scale < 1e-8f) scale = 1e-8f;
+            scale_s[r] = scale;     // final per-row scale for this block row
+        }
+    }
+    __syncthreads();
+}
+
+// Quantize 4 consecutive fp16 activations at x[am][k..k+4) to a packed uint32 of
+// 4 e4m3 bytes using the precomputed per-row inv_scale. Out-of-range rows -> 0,
+// matching the old staging's tail guard. Byte-identical to the pre-kernel.
+__device__ __forceinline__ unsigned int stage_act_word(
+    const __half* __restrict__ x, int M, int K, int am, int k, float inv_scale) {
+    if (am >= M) return 0u;
+    const __half* p = x + (long)am * K + k;
+    unsigned int w = 0u;
+    unsigned char* b = reinterpret_cast<unsigned char*>(&w);
+    #pragma unroll
+    for (int j = 0; j < 4; ++j)
+        b[j] = f32_to_e4m3(__half2float(p[j]) * inv_scale);
+    return w;
+}
+
+// v10's load_A reads 8 fp8 (a v2i_t = 2 int32) per lane before the warp shuffle.
+// Fuse: quantize the 8 fp16 at x[am][k..k+8) -> 8 e4m3 bytes (byte-identical to
+// the pre-kernel's x_fp8). Out-of-range -> 0, matching the old v2i_t{0,0} guard.
+__device__ __forceinline__ v2i_t stage_act_v2i(
+    const __half* __restrict__ x, int M, int K, int am, int k, float inv_scale) {
+    if (am >= M) return v2i_t{0, 0};
+    const __half* p = x + (long)am * K + k;
+    v2i_t v;
+    unsigned char* b = reinterpret_cast<unsigned char*>(&v);
+    #pragma unroll
+    for (int j = 0; j < 8; ++j)
+        b[j] = f32_to_e4m3(__half2float(p[j]) * inv_scale);
+    return v;
+}
+
 // ============================================================
 // v1: rocWMMA fp8 16x16x16. One wave32 warp per 16x16 output tile.
 // The int4 -> fp8 expansion is fused into the LDS store (STAGE 2), so weights
@@ -559,13 +645,12 @@ __global__ void __launch_bounds__(V2_NWARPS * 32) mmq_fp8_gemm_kernel_v4(
 // (layout probed: A operand lane L = A[(L&15)][(L>>4)*8], same for B^T). Replaces
 // rocWMMA's mixed ds_load_b32/b64 fragment loads (the ~20 TFLOP/s ceiling).
 // ============================================================
-using v2i_t = int __attribute__((ext_vector_type(2)));
+// (v2i_t defined above near the fused act-quant helpers.)
 using v8f_t = float __attribute__((ext_vector_type(8)));
 using v8h_t = _Float16 __attribute__((ext_vector_type(8)));   // f16 WMMA operand
 
 __global__ void __launch_bounds__(V2_NWARPS * 32) mmq_fp8_gemm_kernel_v5(
-    const unsigned char* __restrict__ x_fp8,
-    const float*         __restrict__ act_scales,
+    const __half*        __restrict__ x,            // (M, K) fp16 activations
     const int*           __restrict__ w_packed,
     const __half*        __restrict__ w_scales,
     const int*           __restrict__ w_zeros_packed,
@@ -594,6 +679,13 @@ __global__ void __launch_bounds__(V2_NWARPS * 32) mmq_fp8_gemm_kernel_v5(
 
     __shared__ unsigned char A_tile[V2_BM * (MAX_GROUP_SIZE + LDS_PAD)];
     __shared__ unsigned char B_tile[V2_BN * (MAX_GROUP_SIZE + LDS_PAD)];
+    // Fused act-quant: per-row e4m3 scale for this block's V2_BM rows. Replaces
+    // the separate compute_act_fp8_and_scales_kernel launch and the (M,K) x_fp8
+    // HBM round-trip (activations stay fp16 in HBM, become e4m3 in A_tile during
+    // staging). Bit-exact with the old path.
+    __shared__ float act_scale_s[V2_BM];
+    compute_block_act_scales(x, M, K, block_m, V2_BM, tid, V2_NWARPS * 32,
+                             act_scale_s);
 
     float running[V2_NFRAG][8];
     #pragma unroll
@@ -606,9 +698,8 @@ __global__ void __launch_bounds__(V2_NWARPS * 32) mmq_fp8_gemm_kernel_v5(
 
         for (int idx = tid * 4; idx < V2_BM * BK; idx += (V2_NWARPS * 32) * 4) {
             const int r = idx / BK, k = idx % BK, am = block_m + r;
-            unsigned int v = 0u;
-            if (am < M)
-                v = *reinterpret_cast<const unsigned int*>(&x_fp8[am * K + k0 + k]);
+            const float inv_scale = 1.0f / act_scale_s[r];
+            unsigned int v = stage_act_word(x, M, K, am, k0 + k, inv_scale);
             *reinterpret_cast<unsigned int*>(&A_tile[r * LDSBK + k]) = v;
         }
         const int njobs = V2_BN * (BK / PACK_FACTOR);
@@ -679,9 +770,10 @@ __global__ void __launch_bounds__(V2_NWARPS * 32) mmq_fp8_gemm_kernel_v5(
 
     #pragma unroll
     for (int e = 0; e < 8; ++e) {
-        const int abs_m = block_m + warp_id * WMMA_DIM + frag_row0 + e;
+        const int lrow_m = warp_id * WMMA_DIM + frag_row0 + e;   // row within block
+        const int abs_m = block_m + lrow_m;
         if (abs_m >= M) continue;
-        const float asc = act_scales[abs_m];
+        const float asc = act_scale_s[lrow_m];   // fused per-row act scale
         #pragma unroll
         for (int f = 0; f < V2_NFRAG; ++f) {
             const int abs_n = block_n + f * WMMA_DIM + frag_col;
@@ -1346,8 +1438,7 @@ __global__ void __launch_bounds__(NWARPS * 32) mmq_fp8_gemm_kernel_v9(
 // ============================================================
 template <int BM, int BN, int NWARPS, int BKT, bool DB>
 __global__ void __launch_bounds__(NWARPS * 32) mmq_fp8_gemm_kernel_v10(
-    const unsigned char* __restrict__ x_fp8,
-    const float*         __restrict__ act_scales,
+    const __half*        __restrict__ x,            // (M, K) fp16 activations
     const int*           __restrict__ w_packed,
     const __half*        __restrict__ w_scales,
     const int*           __restrict__ w_zeros_packed,
@@ -1378,17 +1469,25 @@ __global__ void __launch_bounds__(NWARPS * 32) mmq_fp8_gemm_kernel_v10(
     B_buf[0] = v10_smem;
     B_buf[1] = v10_smem + (DB ? BN * LDSBK : 0);
     __shared__ float v10_wsc[2][BN];
+    // Fused act-quant: per-row e4m3 scale for this block's BM rows. Replaces the
+    // separate compute_act_fp8_and_scales_kernel launch and the (M,K) x_fp8 HBM
+    // round-trip (load_A quantizes fp16->e4m3 in-register right before the
+    // warp-shuffle). Bit-exact with the old path.
+    __shared__ float v10_act_scale[BM];
+    compute_block_act_scales(x, M, K, block_m, BM, tid, nthreads, v10_act_scale);
 
     // coalesced global A load for this warp's 16 rows at K-offset k0+kt*16,
-    // then transpose to the WMMA fragment layout via warp shuffle.
-    const int a_row = block_m + warp_id * WMMA_DIM + (lane >> 1);
+    // quantize fp16->e4m3 in-register (per-row scale), then transpose to the WMMA
+    // fragment layout via warp shuffle.
+    // (lane L -> row L/2, k-half L&1; shuffle src = 2*(L&15)+(L>>4)).
+    const int a_lrow = warp_id * WMMA_DIM + (lane >> 1);   // row within block
+    const int a_row = block_m + a_lrow;
     const int a_kh = (lane & 1) * 8;
     const int a_shfl_src = 2 * (lane & 15) + (lane >> 4);
+    const float a_inv_scale = 1.0f / v10_act_scale[a_lrow];
     auto load_A = [&](int k0, int kt) -> v2i_t {
         const int gk = k0 + kt * WMMA_DIM + a_kh;
-        v2i_t v = v2i_t{0, 0};
-        if (a_row < M)
-            v = *reinterpret_cast<const v2i_t*>(&x_fp8[(long)a_row * K + gk]);
+        v2i_t v = stage_act_v2i(x, M, K, a_row, gk, a_inv_scale);
         v2i_t w;
         w[0] = __shfl(v[0], a_shfl_src);
         w[1] = __shfl(v[1], a_shfl_src);
@@ -1474,9 +1573,10 @@ __global__ void __launch_bounds__(NWARPS * 32) mmq_fp8_gemm_kernel_v10(
 
     #pragma unroll
     for (int e = 0; e < 8; ++e) {
-        const int abs_m = block_m + warp_id * WMMA_DIM + frag_row0 + e;
+        const int lrow_m = warp_id * WMMA_DIM + frag_row0 + e;   // row within block
+        const int abs_m = block_m + lrow_m;
         if (abs_m >= M) continue;
-        const float asc = act_scales[abs_m];
+        const float asc = v10_act_scale[lrow_m];   // fused per-row act scale
         #pragma unroll
         for (int f = 0; f < NFRAG; ++f) {
             const int abs_n = block_n + f * WMMA_DIM + frag_col;
@@ -2387,13 +2487,20 @@ void launch_mmq_fp8_gemm_gfx1201(
 
     hipStream_t stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
 
-    auto x_fp8 = at::empty({M, K}, x.options().dtype(at::kByte));
-    auto act_scales = at::empty({M}, x.options().dtype(at::kFloat));
-   hipLaunchKernelGGL(( compute_act_fp8_and_scales_kernel), dim3(dim3(M)), dim3(dim3(ACTQUANT_BLOCK)), 0, stream, 
-        reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),
-        x_fp8.data_ptr<unsigned char>(),
-        act_scales.data_ptr<float>(),
-        M, K);
+    // The dispatched WMMA path (v5/v10) FUSES the activation fp8-quant into the
+    // GEMM prologue (per-row amax + e4m3 expand in-kernel), so it consumes the
+    // fp16 activations directly -- no separate launch, no (M,K) x_fp8 HBM
+    // round-trip. Every other (non-dispatched) version still uses the standalone
+    // pre-kernel + x_fp8 buffer below.
+    const __half* x_h = reinterpret_cast<const __half*>(x.data_ptr<at::Half>());
+    const bool fused_actquant = (version == 5 || version == 10);
+    at::Tensor x_fp8, act_scales;
+    if (!fused_actquant) {
+        x_fp8 = at::empty({M, K}, x.options().dtype(at::kByte));
+        act_scales = at::empty({M}, x.options().dtype(at::kFloat));
+       hipLaunchKernelGGL(( compute_act_fp8_and_scales_kernel), dim3(dim3(M)), dim3(dim3(ACTQUANT_BLOCK)), 0, stream, 
+            x_h, x_fp8.data_ptr<unsigned char>(), act_scales.data_ptr<float>(), M, K);
+    }
 
     const int* w_zeros_ptr = (w_zeros.defined() && w_zeros.numel() > 0)
                              ? w_zeros.data_ptr<int>() : nullptr;
@@ -2559,8 +2666,7 @@ void launch_mmq_fp8_gemm_gfx1201(
         auto launch = [&](auto kern, int nwarps) {
             dim3 block(nwarps * 32);
            hipLaunchKernelGGL(( kern), dim3(grid), dim3(block), shmem, stream, 
-                x_fp8.data_ptr<unsigned char>(),
-                act_scales.data_ptr<float>(),
+                x_h,                       // fused act-quant: fp16 activations
                 w_packed.data_ptr<int>(),
                 reinterpret_cast<const __half*>(scales.data_ptr<at::Half>()),
                 w_zeros_ptr,
@@ -2734,11 +2840,11 @@ void launch_mmq_fp8_gemm_gfx1201(
             M, N, K, group_size, lds_pad);
     } else if (version == 5) {
         // v5: raw fp8 WMMA builtin + direct K-major int2 loads.
+        // Fused act-quant (fp16 in, e4m3 in A_tile during staging).
         dim3 block(V2_NWARPS * 32);
         dim3 grid((N + V2_BN - 1) / V2_BN, (M + V2_BM - 1) / V2_BM);
        hipLaunchKernelGGL(( mmq_fp8_gemm_kernel_v5), dim3(grid), dim3(block), 0, stream, 
-            x_fp8.data_ptr<unsigned char>(),
-            act_scales.data_ptr<float>(),
+            x_h,
             w_packed.data_ptr<int>(),
             reinterpret_cast<const __half*>(scales.data_ptr<at::Half>()),
             w_zeros_ptr,
