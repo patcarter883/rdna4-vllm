@@ -84,8 +84,10 @@ curl -s localhost:8001/v1/completions -d '{"model":"model","prompt":"17*23=","ma
 - [ ] CCA DECODE kernel A/B: `ZAYA_CCA_HIP=1` vs `=0` — both coherent; `=1` faster.
 - [ ] CCA PREFILL kernel A/B: `ZAYA_CCA_HIP_PREFILL=1` vs `=0` — coherence must be
       identical (exact refusion of the eager path; standalone bit-exact qk rel
-      ~6e-7, 2.4-3x faster). Default OFF until this passes. Fires only for
-      pure-prefill batches today; mixed prefill+decode -> eager (follow-up).
+      ~6e-7, 2.4-3x faster). Default OFF until this passes. Fires for pure-prefill
+      AND mixed prefill+decode batches (mixed runs both fused kernels — disjoint
+      conv-state slots, decode-first concat; standalone bit-exact, commit 4507d53,
+      `test_cca_mixed_qk.py`). The A/B should now exercise mixed batches too.
 - [ ] add + validate the multi-card (DP=2 + EP) profile — topology re-confirmed on
       the combined base, not staged blind.
 
