@@ -18,7 +18,6 @@ from vllm.distributed import (
 )
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoE
-from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -904,16 +903,17 @@ class ZayaForCausalLM(nn.Module, HasInnerState, IsHybrid):
                     key = key.replace("_B.weight", ".B.weight")
             weights_dict[key] = loaded_weight
 
-        # Build a map from prefix → MoE expert module for expert weight loading.
-        # FusedMoE is a factory function on current vLLM; the experts module it
-        # returns is a RoutedExperts instance.
-        # FusedMoE is a factory returning a MoERunner; the expert weight
-        # parameters (w13_weight, w2_weight, and their _scale partners for
-        # quantized checkpoints) live in its nested RoutedExperts submodule,
-        # named "<...>.experts.routed_experts".
-        fused_moe_modules: dict[str, RoutedExperts] = {}
+        # Build a map from prefix → FusedMoE module for expert weight loading.
+        # On the combined base FusedMoE is a real nn.Module class (NOT a factory):
+        # self.experts IS the FusedMoE and the expert params (w13_weight,
+        # w2_weight, and their _scale partners for quantized checkpoints) live
+        # directly on it. The therock fork nested a RoutedExperts submodule here
+        # and an earlier port matched isinstance(module, RoutedExperts) — which
+        # this base never builds, so every expert weight was silently skipped and
+        # the MoE ran on random weights. Match FusedMoE, like the zaya1-pr loader.
+        fused_moe_modules: dict[str, FusedMoE] = {}
         for name, module in self.named_modules():
-            if isinstance(module, RoutedExperts):
+            if isinstance(module, FusedMoE):
                 fused_moe_modules[name] = module
 
         loaded_params: set[str] = set()
@@ -940,20 +940,19 @@ class ZayaForCausalLM(nn.Module, HasInnerState, IsHybrid):
                     )
                 expert_id = int(m.group(1))
 
-                # Determine the RoutedExperts param name and shard_id.
+                # Determine the FusedMoE param name and shard_id.
                 # linear_fc1 = merged gate+up → w13_weight (split into w1, w3)
                 # linear_fc2 = down proj → w2_weight (shard_id w2)
-                # The expert params live in the nested RoutedExperts submodule.
                 # parts[-1] is "weight" (bf16/fp8 weight) or "weight_scale"
-                # (per-channel scale for quantized checkpoints); both are loaded
+                # (per-channel scale for quantized checkpoints); both load
                 # through the same FusedMoE weight_loader, which routes by the
                 # param it is handed.
-                routed_experts_prefix = ".".join(parts[:5]) + ".routed_experts"
-                fused_moe_module = fused_moe_modules.get(routed_experts_prefix)
+                fused_moe_prefix = ".".join(parts[:5])
+                fused_moe_module = fused_moe_modules.get(fused_moe_prefix)
                 if fused_moe_module is None:
                     logger.warning(
-                        "No RoutedExperts module found at %s, skipping %s",
-                        routed_experts_prefix,
+                        "No FusedMoE module found at %s, skipping %s",
+                        fused_moe_prefix,
                         chkpt_weight_name,
                     )
                     continue
@@ -967,7 +966,7 @@ class ZayaForCausalLM(nn.Module, HasInnerState, IsHybrid):
                 suffix = "_scale" if kind == "weight_scale" else ""
 
                 if parts[-2] == "linear_fc1":
-                    param_name = f"{routed_experts_prefix}.w13_weight{suffix}"
+                    param_name = f"{fused_moe_prefix}.w13_weight{suffix}"
                     param = params_dict[param_name]
                     half = loaded_weight.shape[0] // 2
                     gate = loaded_weight[:half]
@@ -980,7 +979,7 @@ class ZayaForCausalLM(nn.Module, HasInnerState, IsHybrid):
                     )
                     loaded_params.add(param_name)
                 elif parts[-2] == "linear_fc2":
-                    param_name = f"{routed_experts_prefix}.w2_weight{suffix}"
+                    param_name = f"{fused_moe_prefix}.w2_weight{suffix}"
                     param = params_dict[param_name]
                     fused_moe_module.weight_loader(
                         param, loaded_weight, chkpt_weight_name, "w2", expert_id
