@@ -1,11 +1,18 @@
 """AOT crossover profiler -> crossover_cache.json (consumed by vllm_adapter._crossover_for).
 
 For each (N,K,group) it measures v10 (W4A8 fp8-WMMA) vs the SERVED mid-M fallback
-(stock Triton W4A16) and records the LOWEST M whose entire >=M suffix beats stock
-within a 2% noise margin. v10's mid-M crossover is non-monotonic and shape-dependent
-(it can win at M=48, dip at M=96, win again at M=192), so a single threshold must be
-the start of the contiguous winning *suffix* -- guaranteeing the dispatch never
-regresses below stock once it engages v10. Unknown shapes stay null -> Triton.
+(gfx1201-tuned Triton W4A16) and records the LOWEST M whose entire >=M suffix beats
+Triton within a 2% noise margin. v10's mid-M crossover is non-monotonic and
+shape-dependent, so a single threshold must be the start of the contiguous winning
+*suffix* -- guaranteeing the dispatch never regresses below Triton once it engages v10.
+Unknown shapes stay null -> Triton.
+
+IMPORTANT: timing uses HIP graph replay (ms_graph), NOT eager Python loops.
+Under production (cudagraphs on) stock Triton benefits from graph capture -- its
+per-kernel launch overhead is amortised once, whereas our W4A8 kernel is already
+GPU-compute-bound per call and sees ~no benefit. Eager timings flatter us and
+produce crossovers that are too low (we win shapes in eager that lose under graphs).
+ms_graph exposes the production regime for both sides so the cache is correct.
 
 Run: HIP_VISIBLE_DEVICES=0 python profile_crossover.py   (writes crossover_cache.json)
 """
@@ -33,11 +40,22 @@ def pkt(W):
     N,K=W.shape; b=torch.zeros(K,N//8,dtype=torch.int32,device=W.device)
     for j in range(8): b|=((W[j::8,:].t().int())&0xF)<<(j*4)
     return b
-def ms(fn,it=200):
+def ms_graph(fn, it=200):
+    # Eager warmup: ensures Triton JIT compiles and both kernels are warm in L2.
     for _ in range(20): fn()
-    torch.cuda.synchronize(); t=time.perf_counter()
-    for _ in range(it): fn()
-    torch.cuda.synchronize(); return (time.perf_counter()-t)/it*1e3
+    torch.cuda.synchronize()
+    # Capture a HIP replay graph -- same API as CUDA graphs on PyTorch/ROCm.
+    # The captured graph holds tensor addresses fixed; fn() must not allocate
+    # inside the capture window (all tensors are pre-allocated in crossover()).
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        fn()
+    torch.cuda.synchronize()
+    # Time pure replays: this is what production cudagraph mode looks like.
+    t = time.perf_counter()
+    for _ in range(it): g.replay()
+    torch.cuda.synchronize()
+    return (time.perf_counter() - t) / it * 1e3
 def crossover(N,K,G):
     W=torch.randint(0,16,(N,K),dtype=torch.int32,device=dev); nkg=K//G
     sc=(torch.rand(N,nkg,device=dev)*0.02+0.002).half(); tsc=sc.t().contiguous()
@@ -45,7 +63,12 @@ def crossover(N,K,G):
     ratios={}
     for M in MGRID:
         x=(torch.randn(M,K,device=dev)*0.4).half()
-        ratios[M]=ms(lambda: op.mmq_fp8_gemm(x,wq,sc,ze,10))/ms(lambda: tri_stock(x,bq,tsc,None,G,8))
+        # Graph-captured timing: both kernels timed under graph replay so the
+        # ratio reflects production (not eager) performance. Stock Triton's
+        # graph speedup is exposed here; our kernel is graph-invariant.
+        t_ours = ms_graph(lambda: op.mmq_fp8_gemm(x,wq,sc,ze,10))
+        t_tri  = ms_graph(lambda: tri_stock(x,bq,tsc,None,G,8))
+        ratios[M] = t_ours / t_tri
     # lowest M whose entire suffix (all M'>=M in grid) is within EPS
     best=None
     for i,M in enumerate(MGRID):
