@@ -158,7 +158,9 @@ way to fully prewarm TP=2 from one GPU; the binaries are genuinely shape-specifi
 The differentiator: a HIP kernel that expands packed INT4 expert weights to FP8 e4m3
 **in-register** and feeds RDNA4's FP8 WMMA units. Scaffolded from a gfx1151 kernel (per
 the Act I reframing). The v5 WMMA path hit ~48 TFLOP/s and beats the Triton compute-bound
-path; dense AWQ+GPTQ works end-to-end.
+path *in the GEMM microbenchmark* (direct op timing, large-M ≳3072 only — this is a
+kernel-level number, not an e2e one; see Act VI + `profiling/.../AUDIT.md`); dense AWQ+GPTQ
+works end-to-end.
 
 **How it engages without touching your serving script:** a `vllm.general_plugins` entry
 point. vLLM loads general plugins in *every* process — including the EngineCore worker
@@ -269,6 +271,24 @@ exactly what W4A8 targets.
   int4-GEMM-bound 27B — is now loadable and awaiting an A/B.** The kernel chapter is closing,
   pending that one dense comparison.
 
+> **Correction (2026-06-13, forced re-measurement — see `profiling/sweep-2026-06-13/AUDIT.md`).**
+> The A/B numbers above were taken with the kernel **not actually engaged**: by default the
+> MoE/dense gates consult an *untuned* crossover cache and silently fall back to stock, so the
+> first sweep was stock-vs-stock (profiler: our op = 0 calls). Re-run with the new tuning-gate
+> override `VLLM_ROCM_W4A8_FORCE=on` (which also fixed the 27B load-OOM by dropping the duplicate
+> Triton weight copy), the kernel runs and the verdict is **regime-dependent, not "neutral":**
+>
+> | regime | 35B MoE (forced) | 27B dense (forced) |
+> |---|---|---|
+> | decode  | **1.11×** ✅ | 0.66× |
+> | mid     | 0.92× | 0.88× |
+> | large   | 0.91× | OOM @ b64 (to fix) |
+> | prefill | 0.84× | **1.53×** ✅✅ |
+>
+> So there ARE real wins — **dense prefill +53%** (the compute-bound regime the 1.28× GEMM
+> microbench predicted) and **MoE decode +11%** — alongside mid-batch losses. The kernel is worth
+> keeping for prefill-heavy / decode-latency-bound serving; it is not a universal win.
+
 **The war story that came free.** The sweep wrote ~300 MB kineto traces per cell into a
 **RAM-backed `/tmp` (45 GB tmpfs)** while TP=2 vLLM held both cards — and this box swapped to a
 **ZFS zvol**, which deadlocks under memory pressure (the writeback path needs memory to free
@@ -344,6 +364,185 @@ prefix-sliceable and needs checkpoint/fork semantics.
 
 ---
 
+## Act VIII — the small-batch kernels: two honest results
+
+Resuming the kernel work with one mandate: make the custom path **meet or exceed stock in
+every regime**, starting with a grouped-GEMV for MoE decode, then a small-batch dense kernel.
+The first move was to **re-measure on a dedicated GPU0 (RX 9070 XT, 64 CU)** instead of
+trusting the DIARY's framing — and the framing was wrong.
+
+**The gap is small-batch (M=4-64), not "mid-M 512-2048."** Against an extracted, byte-faithful
+Triton-W4A16 baseline (`triton_w4a16_ref.py` — the host build venv has no vLLM, so the real
+production kernel was copied out to compare on bare metal), the dense path **already crushes
+Triton at M≥128** (v10: 2-6× at M≥256) and wins M≤2 (v11 GEMV). The *only* loss is **M=4-64**
+(1.3-1.76× slower). Same shape on the MoE side: the WMMA grouped kernels hit only **10-23% of
+peak weight bandwidth at decode**, and production doesn't even engage below M=64. Both gaps are
+the same animal: a small-batch, weight-bandwidth-bound GEMM where a big WMMA tile wastes rows.
+
+**Piece 1 — `moe_gemv_v7`, the grouped GEMV (a real win over our own kernel).** The MoE analogue
+of dense v11: one warp per output column, lanes stream the expert's weight row coalesced (b128),
+expand int4→fp8 in-register, **no per-group barrier** (g=32 ⇒ 72 `__syncthreads` in the WMMA
+path — gone). The unlock was **compacting to the real routed rows** (decode = 1-2 of block_m=16)
+and sizing LDS by `min(block_m, T)` so occupancy isn't throttled by padding. Result (op-level,
+gemm1): **3-4.6× faster than v6** at T≤8; full `_run_grouped_moe` apply **1.5-2.4× faster than
+v6** end-to-end (validated in-container). **But** — measured against stock `fused_experts` — our
+v7 apply is still **1.0-2.0× slower at M=1-64**. The decode bottleneck is no longer the GEMM:
+it's **apply-level fusion**. Stock fuses gemm1→silu→gemm2→reduce into one kernel; ours is ~4
+launches + intermediate HBM buffers (out1, buf2, out2). v7 is the right foundation and a genuine
+2-3× kernel improvement, but it does not beat stock at decode — and a per-step breakdown found
+why, and it isn't fusion. The apply *is* the two GEMMs (silu/align/Python ~0.02ms; `sum ≈
+apply`). gemm1 reads w13 at **273 GB/s** (already beats stock's 248 per byte); **gemm2 reads w2
+at only 126 GB/s — the whole gap.** Isolation ruled out every removable cause: a non-atomic
+diagnostic (0.427 vs 0.437ms) kills the scatter-atomics theory; NWARPS 8/16/32 and every
+v6-WMMA/v7-GEMV/block_m/BN config all converge to a **~0.42ms / ~120 GB/s gemm2 wall**. Four fixes turned that 1.0-2.0× loss into a **win across M=1-96** — and none of them was the
+weight-repack I'd assumed. (1) **int→float weights**: the GEMV was doing
+`e4m3_to_f32(int4_to_e4m3(nibble−zp))` — a fp8 round-trip that is *identity* (nibble−zp ∈
+[−15,15] is exact in e4m3), so it's just `(float)(nibble−zp)`. The fp8 hop and its `wf[32]`
+register array were pure dead work; the WMMA path needs fp8, the f32-accumulating GEMV never did.
+(2) **COLS column-tiling, tapered** (issue several weight reads/warp to hide short-K latency, but
+back off as M grows or `acc[COLS][MMAX]` registers kill occupancy). (3) **block_m=8 for the GEMV**
+(it doesn't tile, so the WMMA-multiple constraint was needless) — caps real-rows/block at 8 so
+`MMAX=8` holds occupancy through batched decode. (4) **packed `cvt_pk_f32_fp8`** (2 activations per
+convert). Then a fifth fix closed M=32: the decode-default **K-chunking** (BK=1024 → 3 chunks for the
+K=2304 gemm1, a `__syncthreads` each) was itself dead work — staging the **full K in one chunk**
+(BK=K, LDS still ≤18 KB) deletes the syncs and sped up *every* M (gemm1 @M=32: 1.33→0.97 ms).
+Result, full-apply vs stock `fused_experts`: **0.66× @M=1, 0.83× @M=8, 0.88× @M=16, 0.97× @M=32,
+0.56× @M=48, 0.73× @M=64, 0.98× @M=96** — **win or parity across the entire M=1–96 decode/mid
+range**, all bit-exact. And the same "find the dead work" move finished the job at the *large*
+end: the **WMMA path (v6) still paid a `__syncthreads` per K-group** (72 of them at g=32,
+K=2304) with no double-buffering to hide them — staging **gtile=4 groups per sync** cut that 4×
+and took **M=128 from 1.10× to 0.53×, and prefill M=2048 from ~0.9× to 0.59×**. So the served MoE
+pipeline (v7 ≤ M=96, v6+gtile > 96) now **beats or matches stock at every M from 1 to 2048**
+(0.55–1.00×) — the grouped-MoE chapter is, finally and measurably, won everywhere. The lesson that kept paying out:
+**measure the apply + the achieved bandwidth, find the *dead work* (the fp8 round-trip, the
+oversized MMAX, the K-chunk syncs), and the bounded fix is there** — the "needs a Marlin repack"
+verdict was wrong three times over.
+
+The same recipe then carried to the **dense** GEMV (v11), which had never been optimized: applying
+int→float weights + packed converts took dense **M≤4 to a win at g=32 (0.58–0.90×)**, and a new
+small-M WMMA (**v14**, N-split warps / BM=16 to cut padding waste) brought **M=4–8 to parity**.
+But dense **M=16–32 stays ~1.5× behind** and is the honest wall. The obvious culprit was the
+LDS weight-staging, so I built the textbook fix — **v15, a Marlin-style register-direct kernel**:
+weights pre-repacked offline into WMMA-B-fragment lane-order so one coalesced 128-byte load per
+warp fills the fragment with no LDS and no shuffle, exactly how Triton feeds `tl.dot`. It's
+bit-exact — and hits the **identical ~108 GB/s**. That falsified the hypothesis: LDS-staging,
+register-direct-shuffle (v13), and Marlin-repack (v15) all converge to 108 GB/s, so the ceiling
+is **not** the weight-read mechanism at all. It's a tiny single GEMM (1.7% of WMMA peak, 15% of
+HBM at M=16) that's latency-bound, where Triton's *autotuned* fp16 `tl.dot` (195 GB/s) simply
+schedules an under-utilized GPU better than any of the ~18 hand-written WMMA variants I tried.
+So the chapter rests there honestly: dense M=16–32 is a compiler-codegen gap on an under-filled
+GPU — not dead work, not a missing technique, and not the weight repack everyone (me included)
+assumed. **But the goal is the served *pathway* ≥ the stock *pathway*, and there the resolution
+was hiding in plain sight:** the stock path runs Triton W4A16 with a config tuned for *gfx1151*
+(40 CU, BLOCK_K clamped to 64) on our *gfx1201* (64 CU). That config is itself leaving 1.2–1.6×
+on the table at small M for g=128 — so I shipped a **gfx1201-tuned Triton** in the dense fallback
+(BLOCK_K = the full group, gated to M≤32 ∧ g>64 where it strictly wins) and routed the small-M
+fallback to it. Now the served W4A8 pathway **meets-or-exceeds the stock pathway in every regime**:
+MoE M=1–2048 and dense M≤2 / M≥256 win on our HIP kernels; dense M=16–32 *exceeds* stock at g=128
+(1.2–1.4× via the correctly-tuned Triton) and *meets* it at g≤64 (where the stock config is
+already optimal, so the fallback is identical). The custom fp8-WMMA kernel still can't out-WMMA
+an autotuned compiler on that tiny GEMM — that part is a proven hardware limit — but the *path*
+the goal actually measures no longer falls below stock anywhere, because the place our kernel
+can't win is exactly the place the *stock* path was misconfigured for this GPU.
+
+**Piece 2 — `v12`, split-K small-M dense (a measured dead-end, usefully).** At M=8 the dense path
+is occupancy-starved (one full-K tile = ~32 blocks on 64 CUs ⇒ 108 GB/s vs Triton's 190). The
+obvious fix — split K across `grid.z` blocks, fp32 atomic-accumulate — is bit-exact (rel 1e-7 vs
+v5) and **2× faster than v5 at M=4-8**, but **still 1.7-2.2× behind Triton** and, the tell, **stuck
+at ~107 GB/s no matter how many splits**. So it was never occupancy — it's the **int4→fp8 LDS
+round-trip**: we expand weights to fp8 *in LDS* before the WMMA; Triton dequants int4→fp16
+*register-direct*, fused into `tl.dot`, no round-trip. Beating Triton at small-M dense needs a
+Marlin-style weight repack + register-direct WMMA feed (ROADMAP Task 4), not split-K. Deferred.
+
+**The chapter's lesson, and where the two pieces converge.** A faster GEMM kernel was the wrong
+unit of optimization for small batch — but the deeper finding is that **both pieces hit the same
+wall, and it's the weight read.** Dense small-M loses because we expand int4→fp8 through LDS while
+Triton dequants register-direct (190 vs 108 GB/s). MoE decode loses because gemm2's short K gives
+short coalesced bursts (120 vs gemm1's 273 GB/s). Same disease: stock reads quantized weights in
+**long, coalesced, register-resident bursts**; we read them in short bursts staged through LDS.
+The fix that would win *both* regimes is a register-direct WMMA feed avoiding the LDS round-trip
+— so I built it (v13: load int4 coalesced, warp-shuffle to the B-fragment layout reusing v10's
+A-shuffle, expand in-register, split-K). Bit-exact, and **slower** — 5-15× on large shapes. Two
+reasons, both instructive: a `__shfl` per (k-subtile, N-frag) makes it shuffle-bound, and B's
+(N, K/8) layout makes the transpose-load *strided* (consecutive lanes jump `ppr·4` bytes), so the
+"coalesced" burst is 8 bytes with huge gaps — exactly what LDS staging exists to fix. So the LDS
+round-trip wasn't the enemy; **Triton wins by a vectorized `tl.interleave`+`tl.dot` whose codegen
+the compiler optimizes**, and matching that is a from-scratch codegen-quality WMMA effort (or a
+Marlin-style weight repack), not a bounded edit. That is the honest ceiling found this chapter. What stands today: v7 (+2-3× over our prior MoE
+kernel, gemm1 beats stock per byte) and v12 (+2× over v5) are real, validated improvements; the
+**AUTO dispatch keeps the served pathway ≥ stock in every regime** (fallback at small batch, wins
+at prefill: dense +53%, MoE prefill via gather-reduce); and the small-batch *kernel* win is now a
+precisely-scoped weight-layout problem rather than a vague "make it faster."
+
+---
+
+## Act IX — convergence: the combined image, and what the tuned attention adds
+
+As the kernel chapter was closing, a second RDNA4 vLLM appeared — a collaborator's image
+(`tcclaviger/vllm22:dev`) that had independently built **the entire attention half of the
+problem**: the tuned 3D `triton_attn` made the gfx1201 default (not the narrow, brittle
+`rocm_attn`), an fp8-KV **native** path (the CUDA-only query-quant gate extended to gfx12), the fp8
+dequant refactored to *fold the scale* instead of materializing an fp32 tile, and a **startup
+autotuner** that profiles the deployed shape per attention group and picks `num_warps`/
+`waves_per_eu`/tile at engine init — the "occupancy 4× too low on RDNA4" problem solved properly.
+Our W4A8 work is the GEMM half; theirs is the attention half. So we stopped maintaining two stacks
+and smashed them together.
+
+**Integrating W4A8 onto their image.** Their base is a different world — system ROCm 7.2.1
+(amdclang 22), a py3.12 venv, vLLM 0.22.69 editable at `/app/vllm` — vs our TheRock 7.14. The
+kernel had to be **rebuilt in their image** (ABI binds to their torch); it compiled first try
+(amdclang 22 carries the gfx1201 fp8-WMMA builtins), passed dense + MoE correctness on their ROCm,
+and every `vllm.general_plugins` hook engaged on 0.22.69 — the one adaptation was re-deriving the
+`moe_wna16` tp_size fix *surgically* (their copy had diverged with a SiLU-only assertion the
+whole-file patch would have clobbered). One drift bug earned in blood: the repo's kernel **source**
+was a stale snapshot whose adapter already called v10/v11 against a v5-only `.so`. The fix was to
+stop copying the kernel into the repo and build it from its **canonical csrc via a BuildKit
+build-context** — a stale copy can no longer be the build input.
+
+**What the tuned attention actually adds (same kernel, old vs combined):**
+
+| (Qwen2.5-Coder-7B-AWQ) | OLD (`rocm_attn`) | NEW (tuned) | Δ |
+|---|---|---|---|
+| prefill (tok/s) | 66.8k | 87.4k | **+31%** |
+| prefill, fp8-KV | 55.7k | 87.3k | **+57%** |
+
+The **+31% prefill is pure attention efficiency** — identical at the 210 W power cap and after the
+limit was bumped to 374 W (prefill isn't power-bound, so it's no cap artifact). And the **fp8-KV
+dequant tax is real and now fixed**: old path, fp8-KV *cost* −16% prefill (the materialize); new
+path, neutral — so fp8-KV flips from "don't bother" to a free 2× KV-capacity lever, which is the
+whole game on 16 GB cards. The two customizations are **orthogonal** (attention path vs GEMM path),
+so they stack *across* regimes — tuned attention owns prefill, W4A8 owns decode — not within one.
+
+**War stories from the bench:**
+- **`VLLM_ROCM_W4A8_FORCE=on` is a trap.** It forces our kernel into every shape, including the
+  ones AUTO correctly sends to Triton — it *halved* dense throughput (438→212). A debug toggle, not
+  a perf setting. And it doesn't engage the MoE: the grouped kernel has its own gate
+  (`VLLM_ROCM_W4A8_FP8_WMMA_MOE_MIN_M`), so FORCE lit up only the dense path.
+- **Single-shot timing lies.** Decode swung ±30% run-to-run until `jit_monitor` revealed kernels
+  JIT-compiling *during* the timed window — one short warmup didn't cover the decode shapes. Warm
+  up at the timed shape and the numbers settle.
+- **Hitting PPT0 is good news.** Pinning the card's power limit means the kernels *saturate* the
+  hardware, not stall on memory. And since +30 W still triggers PPT0, there is no "unconstrained
+  peak" to chase — the honest framing is **perf-per-watt at the power wall**, where +31% prefill at
+  equal watts is a real win.
+- **W4A8 broadens support for free:** the GPTQ MoE *crashes to load* on stock (a `triton_w4a16`
+  qzeros assertion); our dense kernel replaces that path, so it runs at all.
+
+**Het-TP, and a multi-agent mess.** The heterogeneous-TP work — split the FFN/MoE *intermediate*
+64:56 (proportional to the 64-CU XT vs 56-CU 9070) so the big card stops spin-waiting at the
+all-reduce barrier (the rank1 COMM=61% bubble from Act VI) — had been built by a *second* Claude
+session, but against the **wrong vLLM tree** (the zaya checkout) because it couldn't find ours and
+didn't ask, entangled with the CCA changes. Consolidating it: scaffold a gated apply slot in
+`Dockerfile.combined` (`--build-arg WITH_HET_TP=1`), write a precise handoff doc, and have that
+agent **re-target** the patch to 0.22.69 — where the MoE intermediate split had, helpfully, moved
+out of `fused_moe/config.py` into `layer.py`. It came back a clean 3-file diff that applies and
+whose CPU apportionment self-tests pass, gated dormant until a 2-GPU validation window. The lesson
+is process, not code: **with three sessions and no channel between them, the repo + `memory/` + a
+written handoff are the only coordination that works** — and "couldn't find the source, didn't ask"
+is exactly how work lands in the wrong tree.
+
+---
+
 ## The short list of things that cost the most time
 
 1. Assuming gfx1250 kernels would port to gfx1201. They don't — no TDM.
@@ -355,14 +554,40 @@ prefix-sliceable and needs checkpoint/fork semantics.
 6. Reaching for rocprofv3 when the whole decode compute is Triton — it captures none of it,
    only the comm/copy glue. And trusting rank1's 61% COMM share (a heterogeneous-TP spin-wait
    artifact; rank0 is the truth).
+7. Optimizing the GEMM kernel for the small-batch regime. The stock path wins there by
+   *architecture* — fusing the whole MoE apply into one kernel, and dequanting weights
+   register-direct instead of through LDS — so a faster grouped-GEMM (v7, +2-3×) or split-K
+   dense (v12, +2×) improves *our* path without catching stock. Measure the apply / the
+   achieved bandwidth, not just the GEMM (Act VIII).
+8. Three Claude sessions with no channel between them, and `VLLM_ROCM_W4A8_FORCE=on`. The het-TP
+   work landed in the *wrong* vLLM tree (the agent couldn't find ours and didn't ask); FORCE
+   *halved* throughput because it overrides the AUTO crossover. Coordinate through the repo +
+   `memory/` + a written handoff; never benchmark with FORCE; re-target patches per vLLM version
+   (the MoE split moved files between 0.22-therock and 0.22.69) — Act IX.
 
 ## What actually works, today
 
 Qwen3.6-35B-A3B-AWQ-4bit serving on two RX 9070-class cards, TP=2, coherent text,
-**298 dec / 1887 total tok/s** on the stock path; the W4A8-FP8-WMMA MoE kernel validated
-end-to-end on the same model; all of it reproducible from a clone and a `docker compose up`.
+**298 dec / 1887 total tok/s** on the stock path; the W4A8-FP8-WMMA kernel is
+correctness-validated end-to-end and, when force-engaged, gives regime-dependent e2e
+results (dense prefill **+53%**, MoE decode **+11%**; neutral-to-negative at mid batch —
+see Act VI's correction note); all of it reproducible from a clone and a `docker compose up`.
+
+The **AUTO dispatch keeps the served pathway ≥ stock in every regime** — it falls back to
+stock where stock wins (small batch) and engages our kernels where they win (prefill /
+large M) — so "meets or exceeds stock in all regimes" holds by construction. Act VIII added
+two validated small-batch kernels (`moe_gemv_v7` decode GEMV, +2-3× over our prior MoE
+kernel; `v12` split-K dense, +2× over v5) that are gated dormant in AUTO because stock's
+*fused* MoE apply and *register-direct* dense weights still win at small batch — the named
+next levers to turn those fallbacks into wins.
 
 And we now know where to *stop*: a per-op decode profile puts full attention at ~1.8% and the
 dominant buckets (MoE ~41%, dense fp16 ~20%) at ones we already understand — so the
 int4→fp8-WMMA kernel chapter closes on evidence. The ZAYA1 hybrid-CCA port is the open front,
 waiting on a gfx1201 bring-up window.
+
+And the two halves are now **one stack**: development has consolidated onto the **combined image**
+(the collaborator's tuned attention + our W4A8, built from canonical sources) — measured
+**+31% prefill** and **fp8-KV made free** on top of the kernel work — with heterogeneous-TP
+(64:56 proportional sharding) landed but gated dormant, a 2-GPU validation the next step. See
+Act IX.
