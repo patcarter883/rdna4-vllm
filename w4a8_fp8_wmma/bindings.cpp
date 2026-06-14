@@ -49,6 +49,19 @@ void launch_mmq_fp8_moe_gemm_gfx1201(
     int64_t block_m,
     int64_t version);
 
+void launch_mmq_fp8_moe_gemm1_silu_gfx1201(
+    const at::Tensor& x,
+    const at::Tensor& w_packed,
+    const at::Tensor& scales,
+    const at::Tensor& w_zeros,
+    const at::Tensor& sorted_token_ids,
+    const at::Tensor& expert_ids,
+    const at::Tensor& num_tokens_post_padded,
+    at::Tensor& out,
+    int64_t top_k,
+    int64_t block_m,
+    int64_t version);
+
 void launch_mmq_fp8_moe_gemm_scatter_gfx1201(
     const at::Tensor& x,
     const at::Tensor& w_packed,
@@ -203,6 +216,63 @@ at::Tensor mmq_fp8_moe_gemm_forward(
     return out;
 }
 
+// Fused gemm1 + silu_and_mul. Runs the gated gemm1 (w13, N=2*inter = [gate|up])
+// and the silu_and_mul activation in ONE kernel, returning the post-activation
+// (P, inter) directly -- no separate (P,2*inter) out1 / (P,inter) buf2 HBM
+// round-trip and no separate silu launch. Bit-exact to mmq_fp8_moe_gemm(w13) +
+// torch.ops._C.silu_and_mul. v5/v6 only.
+at::Tensor mmq_fp8_moe_gemm1_silu_forward(
+    const at::Tensor& x,
+    const at::Tensor& w_packed,
+    const at::Tensor& scales,
+    const at::Tensor& w_zeros,
+    const at::Tensor& sorted_token_ids,
+    const at::Tensor& expert_ids,
+    const at::Tensor& num_tokens_post_padded,
+    int64_t top_k,
+    int64_t block_m,
+    int64_t version) {
+
+    TORCH_CHECK(x.is_cuda() && w_packed.is_cuda() && scales.is_cuda(),
+                "x, w_packed, scales must be CUDA");
+    TORCH_CHECK(x.scalar_type() == at::kHalf, "x must be fp16");
+    TORCH_CHECK(w_packed.scalar_type() == at::kInt, "w_packed must be int32");
+    TORCH_CHECK(scales.scalar_type() == at::kHalf, "scales must be fp16");
+    TORCH_CHECK(x.dim() == 2, "x must be (T, K)");
+    TORCH_CHECK(w_packed.dim() == 3 && scales.dim() == 3,
+                "w_packed (E,2*inter,K/8) and scales (E,2*inter,K/group) must be 3D");
+    TORCH_CHECK(sorted_token_ids.scalar_type() == at::kInt &&
+                expert_ids.scalar_type() == at::kInt &&
+                num_tokens_post_padded.scalar_type() == at::kInt,
+                "routing tensors must be int32");
+    TORCH_CHECK(x.is_contiguous() && w_packed.is_contiguous() &&
+                scales.is_contiguous(), "x, w_packed, scales must be contiguous");
+    TORCH_CHECK(version == 5 || version == 6, "fused gemm1+silu needs version 5/6");
+
+    const int64_t K = x.size(1);
+    const int64_t N = w_packed.size(1);          // 2*inter
+    const int64_t P = sorted_token_ids.size(0);
+    TORCH_CHECK(N % 2 == 0, "w13 N must be 2*inter (even); got ", N);
+    const int64_t inter = N / 2;
+    TORCH_CHECK(w_packed.size(2) * kPackFactor == K,
+                "w_packed last dim must be K/8=", K / kPackFactor);
+    TORCH_CHECK(P % block_m == 0, "P=", P, " not divisible by block_m=", block_m);
+    TORCH_CHECK(expert_ids.size(0) == P / block_m,
+                "expert_ids must have P/block_m=", P / block_m, " entries");
+
+    if (w_zeros.defined() && w_zeros.numel() > 0) {
+        TORCH_CHECK(w_zeros.scalar_type() == at::kInt && w_zeros.dim() == 3 &&
+                    w_zeros.size(1) * 8 == N && w_zeros.size(2) == scales.size(2),
+                    "w_zeros must be (E, (2*inter)/8, K/group) int32");
+    }
+
+    auto out = at::empty({P, inter}, x.options());
+    launch_mmq_fp8_moe_gemm1_silu_gfx1201(
+        x, w_packed, scales, w_zeros, sorted_token_ids, expert_ids,
+        num_tokens_post_padded, out, top_k, block_m, version);
+    return out;
+}
+
 // Fused gemm2 + topk-weight + indirect atomic scatter. `x` is the (P, inter)
 // post-activation buffer; the result is accumulated IN PLACE into the caller's
 // pre-zeroed (M, N) fp32 `output` (one row per real token). No (P,N) materialise,
@@ -305,6 +375,9 @@ TORCH_LIBRARY(w4a8_fp8_wmma, m) {
     m.def("mmq_fp8_moe_gemm(Tensor x, Tensor w_packed, Tensor scales, Tensor w_zeros, "
           "Tensor sorted_token_ids, Tensor expert_ids, Tensor num_tokens_post_padded, "
           "int top_k, int block_m, int version) -> Tensor");
+    m.def("mmq_fp8_moe_gemm1_silu(Tensor x, Tensor w_packed, Tensor scales, Tensor w_zeros, "
+          "Tensor sorted_token_ids, Tensor expert_ids, Tensor num_tokens_post_padded, "
+          "int top_k, int block_m, int version) -> Tensor");
     m.def("mmq_fp8_moe_gemm_scatter(Tensor x, Tensor w_packed, Tensor scales, "
           "Tensor w_zeros, Tensor sorted_token_ids, Tensor expert_ids, "
           "Tensor num_tokens_post_padded, Tensor topk_weights, Tensor(a!) output, "
@@ -319,6 +392,7 @@ TORCH_LIBRARY_IMPL(w4a8_fp8_wmma, CUDA, m) {
     m.impl("mmq_fp8_gemm_v16", &mmq_fp8_gemm_v16_forward);
     m.impl("mmq_w4a16_gemm_v17", &mmq_w4a16_gemm_v17_forward);
     m.impl("mmq_fp8_moe_gemm", &mmq_fp8_moe_gemm_forward);
+    m.impl("mmq_fp8_moe_gemm1_silu", &mmq_fp8_moe_gemm1_silu_forward);
     m.impl("mmq_fp8_moe_gemm_scatter", &mmq_fp8_moe_gemm_scatter_forward);
     m.impl("mmq_fp8_moe_gather_reduce", &mmq_fp8_moe_gather_reduce_forward);
 }

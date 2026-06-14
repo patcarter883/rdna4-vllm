@@ -4,6 +4,28 @@ Research kernel: expand packed int4 weights to **fp8 e4m3 in-register** and feed
 RDNA4's **FP8 WMMA** units, vs the current int4→f16→f16-WMMA path. See the
 approved plan at `~/.claude/plans/while-this-project-is-greedy-stroustrup.md`.
 
+## MoE gemm1 + silu fusion (ROADMAP Task 3, the prefill/mid intermediate-traffic win)
+`mmq_fp8_moe_gemm1_silu` (moe_kernel.hip: `moe_gemm1_silu_v5/v6_kernel` + launcher;
+bindings; `__init__.py`) fuses **silu_and_mul into gemm1's epilogue**. The gated MoE's
+gemm1 produces (P, 2*inter)=[gate|up]; the stock apply then runs a SEPARATE silu launch
+-> (P, inter) buf2 -> gemm2 (staging out1 P×2inter AND buf2 P×inter through HBM). The
+fused kernel has ONE block compute BOTH the gate N-tile [block_n, block_n+BN) and the
+matching up N-tile [inter+block_n, ...) for the same expert (two B-slabs/group, two
+accumulator sets), then writes silu(gate)*up directly to (P, inter) — dropping buf2,
+the silu launch, and halving gemm1's output write. Wired into `_run_grouped_moe`:
+engages for **gated SILU on v5/v6, NON-gemv** (env `VLLM_ROCM_W4A8_FP8_WMMA_MOE_FUSE_SILU`,
+default on). DECODE (use_gemv / v7) keeps the unfused path — per DIARY Act VIII the decode
+wall is gemm2's weight-read BW, not these buffers, so the fusion targets prefill/mid.
+**BIT-EXACT** to unfused gemm1 + `torch.ops._C.silu_and_mul`: each half is rounded to
+fp16 exactly as the gemm1 store (`__float2half(acc*asc)`), silu is fp32 then fp16
+(`silu_kernel<half>`), and the final product is a HALF*HALF multiply (act_first compute) —
+see `moe_silu_and_mul_h`. Verify: `test_moe_experts.py::test_fused_gemm1_silu` asserts
+`max|diff|==0.0` vs unfused; the composition tests also run through the fused path.
+**SEAM** (wire-v6 / autotune-gate also edit moe_experts.py): the fused gemm1 uses `gver`
+(== the dispatched WMMA version when not gemv), so it follows wire-v6's version default;
+it errors out for non-5/6 WMMA versions (binding TORCH_CHECK). The gemm2/gather-reduce
+epilogue is untouched (HIP-graph-safe).
+
 ## Status
 
 - **v0 scalar fp8 reference — DONE + VALIDATED on gfx1201 (RX 9070 XT).**
