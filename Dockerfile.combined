@@ -1,0 +1,97 @@
+# syntax=docker/dockerfile:1
+#
+# Combined image: the collaborator's tuned-attention vLLM (tcclaviger/vllm22:dev)
+# + our W4A8-FP8-WMMA kernel layered on top.
+#
+#   their base  -> RDNA4 attention done: triton_attn default on gfx1201, fp8-KV native
+#                  gate, fp8 dequant scale-fold, startup autotuner. Python 3.12 venv at
+#                  /app/.venv, torch 2.10.0, system ROCm 7.2.1 (amdclang 22) at
+#                  /opt/rocm-7.2.1, vLLM 0.22.69 (editable at /app/vllm).
+#   our layer   -> the W4A8 dense (v5/v10/v11) + grouped-MoE (v6) FP8-WMMA kernel,
+#                  built in-image so its ABI matches the base's torch (cp312).
+#
+# SOURCE OF TRUTH: the kernel is NOT copied into this repo (a stale copy here is exactly
+# what bit us — adapter calling v10/v11 against a v5-only .so). It is pulled at build time
+# from the canonical csrc via a named BuildKit build-context `w4a8_src`, so the build always
+# tracks the live kernel. Build:
+#
+#   docker build -f Dockerfile.combined -t vllm22-w4a8:combined \
+#     --build-context w4a8_src=/home/pat/code/vllm-rocm714-gfx1250/vllm/csrc/quantization/w4a8_fp8_wmma .
+#
+# (docker-compose.combined.yml wires this via `additional_contexts`.) No GPU needed — the HIP
+# kernel cross-compiles for gfx1201.
+#
+# Run: the W4A8 kernel auto-engages via the vllm.general_plugins entry point in every
+# EngineCore worker; disable at runtime (no rebuild) with VLLM_ROCM_USE_W4A8_FP8_WMMA=0.
+# Mount a persistent Triton cache — both Qwen3.6 variants are GDN hybrids and pay the FLA-GDN
+# cold compile + the base's attention startup autotune; cache makes it one-time.
+
+ARG BASE_IMAGE=tcclaviger/vllm22:dev
+FROM ${BASE_IMAGE}
+
+ARG GPU_ARCHS=gfx1201
+ENV ROCM_HOME=/opt/rocm-7.2.1 \
+    GPU_ARCHS=${GPU_ARCHS} \
+    MAX_JOBS=8
+
+# --- 1. Build + install the W4A8 kernel from the CANONICAL source (build-context) ---
+# `w4a8_src` is a named build-context (not a repo path) -> single source of truth, no drift.
+# Clean any host build/ + *.so first (the canonical tree carries a gfx1250/ROCm-7.14 _C.so that
+# must NOT be reused — we rebuild for gfx1201 / ROCm-7.2.1). ld.lld lives under the system ROCm
+# llvm bin; GPU_ARCHS keeps the offload list off the display iGPU. The source tree is removed
+# after install so the import check resolves the INSTALLED package (sys.path source-shadow trap).
+COPY --from=w4a8_src . /opt/w4a8_fp8_wmma
+RUN set -eu; \
+    . /app/.venv/bin/activate; \
+    export PATH="/opt/rocm-7.2.1/lib/llvm/bin:/opt/rocm-7.2.1/bin:${PATH}"; \
+    cd /opt/w4a8_fp8_wmma; \
+    rm -rf build *.egg-info; find . -name '*.so' -delete; \
+    pip install . --no-build-isolation --no-deps; \
+    cd /; rm -rf /opt/w4a8_fp8_wmma; \
+    python -c "import w4a8_fp8_wmma, w4a8_fp8_wmma._C; print('[combined] W4A8 import OK ::', w4a8_fp8_wmma.__file__)"
+
+# --- 2. Surgical moe_wna16 tp_size fix (RoutedExperts hazard, DIARY Blocker 2) ---
+# Their moe_wna16 reads `layer.tp_size` directly AND has diverged from our whole-file patch
+# (it added a MoEActivation.SILU assertion), so apply ONLY the tp_size fallback via sed on the
+# two unambiguous occurrences — idempotent (the replacement holds `layer.moe_config.tp_size`,
+# not the literal `layer.tp_size`) and preserves their other changes. Locate via `find` (NOT
+# `import vllm...`, which prints Triton/INFO logs to stdout and would corrupt the captured path).
+RUN set -eu; \
+    MW="$(find /app/vllm /opt /usr -path '*vllm/model_executor/layers/quantization/moe_wna16.py' -type f 2>/dev/null | grep -v '\.orig$' | head -1)"; \
+    test -n "$MW" || { echo "moe_wna16.py not found"; exit 1; }; \
+    cp "$MW" "${MW}.orig"; \
+    sed -i 's/layer\.tp_size/(getattr(layer, "tp_size", None) or layer.moe_config.tp_size)/g' "$MW"; \
+    python3 -c "import ast; ast.parse(open('${MW}').read())"; \
+    grep -q 'getattr(layer, "tp_size"' "$MW"; \
+    echo "[combined] moe_wna16 tp_size fallback applied -> $MW"
+
+# --- 2b. (optional) Heterogeneous-TP proportional sharding — 64:56 for a 9070 XT + 9070 ---
+# Splits the FFN/MoE intermediate proportional to CU counts so the big card stops spin-waiting
+# at the all-reduce barrier (the rank1 COMM=61% sync bubble). Gated OFF by default; lights up
+# once the het-TP agent drops the re-targeted (vLLM 0.22.69!) source diff into
+# patches/het_tp_vllm.patch. See patches/HET_TP_HANDOFF.md. Build: --build-arg WITH_HET_TP=1;
+# runtime needs VLLM_TP_CU_WEIGHTS="64,56" (docker-compose.combined.yml).
+ARG WITH_HET_TP=0
+COPY patches/het_tp.py patches/het_tp_vllm.patch /tmp/hettp/
+RUN set -eu; \
+    if [ "$WITH_HET_TP" = "1" ]; then \
+      grep -q '^@@' /tmp/hettp/het_tp_vllm.patch || { \
+        echo "ERROR: patches/het_tp_vllm.patch is still a placeholder — the het-TP agent must drop"; \
+        echo "       the re-targeted vLLM 0.22.69 unified diff here. See patches/HET_TP_HANDOFF.md."; \
+        exit 1; }; \
+      install -D /tmp/hettp/het_tp.py /app/vllm/vllm/distributed/het_tp.py; \
+      cd /app/vllm && patch -p1 < /tmp/hettp/het_tp_vllm.patch; \
+      python3 -c "import ast; ast.parse(open('/app/vllm/vllm/model_executor/layers/linear.py').read())"; \
+      echo "[combined] het-TP applied (set VLLM_TP_CU_WEIGHTS at runtime)"; \
+    else echo "[combined] het-TP slot present but disabled (build --build-arg WITH_HET_TP=1 to enable)"; fi; \
+    rm -rf /tmp/hettp
+
+# --- 3. W4A8 defaults (all overridable at runtime via -e / compose; no rebuild to toggle) ---
+# MOE_VERSION=6 is the grouped kernel that actually executes on the MoE path.
+# Do NOT bake VLLM_ROCM_W4A8_FORCE — W4A8 is a *decode-regime* win and loses at mid/large/prefill,
+# so leave the adaptive crossover dispatch in charge; force per-run if needed.
+ENV VLLM_ROCM_USE_W4A8_FP8_WMMA=1 \
+    VLLM_ROCM_W4A8_FP8_WMMA_MOE=1 \
+    VLLM_ROCM_W4A8_FP8_WMMA_MOE_VERSION=6
+
+# Entry point inherited from the base (its tuned-attention vLLM launcher: `vllm serve "$@"`).

@@ -1,0 +1,14 @@
+# Keep the build context small. The Dockerfiles only need patches/, w4a8_fp8_wmma/
+# (sources), scripts/, and the compose/env files — never the profiling artifacts or git.
+.git
+.github
+profiling/
+*.log
+.claude/
+# build artifacts (the kernel is (re)built in-image; never ship stale host .so/build dirs)
+**/__pycache__/
+**/*.so
+**/*.o
+**/build/
+**/*.egg-info/
+**/.pytest_cache/

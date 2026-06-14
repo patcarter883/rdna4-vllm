@@ -1,0 +1,325 @@
+# Heterogeneous-TP proportional sharding — vLLM 0.22.69 source patch.
+#
+# Re-targeted from the zaya 0.22-therock tree to the combined image's vLLM 0.22.69
+# (editable at /app/vllm). Apply with `patch -p1` from /app/vllm (the Dockerfile.combined
+# WITH_HET_TP=1 step does this). Pairs with patches/het_tp.py, installed to
+# /app/vllm/vllm/distributed/het_tp.py. Strict no-op unless VLLM_TP_CU_WEIGHTS is set.
+#
+# Splits ONLY the FFN/MoE *intermediate* (reduction) dimension proportional to per-rank
+# CU counts (e.g. 64:56), so the bigger card stops spin-waiting at the all-reduce barrier.
+# Attention heads + vocab/lm_head stay on the stock even path. See patches/HET_TP_PATCH.md.
+#
+# Files (3 — config.py is NOT touched: in 0.22.69 the MoE intermediate split + expert
+# loaders moved out of fused_moe/config.py into fused_moe/layer.py):
+#   vllm/model_executor/layers/linear.py      Column/Merged/Row sizing + v2-param stamp
+#   vllm/model_executor/parameter.py          load_{column,merged_column,row}_weight offset
+#   vllm/model_executor/layers/fused_moe/layer.py
+#                                             MoE intermediate split, _het_moe_shard,
+#                                             _load_w13/_load_w2 offset, combined-w13 guard
+#
+diff --git a/vllm/model_executor/layers/fused_moe/layer.py b/vllm/model_executor/layers/fused_moe/layer.py
+index d276db4..d0376ed 100755
+--- a/vllm/model_executor/layers/fused_moe/layer.py
++++ b/vllm/model_executor/layers/fused_moe/layer.py
+@@ -260,8 +260,23 @@ class FusedMoE(PluggableLayer):
+ 
+         self.top_k = top_k
+ 
+-        assert intermediate_size % self.tp_size == 0
+-        intermediate_size_per_partition = intermediate_size // self.tp_size
++        # --- Heterogeneous TP: proportional MoE intermediate split (gfx1201 64:56).
++        # No-op unless VLLM_TP_CU_WEIGHTS is set. align = HET_ALIGN_FLOOR (128): a
++        # multiple of every common AWQ group (16/32/64/128) and the kernel tiles, so
++        # the per-partition size stays valid AND matches the het offsets the expert
++        # loaders (_het_moe_shard) compute with the SAME floor. The full (logical)
++        # intermediate is stashed for those loaders -- it can't be recovered from the
++        # per-partition size once the split is uneven.
++        self._het_moe_intermediate_size = intermediate_size
++        from vllm.distributed.het_tp import (
++            HET_ALIGN_FLOOR, get_cu_weights, het_active, partition_sizes)
++        if het_active(self.tp_size) and intermediate_size % HET_ALIGN_FLOOR == 0:
++            intermediate_size_per_partition = partition_sizes(
++                intermediate_size, get_cu_weights(self.tp_size),
++                align=HET_ALIGN_FLOOR)[self.moe_parallel_config.tp_rank]
++        else:
++            assert intermediate_size % self.tp_size == 0
++            intermediate_size_per_partition = intermediate_size // self.tp_size
+         self.renormalize = renormalize
+ 
+         # TODO(bnell): these attributes are only used by monolithic kernels.
+@@ -582,6 +597,15 @@ class FusedMoE(PluggableLayer):
+         Load w13 weight scales assuming that w1 weight scales and w3 weight
+         scales are stored in the same loaded_weight tensor.
+         """
++        from vllm.distributed.het_tp import het_active
++        if het_active(self.moe_config.tp_size):
++            # Combined-w13 layout (ModelOpt FP4 MoE) isn't covered by the het
++            # offset math; fail loud rather than silently mis-shard. The served
++            # AWQ/compressed-tensors group path uses _load_w13/_load_w2 instead.
++            raise NotImplementedError(
++                "heterogeneous TP (VLLM_TP_CU_WEIGHTS) does not support the combined "
++                "w13 weight-scale path; use an AWQ/compressed-tensors group-quant "
++                "checkpoint or unset VLLM_TP_CU_WEIGHTS for this model.")
+         shard_size = param.shape[shard_dim]
+         loaded_weight = loaded_weight.narrow(
+             shard_dim, shard_size * tp_rank, shard_size
+@@ -709,6 +733,22 @@ class FusedMoE(PluggableLayer):
+                     expert_data = expert_data.narrow(dim, 0, loaded_weight.shape[dim])
+         return expert_data
+ 
++    def _het_moe_shard(self, axis_total: int, tp_rank: int, tp_size: int):
++        """``(start, per_rank)`` along the intermediate (shard) axis, in the tensor's
++        own units. Proportional 64:56 when ``VLLM_TP_CU_WEIGHTS`` is set, else the
++        stock even split. Uses ``HET_ALIGN_FLOOR`` (128) so the offsets match the
++        per-partition sizing computed in ``__init__``. ``axis_total`` is
++        ``loaded_weight.shape[shard_dim]`` (axis units: packed/grouped/plain); the
++        full *logical* intermediate stashed in ``__init__`` lets ``het_axis_shard``
++        convert logical apportionment to those axis units."""
++        from vllm.distributed.het_tp import (
++            HET_ALIGN_FLOOR, het_active, het_axis_shard)
++        if not het_active(tp_size):
++            per = axis_total // tp_size
++            return per * tp_rank, per
++        return het_axis_shard(self._het_moe_intermediate_size, HET_ALIGN_FLOOR,
++                              axis_total, tp_rank, tp_size)
++
+     def _load_w13(
+         self,
+         expert_data: torch.Tensor,
+@@ -728,15 +768,25 @@ class FusedMoE(PluggableLayer):
+         # and we're not loading the full weight
+         if not load_full and loaded_weight.ndim > 0:
+             # Handle padding: loaded_weight might be smaller than shard_size on last
+-            # TP rank
+-            start_offset = shard_size * tp_rank
++            # TP rank.
++            # Heterogeneous TP: proportional offset/cap along the intermediate axis
++            # (byte-identical even split unless VLLM_TP_CU_WEIGHTS is set). shard_size
++            # (possibly roundup-padded) still locates the w1/w3 sub-slot below; only
++            # the loaded_weight indexing into the global checkpoint becomes het.
++            from vllm.distributed.het_tp import het_active
++            if het_active(self.moe_config.tp_size):
++                start_offset, narrow_cap = self._het_moe_shard(
++                    loaded_weight.shape[shard_dim], tp_rank, self.moe_config.tp_size)
++            else:
++                start_offset = shard_size * tp_rank
++                narrow_cap = shard_size
+             available = loaded_weight.shape[shard_dim] - start_offset
+             if available <= 0:
+                 # If there is no available weight to load for this TP rank
+                 # (can happen on last TP rank with padding), we can skip
+                 # loading and return early
+                 return
+-            narrow_size = min(shard_size, available)
++            narrow_size = min(narrow_cap, available)
+             loaded_weight = loaded_weight.narrow(shard_dim, start_offset, narrow_size)
+         # Narrow parameter and load.
+         # w1, gate_proj: Load into first logical weight of w13.
+@@ -771,15 +821,23 @@ class FusedMoE(PluggableLayer):
+         # and we're not loading the full weight
+         if not load_full and loaded_weight.ndim > 0:
+             # Handle padding: loaded_weight might be smaller than shard_size on last
+-            # TP rank
+-            start_offset = shard_size * tp_rank
++            # TP rank.
++            # Heterogeneous TP: proportional offset/cap along the intermediate axis
++            # (byte-identical even split unless VLLM_TP_CU_WEIGHTS is set).
++            from vllm.distributed.het_tp import het_active
++            if het_active(self.moe_config.tp_size):
++                start_offset, narrow_cap = self._het_moe_shard(
++                    loaded_weight.shape[shard_dim], tp_rank, self.moe_config.tp_size)
++            else:
++                start_offset = shard_size * tp_rank
++                narrow_cap = shard_size
+             available = loaded_weight.shape[shard_dim] - start_offset
+             if available <= 0:
+                 # If there is no available weight to load for this TP rank
+                 # (can happen on last TP rank with padding), we can skip
+                 # loading and return early
+                 return
+-            narrow_size = min(shard_size, available)
++            narrow_size = min(narrow_cap, available)
+             loaded_weight = loaded_weight.narrow(shard_dim, start_offset, narrow_size)
+         # w2, down_proj: Load into only logical weight of w2.
+         hidden_dim = self._get_hidden_dim(shard_dim, expert_data.ndim)
+diff --git a/vllm/model_executor/layers/linear.py b/vllm/model_executor/layers/linear.py
+index e50a0e6..283995f 100755
+--- a/vllm/model_executor/layers/linear.py
++++ b/vllm/model_executor/layers/linear.py
+@@ -448,13 +448,36 @@ class ColumnParallelLinear(LinearBase):
+         self.tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0
+         self.tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
+         self.input_size_per_partition = input_size
+-        self.output_size_per_partition = divide(output_size, self.tp_size)
+-        self.output_partition_sizes = [self.output_size_per_partition]
+-        # If QKV or MergedColumn, use output size of each partition.
+-        if hasattr(self, "output_sizes"):
++        # --- Heterogeneous TP (gfx1201 64:56 rig): proportional FFN/MoE split. ---
++        # Strict no-op unless VLLM_TP_CU_WEIGHTS is set AND this is an FFN/MoE column
++        # layer with an output divisible by the alignment. See patches/HET_TP_PATCH.md.
++        from vllm.distributed.het_tp import (
++            het_active, het_align, het_eligible, het_size)
++        self._het_align = het_align(getattr(quant_config, "group_size", None))
++        self._het = (
++            het_eligible(prefix)
++            and het_active(self.tp_size)
++            and output_size % self._het_align == 0
++        )
++        if self._het:
++            # Per-sub-output logical size (gate_up has equal sub-outputs == intermediate).
++            self._het_logical = (
++                self.output_sizes[0] if hasattr(self, "output_sizes") else output_size)
+             self.output_partition_sizes = [
+-                divide(output_size, self.tp_size) for output_size in self.output_sizes
++                het_size(o, self.tp_rank, self.tp_size, align=self._het_align)
++                for o in (self.output_sizes if hasattr(self, "output_sizes")
++                          else [output_size])
+             ]
++            self.output_size_per_partition = sum(self.output_partition_sizes)
++        else:
++            self.output_size_per_partition = divide(output_size, self.tp_size)
++            self.output_partition_sizes = [self.output_size_per_partition]
++            # If QKV or MergedColumn, use output size of each partition.
++            if hasattr(self, "output_sizes"):
++                self.output_partition_sizes = [
++                    divide(output_size, self.tp_size)
++                    for output_size in self.output_sizes
++                ]
+ 
+         super().__init__(
+             input_size,
+@@ -499,6 +522,14 @@ class ColumnParallelLinear(LinearBase):
+         else:
+             self.register_parameter("bias", None)
+         self.update_param_tp_status()
++        # Heterogeneous TP: stamp v2 (vLLM) params with (logical_narrow_dim, align) so
++        # load_*column*_weight uses the proportional, packing-aware offset. Plain
++        # Parameters (bias: no tp_rank) are left on the even path on purpose.
++        if getattr(self, "_het", False):
++            for _p in self.parameters(recurse=False):
++                if (getattr(_p, "tp_rank", None) is not None
++                        and getattr(_p, "output_dim", None) is not None):
++                    _p.het = (self._het_logical, self._het_align)
+ 
+     def _maybe_allow_fp8_block_shape_mismatch(self) -> None:
+         quant_config = getattr(self, "quant_config", None)
+@@ -949,10 +980,18 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
+ 
+         assert loaded_shard_id < len(self.output_sizes)
+ 
+-        shard_offset = sum(self.output_sizes[:loaded_shard_id])
+-        shard_size = self.output_sizes[loaded_shard_id]
+-        shard_offset //= self.tp_size
+-        shard_size //= self.tp_size
++        if getattr(self, "_het", False):
++            # Heterogeneous TP: use the proportional per-sub sizes the param was
++            # actually allocated with (output_partition_sizes), so the merged param
++            # offset/size match both the het allocation AND the het loaded_weight
++            # offset computed in load_merged_column_weight. Even path unchanged.
++            shard_offset = sum(self.output_partition_sizes[:loaded_shard_id])
++            shard_size = self.output_partition_sizes[loaded_shard_id]
++        else:
++            shard_offset = sum(self.output_sizes[:loaded_shard_id])
++            shard_size = self.output_sizes[loaded_shard_id]
++            shard_offset //= self.tp_size
++            shard_size //= self.tp_size
+ 
+         if isinstance(param, BlockQuantScaleParameter):
+             weight_block_size = getattr(self, "weight_block_size", None)
+@@ -1439,7 +1478,22 @@ class RowParallelLinear(LinearBase):
+         # Divide the weight matrix along the first dimension.
+         self.tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0
+         self.tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
+-        self.input_size_per_partition = divide(input_size, self.tp_size)
++        # --- Heterogeneous TP: proportional split of the FFN/MoE reduction (input)
++        # dim. No-op unless VLLM_TP_CU_WEIGHTS set + FFN/MoE layer + divisible.
++        from vllm.distributed.het_tp import (
++            het_active, het_align, het_eligible, het_size)
++        self._het_align = het_align(getattr(quant_config, "group_size", None))
++        self._het = (
++            het_eligible(prefix)
++            and het_active(self.tp_size)
++            and input_size % self._het_align == 0
++        )
++        if self._het:
++            self._het_logical = input_size
++            self.input_size_per_partition = het_size(
++                input_size, self.tp_rank, self.tp_size, align=self._het_align)
++        else:
++            self.input_size_per_partition = divide(input_size, self.tp_size)
+         self.output_size_per_partition = output_size
+         self.output_partition_sizes = [output_size]
+ 
+@@ -1489,6 +1543,13 @@ class RowParallelLinear(LinearBase):
+         else:
+             self.register_parameter("bias", None)
+         self.update_param_tp_status()
++        # Heterogeneous TP: stamp v2 params with (logical_input_dim, align) so
++        # load_row_parallel_weight uses the proportional, group-aware offset.
++        if getattr(self, "_het", False):
++            for _p in self.parameters(recurse=False):
++                if (getattr(_p, "tp_rank", None) is not None
++                        and getattr(_p, "input_dim", None) is not None):
++                    _p.het = (self._het_logical, self._het_align)
+ 
+     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
+         input_dim = getattr(param, "input_dim", None)
+diff --git a/vllm/model_executor/parameter.py b/vllm/model_executor/parameter.py
+index 4106672..0fc9d4d 100755
+--- a/vllm/model_executor/parameter.py
++++ b/vllm/model_executor/parameter.py
+@@ -147,9 +147,14 @@ class _ColumnvLLMParameter(BasevLLMParameter):
+ 
+     def load_column_parallel_weight(self, loaded_weight: torch.Tensor):
+         shard_size = self.data.shape[self.output_dim]
+-        loaded_weight = loaded_weight.narrow(
+-            self.output_dim, self.tp_rank * shard_size, shard_size
+-        )
++        start = self.tp_rank * shard_size
++        het = getattr(self, "het", None)  # (logical_output_dim, align) or None
++        if het is not None:
++            from vllm.distributed.het_tp import het_axis_offset
++            start = het_axis_offset(
++                het[0], het[1], loaded_weight.shape[self.output_dim],
++                self.tp_rank, self.tp_size)
++        loaded_weight = loaded_weight.narrow(self.output_dim, start, shard_size)
+         assert self.data.shape == loaded_weight.shape
+         self.data.copy_(loaded_weight)
+ 
+@@ -169,9 +174,15 @@ class _ColumnvLLMParameter(BasevLLMParameter):
+         param_data = self.data
+ 
+         param_data = param_data.narrow(self.output_dim, shard_offset, shard_size)
+-        loaded_weight = loaded_weight.narrow(
+-            self.output_dim, self.tp_rank * shard_size, shard_size
+-        )
++        start = self.tp_rank * shard_size
++        het = getattr(self, "het", None)
++        if het is not None:
++            # Per-sub-output het offset (gate_up sub-outputs each span `intermediate`).
++            from vllm.distributed.het_tp import het_axis_offset
++            start = het_axis_offset(
++                het[0], het[1], loaded_weight.shape[self.output_dim],
++                self.tp_rank, self.tp_size)
++        loaded_weight = loaded_weight.narrow(self.output_dim, start, shard_size)
+         assert param_data.shape == loaded_weight.shape
+         param_data.copy_(loaded_weight)
+ 
+@@ -219,9 +230,14 @@ class RowvLLMParameter(BasevLLMParameter):
+ 
+     def load_row_parallel_weight(self, loaded_weight: torch.Tensor):
+         shard_size = self.data.shape[self.input_dim]
+-        loaded_weight = loaded_weight.narrow(
+-            self.input_dim, self.tp_rank * shard_size, shard_size
+-        )
++        start = self.tp_rank * shard_size
++        het = getattr(self, "het", None)  # (logical_input_dim, align) or None
++        if het is not None:
++            from vllm.distributed.het_tp import het_axis_offset
++            start = het_axis_offset(
++                het[0], het[1], loaded_weight.shape[self.input_dim],
++                self.tp_rank, self.tp_size)
++        loaded_weight = loaded_weight.narrow(self.input_dim, start, shard_size)
+ 
+         if len(loaded_weight.shape) == 0:
+             loaded_weight = loaded_weight.reshape(1)

@@ -5,14 +5,22 @@ Thanks for helping improve the gfx1201 (RDNA4) vLLM stack. This repo is mostly
 explains why almost every odd-looking decision exists, and most debugging walls
 already have a documented door.
 
+> **Canonical stack (2026-06): the combined image.** Active development targets
+> **`Dockerfile.combined`** → `vllm22-w4a8:combined`, built `FROM tcclaviger/vllm22:dev`
+> (the collaborator's tuned-attention vLLM 0.22.69) with our W4A8 kernel built in-image from its
+> canonical csrc + a surgical `moe_wna16` patch. Run via `docker-compose.combined.yml`. The
+> wheel-based `Dockerfile`/`Dockerfile.fromsource` (the standalone TheRock stack) are **legacy** —
+> kept for the A/B baseline, not for new work. See `memory/consolidate-on-combined-image.md`.
+
 ## What lives where
 
 | If you want to change… | Edit it… |
 |---|---|
-| how the image is assembled (wheel install, patches, W4A8 build) | `Dockerfile`, `Dockerfile.fromsource` |
-| how it's served (profiles, flags, mounts, env) | `docker-compose.yml`, `.env.template` |
-| the WNA16-MoE `tp_size` source fix | `patches/moe_wna16.py` |
-| the W4A8-FP8-WMMA MoE kernel | `w4a8_fp8_wmma/` |
+| **the combined image (canonical)** | **`Dockerfile.combined`, `docker-compose.combined.yml`** |
+| heterogeneous-TP (64:56 sharding) | `patches/het_tp.py` + `patches/het_tp_vllm.patch` — see `patches/HET_TP_HANDOFF.md` |
+| the WNA16-MoE `tp_size` source fix | applied surgically in `Dockerfile.combined` (sed) |
+| the W4A8-FP8-WMMA kernel | canonical csrc (`vllm-rocm714-gfx1250/.../w4a8_fp8_wmma`), via build-context |
+| *(legacy)* the wheel image / serving | `Dockerfile`, `Dockerfile.fromsource`, `docker-compose.yml` |
 | the kernels/engine themselves (vllm / aiter / flash-attention) | **not here** — see "Upstream" below |
 
 The three wheels are built from **separate forks**, not from this repo:
@@ -54,6 +62,12 @@ Consequences for contributors:
 5. **Perf claims** must come from `test/bench_tp2.py` (warmup-generate then timed) on
    a **warm** Triton cache, and state the GPU layout — the published baseline is
    **298 dec / 1887 total tok/s** (heterogeneous TP=2, CU_NUM=56). Quote the config.
+6. **Offline scripts that build `vllm.LLM(...)` with TP>1 MUST guard the engine under
+   `if __name__ == "__main__":`** — vLLM spawns TP workers, which re-import the module;
+   an unguarded top-level `LLM(...)` dies at worker spawn with `RuntimeError: An attempt
+   has been made to start a new process before ... bootstrapping` (looks like a model
+   bug, isn't). Template: `def main(): llm = LLM(...); ...` + `if __name__ == "__main__":
+   main()`. This has bitten us repeatedly. (Example: `patches/het_e2e_check.py`.)
 
 ## Style
 
