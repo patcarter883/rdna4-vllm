@@ -76,4 +76,14 @@ def register(verbose: bool = True) -> bool:
         if verbose:
             print(f"[w4a8_fp8_wmma] WNA16 MoE hook not installed: {e}")
 
+    # GPTQ MoE (auto_gptq). AutoGPTQMoEMethod uses the same wna16 oracle as AWQ but
+    # in its own namespace, so register_moe (awq_marlin-only) left GPTQ on Marlin.
+    # This closes that gap for symmetric GPTQ-4bit MoE. Separate try/except.
+    try:
+        from w4a8_fp8_wmma.moe_experts import register_moe_gptq
+        register_moe_gptq(verbose=verbose)
+    except Exception as e:  # pragma: no cover - defensive
+        if verbose:
+            print(f"[w4a8_fp8_wmma] GPTQ MoE hook not installed: {e}")
+
     return True

@@ -29,6 +29,35 @@ _NEVER = 1 << 30  # sentinel crossover meaning "always use Triton"
 _CROSSOVER_TABLE: dict | None = None
 
 
+def _force_mode() -> str:
+    """Override the per-shape tuning gate (the AOT crossover cache).
+
+    VLLM_ROCM_W4A8_FORCE:
+      'auto' (default) — consult the crossover cache (never regress vs stock)
+      'on'  / '1'      — ALWAYS run our W4A8 kernel (ignore the cache; for
+                         measurement, or when you know it wins). Implies no
+                         Triton fallback copy is needed.
+      'off' / '0'      — ALWAYS use the stock Triton path (never run ours).
+    Applies symmetrically to the dense (here) and MoE (moe_experts) gates."""
+    v = os.environ.get("VLLM_ROCM_W4A8_FORCE", "auto").strip().lower()
+    if v in ("on", "1", "true"):
+        return "on"
+    if v in ("off", "0", "false"):
+        return "off"
+    return "auto"
+
+
+def _no_triton_fallback() -> bool:
+    """Single-layout mode: skip building the Triton-fallback weight copy.
+
+    The Triton fallback needs weights in (K, N//8) packing, a *second* full copy
+    alongside our native (N, K//8) — doubling dense weight VRAM. On 16GB cards a
+    ~10GB-weights model (e.g. Qwen3.6-27B at TP=2) OOMs at load building it. With
+    this flag set, we keep only our layout and route ALL M through v11/v10/v5
+    (apply_weights makes the dispatch gap-free)."""
+    return os.environ.get("VLLM_ROCM_W4A8_NO_TRITON_FALLBACK", "0") == "1"
+
+
 def _load_crossover_table() -> dict:
     """Load the AOT crossover cache (O(1) per-shape Triton<->FP8 thresholds).
     Path: $VLLM_ROCM_W4A8_FP8_WMMA_CACHE or crossover_cache.json next to this
@@ -161,30 +190,45 @@ class RocmW4A8Fp8WmmaLinearKernel(MPLinearKernel):
 
         # ---- Triton W4A16 fallback weights (used for small M where Triton wins).
         # triton_w4a16_gemm wants b_q [K, N//8], scales [K//group, N]. Build from
-        # our (N, K//8) / (N, K//group) layout.
-        wq_now = getattr(layer, self.w_q_name).data  # (N, K//8)
-        dev = wq_now.device
-        shifts = (torch.arange(8, device=dev, dtype=torch.int32) * 4).view(1, 8)
-        unpacked = ((wq_now.unsqueeze(-1) >> shifts.view(1, 1, 8)) & 0xF).reshape(N, K)
-        w_kn = unpacked.t().contiguous()  # (K, N)
-        N8 = N // 8
-        tri_bq = torch.zeros((K, N8), dtype=torch.int32, device=dev)
-        for j in range(8):
-            tri_bq |= (w_kn[:, j::8] & 0xF) << (j * 4)
-        layer._w4a8_tri_bq = tri_bq.contiguous()           # (K, N//8)
-        layer._w4a8_tri_s = w_s_fp16.t().contiguous()      # (K//group, N)
-
-        # AWQ asymmetric zeros for the Triton fallback (decode path). Our op's
-        # zero layout is (N//8, K//group) N-packed, standard nibble order;
-        # triton_w4a16_gemm wants (K//group, N//8) with the same N-packing and
-        # nibble order, i.e. a plain transpose. Symmetric (uint4b8) keeps None so
-        # Triton uses the implicit zp_bias=8. Without this, decode (small M)
-        # silently dropped the per-group zero points -> wrong AWQ outputs.
-        if c.zero_points and w_zp is not None:
-            zp_now = getattr(layer, self.w_zp_name).data  # (N//8, K//group)
-            layer._w4a8_tri_zp = zp_now.t().contiguous()  # (K//group, N//8)
-        else:
+        # our (N, K//8) / (N, K//group) layout. SKIPPED in single-layout mode: this
+        # is a SECOND full weight copy (Triton packing) that doubles dense weight
+        # VRAM and OOMs ~10GB-weight models on 16GB cards. See _no_triton_fallback.
+        if _no_triton_fallback() or _force_mode() == "on":
+            # FORCE=on always runs our kernel, so the Triton copy is dead weight.
+            layer._w4a8_tri_bq = None
+            layer._w4a8_tri_s = None
             layer._w4a8_tri_zp = None
+        else:
+            wq_now = getattr(layer, self.w_q_name).data  # (N, K//8)
+            dev = wq_now.device
+            # Unpack/repack in N-row blocks so the transient is O(BLK*K), not the
+            # full O(N*K) int32 that previously spiked peak VRAM at load.
+            N8 = N // 8
+            tri_bq = torch.zeros((K, N8), dtype=torch.int32, device=dev)
+            shifts = (torch.arange(8, device=dev, dtype=torch.int32) * 4).view(1, 8, 1)
+            BLK = 1024 - (1024 % 8)  # multiple of 8 (packing granularity along N)
+            for nb in range(0, N, BLK):
+                ne = min(nb + BLK, N)
+                blk = wq_now[nb:ne]                                   # (b, K//8)
+                # (b, K//8) -> (b, K//8, 8) -> (b, K): nibble j of int32 is k=k8*8+j
+                up = ((blk.unsqueeze(-1) >> shifts.view(1, 1, 8)) & 0xF).reshape(ne - nb, K)
+                w_kn = up.t().contiguous()                            # (K, b)
+                for j in range(8):
+                    tri_bq[:, nb // 8:ne // 8] |= (w_kn[:, j::8] & 0xF) << (j * 4)
+            layer._w4a8_tri_bq = tri_bq.contiguous()           # (K, N//8)
+            layer._w4a8_tri_s = w_s_fp16.t().contiguous()      # (K//group, N)
+
+            # AWQ asymmetric zeros for the Triton fallback (decode path). Our op's
+            # zero layout is (N//8, K//group) N-packed, standard nibble order;
+            # triton_w4a16_gemm wants (K//group, N//8) with the same N-packing and
+            # nibble order, i.e. a plain transpose. Symmetric (uint4b8) keeps None
+            # so Triton uses the implicit zp_bias=8. Without this, decode (small M)
+            # silently dropped the per-group zero points -> wrong AWQ outputs.
+            if c.zero_points and w_zp is not None:
+                zp_now = getattr(layer, self.w_zp_name).data  # (N//8, K//group)
+                layer._w4a8_tri_zp = zp_now.t().contiguous()  # (K//group, N//8)
+            else:
+                layer._w4a8_tri_zp = None
 
         # Per-layer calibration: the ours-vs-Triton crossover depends on (N,K),
         # not just M (larger N lowers it, larger K raises it; some shapes never
@@ -214,21 +258,46 @@ class RocmW4A8Fp8WmmaLinearKernel(MPLinearKernel):
         M = x_2d.size(0)
         orig_dtype = x_2d.dtype
 
-        if M < getattr(layer, "_w4a8_min_m", 1 << 30):
-            # Small-M (decode / small prefill): Triton W4A16 is faster.
-            from vllm.model_executor.kernels.linear.mixed_precision.triton_w4a16 import (
-                triton_w4a16_gemm,
-            )
-            gs = c.group_size if c.group_size != -1 else K
-            # AWQ: pass the real per-group zeros (HAS_ZP path); zp_bias unused.
-            # Symmetric uint4b8: qzeros=None, Triton uses the implicit zp_bias=8.
-            tri_zp = getattr(layer, "_w4a8_tri_zp", None)
-            zp_bias = c.weight_type.bias if c.weight_type.has_bias() else 0
-            out = triton_w4a16_gemm(
-                a=x_2d, b_q=layer._w4a8_tri_bq, scales=layer._w4a8_tri_s,
-                qzeros=tri_zp, group_size=gs, zp_bias=zp_bias)
-        else:
-            # Large-M (compute-bound prefill): our FP8-WMMA kernel wins.
+        gs = c.group_size if c.group_size != -1 else K
+        # Kernel selection by M (all bit-exact; each wins its regime):
+        #   decode (M<=DECODE_MAX): v11 streaming GEMV   -> beats Triton ~1.4-1.9x
+        #   prefill (M>=prefill_min): v10 A-shuffle WMMA -> beats fp16/Triton
+        #   middle / unsupported shapes: Triton W4A16 fallback (safe).
+        # v10 needs group_size in {32,128} (compile-time); v11 needs K%1024==0,
+        # group_size%32==0, and M*K<=65536 (activations fit LDS).
+        v10_ok = gs in (32, 128)
+        # v11 is now K-TILED (kernel stages only (M,BK) in LDS) -> no M*K cap; correct
+        # for any K%1024==0 at M<=16 (validated bit-exact vs v5, incl. K=17408 decode).
+        # BUT v11 is a GEMV: GPU microbench (N=5120,K=17408) shows it only WINS at M=1
+        # (162us vs triton 283 / v10 440); it scales ~110+50*M us and loses to Triton
+        # by M>=4. So gate v11 to tiny M; mid-M decode stays on Triton (fallback) and
+        # large M on v10. (default 2; was wrongly 16. Real crossover is shape-dependent.)
+        v11_ok = (K % 1024 == 0) and (gs % 32 == 0) and (M <= 16)
+        decode_max = int(os.environ.get("VLLM_ROCM_W4A8_DECODE_MAX_M", "2"))
+        # v10 reliably beats fp16/Triton from ~M=256 even untuned; engage there
+        # (or earlier if the AOT crossover cache proved a lower threshold).
+        v10_min = int(os.environ.get("VLLM_ROCM_W4A8_V10_MIN_M", "256"))
+        cached = getattr(layer, "_w4a8_min_m", _NEVER)
+        prefill_min = min(cached, v10_min) if v10_ok else cached
+
+        use_v11 = v11_ok and M <= decode_max
+        use_v10 = (not use_v11) and v10_ok and M >= prefill_min
+        use_v5 = (not use_v11) and (not use_v10) and M >= cached  # gs not 32/128
+
+        # Tuning-gate override (VLLM_ROCM_W4A8_FORCE):
+        #   off -> always stock Triton (needs the fallback weights, which were built
+        #          since FORCE!=on at load); on / single-layout -> always our kernel,
+        #          with a gap-free ladder (v10 covers any M for gs in {32,128}; else v5).
+        force = _force_mode()
+        if force == "off":
+            use_v11 = use_v10 = use_v5 = False
+        elif (force == "on" or _no_triton_fallback()) and not (use_v11 or use_v10 or use_v5):
+            if v10_ok:
+                use_v10 = True
+            else:
+                use_v5 = True
+
+        if use_v11 or use_v10 or use_v5:
             w_q, _w_s_native, w_zp, _ = self._get_weight_params(layer)
             w_s = layer._w4a8_fp8_w_s
             x16 = x_2d if x_2d.dtype == torch.float16 else x_2d.to(torch.float16)
@@ -236,9 +305,35 @@ class RocmW4A8Fp8WmmaLinearKernel(MPLinearKernel):
                 zp_in = w_zp
             else:
                 zp_in = torch.empty(0, dtype=torch.int32, device=x.device)
-            out = torch.ops.w4a8_fp8_wmma.mmq_fp8_gemm(x16, w_q, w_s, zp_in, 5)
+            ver = 11 if use_v11 else (10 if use_v10 else 5)
+            out = torch.ops.w4a8_fp8_wmma.mmq_fp8_gemm(x16, w_q, w_s, zp_in, ver)
             if orig_dtype != torch.float16:
                 out = out.to(orig_dtype)
+        else:
+            # Triton W4A16 fallback (mid-M, or shapes v10/v11 can't take). At small M
+            # the stock vLLM Triton runs a gfx1151-tuned config (BLOCK_K clamped to 64)
+            # that is suboptimal on gfx1201 (64 CU) -- exactly the dense M=16-32 band
+            # where our fp8-WMMA HIP kernels are at the raw WMMA/HBM limit (~20 variants
+            # confirm). For M<=32 we route to a gfx1201-tuned Triton (BLOCK_K = full
+            # group) that is 1.2-1.4x faster than the stock config at g=128 and >= it
+            # elsewhere, so the served pathway EXCEEDS stock in that last regime too.
+            # Above M=32 the stock config is already best, so use it unchanged.
+            tri_zp = getattr(layer, "_w4a8_tri_zp", None)
+            zp_bias = c.weight_type.bias if c.weight_type.has_bias() else 0
+            # gfx1201-tuned Triton ONLY where it strictly beats stock: small M (<=32)
+            # AND group_size > 64 (the stock clamps BLOCK_K to 64, so for g=128 it runs
+            # the half-group tile -> 1.2-1.4x slower than BLOCK_K=full-group here). For
+            # g<=64 the tuned config IS the stock config, so use stock directly (no
+            # separate path). M>32: stock's tile is already best. Net: fallback >= stock.
+            if M <= 32 and gs > 64:
+                from w4a8_fp8_wmma.triton_w4a16_gfx1201 import (
+                    triton_w4a16_gemm_gfx1201 as _tri,
+                )
+            else:
+                from vllm.model_executor.kernels.linear.mixed_precision.triton_w4a16 import (  # noqa: E501
+                    triton_w4a16_gemm as _tri,
+                )
+            out = _tri(x_2d, layer._w4a8_tri_bq, layer._w4a8_tri_s, tri_zp, gs, zp_bias)
 
         if out.dtype != orig_dtype:
             out = out.to(orig_dtype)

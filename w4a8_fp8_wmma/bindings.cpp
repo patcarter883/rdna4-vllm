@@ -24,6 +24,18 @@ void launch_mmq_fp8_gemm_gfx1201(
     at::Tensor& out,
     int64_t version);
 
+void launch_mmq_fp8_gemm_v15_gfx1201(
+    const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+    at::Tensor&, int64_t);
+
+void launch_mmq_fp8_gemm_v16_gfx1201(
+    const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+    at::Tensor&, int64_t);
+
+void launch_mmq_w4a16_gemm_v17_gfx1201(
+    const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+    at::Tensor&, int64_t);
+
 void launch_mmq_fp8_moe_gemm_gfx1201(
     const at::Tensor& x,
     const at::Tensor& w_packed,
@@ -36,6 +48,28 @@ void launch_mmq_fp8_moe_gemm_gfx1201(
     int64_t top_k,
     int64_t block_m,
     int64_t version);
+
+void launch_mmq_fp8_moe_gemm_scatter_gfx1201(
+    const at::Tensor& x,
+    const at::Tensor& w_packed,
+    const at::Tensor& scales,
+    const at::Tensor& w_zeros,
+    const at::Tensor& sorted_token_ids,
+    const at::Tensor& expert_ids,
+    const at::Tensor& num_tokens_post_padded,
+    const at::Tensor& topk_weights,
+    at::Tensor& output,
+    int64_t top_k,
+    int64_t block_m,
+    int64_t version);
+
+void launch_moe_gather_reduce_gfx1201(
+    const at::Tensor& out2,
+    const at::Tensor& sorted_token_ids,
+    const at::Tensor& topk_weights,
+    const at::Tensor& num_tokens_post_padded,
+    at::Tensor& out,
+    int64_t top_k);
 
 namespace {
 
@@ -71,8 +105,9 @@ at::Tensor mmq_fp8_gemm_forward(
                 "K not divisible by scales' K dim");
     TORCH_CHECK(group_size % 16 == 0 && group_size <= 128,
                 "group_size must be a multiple of 16 and <= 128; got ", group_size);
-    TORCH_CHECK(version >= 0 && version <= 5,
-                "version must be 0..5 (5 = raw-builtin direct-load)");
+    TORCH_CHECK(version >= 0 && version <= 14,
+                "version must be 0..14 (7 = tile/ILP, 10 = A-shuffle prefill, 11 = "
+                "decode GEMV, 12 = split-K, 13 = register-direct, 14 = N-split small-M)");
 
     if (w_zeros.defined() && w_zeros.numel() > 0) {
         TORCH_CHECK(w_zeros.is_cuda() && w_zeros.scalar_type() == at::kInt,
@@ -84,6 +119,36 @@ at::Tensor mmq_fp8_gemm_forward(
 
     auto out = at::empty({M, N}, x.options());
     launch_mmq_fp8_gemm_gfx1201(x, w_packed, scales, w_zeros, out, version);
+    return out;
+}
+
+// v15: register-direct WMMA with pre-repacked (N/16,K/16,32) weights.
+at::Tensor mmq_fp8_gemm_v15_forward(
+    const at::Tensor& x, const at::Tensor& w_rep, const at::Tensor& scales,
+    const at::Tensor& w_zeros, int64_t N) {
+    const int64_t M = x.size(0);
+    auto out = at::empty({M, N}, x.options());
+    launch_mmq_fp8_gemm_v15_gfx1201(x, w_rep, scales, w_zeros, out, N);
+    return out;
+}
+
+// v16: f16-WMMA twin of v15 (same w_rep contract).
+at::Tensor mmq_fp8_gemm_v16_forward(
+    const at::Tensor& x, const at::Tensor& w_rep, const at::Tensor& scales,
+    const at::Tensor& w_zeros, int64_t N) {
+    const int64_t M = x.size(0);
+    auto out = at::empty({M, N}, x.options());
+    launch_mmq_fp8_gemm_v16_gfx1201(x, w_rep, scales, w_zeros, out, N);
+    return out;
+}
+
+// v17: true W4A16 -- fp16 activations direct (no act-quant).
+at::Tensor mmq_w4a16_gemm_v17_forward(
+    const at::Tensor& x, const at::Tensor& w_rep, const at::Tensor& scales,
+    const at::Tensor& w_zeros, int64_t N) {
+    const int64_t M = x.size(0);
+    auto out = at::empty({M, N}, x.options());
+    launch_mmq_w4a16_gemm_v17_gfx1201(x, w_rep, scales, w_zeros, out, N);
     return out;
 }
 
@@ -122,7 +187,8 @@ at::Tensor mmq_fp8_moe_gemm_forward(
     TORCH_CHECK(P % block_m == 0, "P=", P, " not divisible by block_m=", block_m);
     TORCH_CHECK(expert_ids.size(0) == P / block_m,
                 "expert_ids must have P/block_m=", P / block_m, " entries");
-    TORCH_CHECK(version == 0 || version == 5, "moe version must be 0 or 5");
+    TORCH_CHECK(version == 0 || version == 5 || version == 6 || version == 7,
+                "moe version must be 0/5/6/7");
 
     if (w_zeros.defined() && w_zeros.numel() > 0) {
         TORCH_CHECK(w_zeros.scalar_type() == at::kInt && w_zeros.dim() == 3 &&
@@ -137,18 +203,124 @@ at::Tensor mmq_fp8_moe_gemm_forward(
     return out;
 }
 
+// Fused gemm2 + topk-weight + indirect atomic scatter. `x` is the (P, inter)
+// post-activation buffer; the result is accumulated IN PLACE into the caller's
+// pre-zeroed (M, N) fp32 `output` (one row per real token). No (P,N) materialise,
+// no torch scatter. `sorted_token_ids` are the gemm1 (token,slot) ids.
+void mmq_fp8_moe_gemm_scatter_forward(
+    const at::Tensor& x,
+    const at::Tensor& w_packed,
+    const at::Tensor& scales,
+    const at::Tensor& w_zeros,
+    const at::Tensor& sorted_token_ids,
+    const at::Tensor& expert_ids,
+    const at::Tensor& num_tokens_post_padded,
+    const at::Tensor& topk_weights,
+    at::Tensor& output,
+    int64_t top_k,
+    int64_t block_m,
+    int64_t version) {
+
+    TORCH_CHECK(x.is_cuda() && w_packed.is_cuda() && scales.is_cuda(),
+                "x, w_packed, scales must be CUDA");
+    TORCH_CHECK(x.scalar_type() == at::kHalf, "x must be fp16");
+    TORCH_CHECK(w_packed.scalar_type() == at::kInt, "w_packed must be int32");
+    TORCH_CHECK(scales.scalar_type() == at::kHalf, "scales must be fp16");
+    TORCH_CHECK(x.dim() == 2, "x must be (P, K)");
+    TORCH_CHECK(w_packed.dim() == 3 && scales.dim() == 3,
+                "w_packed (E,N,K/8) and scales (E,N,K/group) must be 3D");
+    TORCH_CHECK(sorted_token_ids.scalar_type() == at::kInt &&
+                expert_ids.scalar_type() == at::kInt &&
+                num_tokens_post_padded.scalar_type() == at::kInt,
+                "routing tensors must be int32");
+    TORCH_CHECK(topk_weights.scalar_type() == at::kFloat &&
+                output.scalar_type() == at::kFloat,
+                "topk_weights and output must be fp32");
+    TORCH_CHECK(x.is_contiguous() && w_packed.is_contiguous() &&
+                scales.is_contiguous() && topk_weights.is_contiguous() &&
+                output.is_contiguous(),
+                "x, w_packed, scales, topk_weights, output must be contiguous");
+    TORCH_CHECK(output.dim() == 2 && output.size(1) == w_packed.size(1),
+                "output must be (M, N) with N=", w_packed.size(1));
+
+    const int64_t K = x.size(1);
+    const int64_t N = w_packed.size(1);
+    const int64_t P = sorted_token_ids.size(0);
+    const int64_t M = output.size(0);
+    TORCH_CHECK(w_packed.size(2) * kPackFactor == K,
+                "w_packed last dim must be K/8=", K / kPackFactor);
+    TORCH_CHECK(P % block_m == 0, "P=", P, " not divisible by block_m=", block_m);
+    TORCH_CHECK(expert_ids.size(0) == P / block_m,
+                "expert_ids must have P/block_m=", P / block_m, " entries");
+    TORCH_CHECK(topk_weights.numel() == M * top_k,
+                "topk_weights must have M*top_k=", M * top_k, " entries");
+    TORCH_CHECK(version == 0 || version == 5 || version == 6 || version == 7,
+                "moe version must be 0/5/6/7");
+
+    if (w_zeros.defined() && w_zeros.numel() > 0) {
+        TORCH_CHECK(w_zeros.scalar_type() == at::kInt && w_zeros.dim() == 3 &&
+                    w_zeros.size(1) * 8 == N && w_zeros.size(2) == scales.size(2),
+                    "w_zeros must be (E, N/8, K/group) int32");
+    }
+
+    launch_mmq_fp8_moe_gemm_scatter_gfx1201(
+        x, w_packed, scales, w_zeros, sorted_token_ids, expert_ids,
+        num_tokens_post_padded, topk_weights, output, top_k, block_m, version);
+}
+
+// Contention-free MoE reduce: gemm2 NON-scatter (P,N) -> weighted gather-reduce
+// to (M,N) fp32. Replaces the atomic scatter at scale (no top_k-contended atomics).
+at::Tensor mmq_fp8_moe_gather_reduce_forward(
+    const at::Tensor& out2,                    // (P, N) fp16
+    const at::Tensor& sorted_token_ids,        // (P,) int32
+    const at::Tensor& topk_weights,            // (M*top_k,) fp32
+    const at::Tensor& num_tokens_post_padded,  // (1,) int32
+    int64_t top_k) {
+
+    TORCH_CHECK(out2.is_cuda() && out2.scalar_type() == at::kHalf && out2.dim() == 2,
+                "out2 must be (P,N) fp16 CUDA");
+    TORCH_CHECK(sorted_token_ids.scalar_type() == at::kInt &&
+                num_tokens_post_padded.scalar_type() == at::kInt,
+                "sorted_token_ids / num_tokens_post_padded must be int32");
+    TORCH_CHECK(topk_weights.scalar_type() == at::kFloat, "topk_weights must be fp32");
+    TORCH_CHECK(out2.is_contiguous() && topk_weights.is_contiguous(),
+                "out2 and topk_weights must be contiguous");
+    TORCH_CHECK(topk_weights.numel() % top_k == 0, "topk_weights.numel() must be M*top_k");
+
+    const int64_t N = out2.size(1);
+    const int64_t M = topk_weights.numel() / top_k;
+    auto out = at::zeros({M, N}, out2.options().dtype(at::kFloat));
+    launch_moe_gather_reduce_gfx1201(out2, sorted_token_ids, topk_weights,
+                                     num_tokens_post_padded, out, top_k);
+    return out;
+}
+
 }  // namespace
 
 TORCH_LIBRARY(w4a8_fp8_wmma, m) {
     m.def("mmq_fp8_gemm(Tensor x, Tensor w_packed, Tensor scales, Tensor w_zeros, int version) -> Tensor");
+    m.def("mmq_fp8_gemm_v15(Tensor x, Tensor w_rep, Tensor scales, Tensor w_zeros, int N) -> Tensor");
+    m.def("mmq_fp8_gemm_v16(Tensor x, Tensor w_rep, Tensor scales, Tensor w_zeros, int N) -> Tensor");
+    m.def("mmq_w4a16_gemm_v17(Tensor x, Tensor w_rep, Tensor scales, Tensor w_zeros, int N) -> Tensor");
     m.def("mmq_fp8_moe_gemm(Tensor x, Tensor w_packed, Tensor scales, Tensor w_zeros, "
           "Tensor sorted_token_ids, Tensor expert_ids, Tensor num_tokens_post_padded, "
           "int top_k, int block_m, int version) -> Tensor");
+    m.def("mmq_fp8_moe_gemm_scatter(Tensor x, Tensor w_packed, Tensor scales, "
+          "Tensor w_zeros, Tensor sorted_token_ids, Tensor expert_ids, "
+          "Tensor num_tokens_post_padded, Tensor topk_weights, Tensor(a!) output, "
+          "int top_k, int block_m, int version) -> ()");
+    m.def("mmq_fp8_moe_gather_reduce(Tensor out2, Tensor sorted_token_ids, "
+          "Tensor topk_weights, Tensor num_tokens_post_padded, int top_k) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(w4a8_fp8_wmma, CUDA, m) {
     m.impl("mmq_fp8_gemm", &mmq_fp8_gemm_forward);
+    m.impl("mmq_fp8_gemm_v15", &mmq_fp8_gemm_v15_forward);
+    m.impl("mmq_fp8_gemm_v16", &mmq_fp8_gemm_v16_forward);
+    m.impl("mmq_w4a16_gemm_v17", &mmq_w4a16_gemm_v17_forward);
     m.impl("mmq_fp8_moe_gemm", &mmq_fp8_moe_gemm_forward);
+    m.impl("mmq_fp8_moe_gemm_scatter", &mmq_fp8_moe_gemm_scatter_forward);
+    m.impl("mmq_fp8_moe_gather_reduce", &mmq_fp8_moe_gather_reduce_forward);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

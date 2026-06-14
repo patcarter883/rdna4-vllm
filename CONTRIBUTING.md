@@ -5,41 +5,39 @@ Thanks for helping improve the gfx1201 (RDNA4) vLLM stack. This repo is mostly
 explains why almost every odd-looking decision exists, and most debugging walls
 already have a documented door.
 
-> **Canonical stack (2026-06): the combined image.** Active development targets
+> **The stack (2026-06): the combined image.** All development targets
 > **`Dockerfile.combined`** → `vllm22-w4a8:combined`, built `FROM tcclaviger/vllm22:dev`
-> (the collaborator's tuned-attention vLLM 0.22.69) with our W4A8 kernel built in-image from its
-> canonical csrc + a surgical `moe_wna16` patch. Run via `docker-compose.combined.yml`. The
-> wheel-based `Dockerfile`/`Dockerfile.fromsource` (the standalone TheRock stack) are **legacy** —
-> kept for the A/B baseline, not for new work. See `memory/consolidate-on-combined-image.md`.
+> (the collaborator's tuned-attention vLLM 0.22.69) with our W4A8 kernel built in-image from the
+> **in-repo `w4a8_fp8_wmma/` source** + a surgical `moe_wna16` patch. Run via `docker-compose.yml`
+> (the only compose; `--profile serve` / `--profile single`). The wheel-based from-source
+> Dockerfiles have been **retired** — the base image now provides vLLM.
 
 ## What lives where
 
 | If you want to change… | Edit it… |
 |---|---|
-| **the combined image (canonical)** | **`Dockerfile.combined`, `docker-compose.combined.yml`** |
+| **the combined image (the stack)** | **`Dockerfile.combined`, `docker-compose.yml`** |
 | heterogeneous-TP (64:56 sharding) | `patches/het_tp.py` + `patches/het_tp_vllm.patch` — see `patches/HET_TP_HANDOFF.md` |
 | the WNA16-MoE `tp_size` source fix | applied surgically in `Dockerfile.combined` (sed) |
-| the W4A8-FP8-WMMA kernel | canonical csrc (`vllm-rocm714-gfx1250/.../w4a8_fp8_wmma`), via build-context |
-| *(legacy)* the wheel image / serving | `Dockerfile`, `Dockerfile.fromsource`, `docker-compose.yml` |
-| the kernels/engine themselves (vllm / aiter / flash-attention) | **not here** — see "Upstream" below |
+| the W4A8-FP8-WMMA kernel | **in-repo `w4a8_fp8_wmma/`** (the single source of truth; built in-image) |
+| the kernels/engine themselves (vllm / aiter / flash-attention) | **not here** — from the base image, see "Upstream" below |
 
-The three wheels are built from **separate forks**, not from this repo:
-`patcarter883/vllm-gfx1201`, `patcarter883/aiter-gfx1201`,
-`patcarter883/flash-attention-gfx1201` (each on a `gfx1201` branch). A change to a
-kernel or to vLLM core goes there; this repo only *consumes* the resulting wheels
-(via a GitHub Release) and bakes the small source patches.
+vLLM core, attention, aiter and flash-attention come from the **base image**
+(`tcclaviger/vllm22:dev`), not from this repo. A change to vLLM core or attention goes to the
+base image / its upstreams; this repo layers the W4A8 kernel and the small source patches on
+top. (Historically these shipped as three `patcarter883/*-gfx1201` wheels — see DIARY Act I.)
 
 ## The one hard rule: ABI
 
-Everything here is pinned to **gfx1201 + Python 3.12 + torch 2.10 + ROCm 7.14**
-(the `rocm/vllm-dev:nightly-therock714` base). Native artifacts built against any
+Everything is pinned to the combined base **`tcclaviger/vllm22:dev`** — gfx1201 +
+Python 3.12 + torch 2.10 + ROCm 7.2.1 + vLLM 0.22.69. Native artifacts built against any
 other torch/arch will fail to load (`ImportError: undefined symbol _ZN3c10...`).
 Consequences for contributors:
 
-- **Never commit a prebuilt `.so`/`.whl`.** Wheels live in a GitHub Release; the
-  W4A8 kernel is compiled *inside* the image. `.gitignore` already blocks them.
-- If you bump the base image or any pinned version, you must rebuild **all three
-  wheels** from the forks and the W4A8 kernel — they are not independent.
+- **Never commit a prebuilt `.so`.** The W4A8 kernel is compiled *inside* the image from
+  `w4a8_fp8_wmma/`; `.gitignore` already blocks build output.
+- If you bump the base image or any pinned version, the in-image build rebuilds the W4A8
+  kernel against it automatically — but verify the ABI import check still passes.
 
 ## Dev workflow
 
@@ -47,11 +45,10 @@ Consequences for contributors:
 2. **Validate compose** for any `docker-compose*.yml` / `Dockerfile*` change:
    ```bash
    docker compose config -q
-   docker compose -f docker-compose.yml -f docker-compose.fromsource.yml config -q
    ```
 3. **Build + smoke** on real gfx1201 hardware when you touch the image or runtime:
    ```bash
-   docker compose --profile tp2-baseline up --build
+   docker compose --profile serve up --build      # TP=2 (or --profile single for 1 GPU)
    ./scripts/smoke.sh            # /v1/models + one completion
    ```
    The first boot pays the 15–30 min cold Triton compile (see DIARY "Act II").

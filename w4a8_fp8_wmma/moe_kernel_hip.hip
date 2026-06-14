@@ -42,7 +42,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <torch/extension.h>
-#include <ATen/cuda/CUDAContext.h>
+#include <ATen/hip/HIPContext.h>
 
 namespace w4a8_fp8_moe {
 
@@ -721,11 +721,11 @@ static void run_moe_gemm(
     const int K = x.size(1);
     const int group_size = K / scales.size(2);
     const int P = sorted_token_ids.size(0);
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    hipStream_t stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
 
     auto x_fp8 = at::empty({T, K}, x.options().dtype(at::kByte));
     auto act_scales = at::empty({T}, x.options().dtype(at::kFloat));
-    moe_compute_act_fp8_kernel<<<dim3(T), dim3(ACTQUANT_BLOCK), 0, stream>>>(
+   hipLaunchKernelGGL(( moe_compute_act_fp8_kernel), dim3(dim3(T)), dim3(dim3(ACTQUANT_BLOCK)), 0, stream, 
         reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),
         x_fp8.data_ptr<unsigned char>(), act_scales.data_ptr<float>(), T, K);
 
@@ -757,13 +757,13 @@ static void run_moe_gemm(
         const size_t smem5 = (size_t)(block_m + bn) * (group_size + LDS_PAD);
         const size_t smem6 = (size_t)bn * (group_size + LDS_PAD) * gt6;  // B only, gtile groups
         if (version == 6) {
-            #define V6_LAUNCH(BN_T, SM) moe_gemm_v6_kernel<SCATTER, BN_T><<<grid, block, SM, stream>>>( \
+            #define V6_LAUNCH(BN_T, SM)hipLaunchKernelGGL(( moe_gemm_v6_kernel<SCATTER, BN_T>), dim3(grid), dim3(block), SM, stream,  \
                 xf, asc, wq, wsc, wz, sti, eid, ntp, out, T, N, K, group_size, \
                 top_k, block_m, num_valid_tokens, output_scatter, topk_weights, out_top_k, gt6)
             if (bn == 128) V6_LAUNCH(128, smem6); else V6_LAUNCH(MV5_BN, smem6);
             #undef V6_LAUNCH
         } else {
-            #define V5_LAUNCH(BN_T, SM) moe_gemm_v5_kernel<SCATTER, BN_T><<<grid, block, SM, stream>>>( \
+            #define V5_LAUNCH(BN_T, SM)hipLaunchKernelGGL(( moe_gemm_v5_kernel<SCATTER, BN_T>), dim3(grid), dim3(block), SM, stream,  \
                 xf, asc, wq, wsc, wz, sti, eid, ntp, out, T, N, K, group_size, \
                 top_k, block_m, num_valid_tokens, output_scatter, topk_weights, out_top_k)
             if (bn == 128) V5_LAUNCH(128, smem5); else V5_LAUNCH(MV5_BN, smem5);
@@ -800,8 +800,8 @@ static void run_moe_gemm(
         const int per_block = nw * cols;
         dim3 grid((N + per_block - 1) / per_block, P / block_m);
         const size_t smem7 = (size_t)mreal_cap * bk;
-        #define GEMV7(NW, MM, CO) moe_gemv_v7_kernel<SCATTER, NW, MM, CO> \
-            <<<grid, dim3(NW * 32), smem7, stream>>>( \
+        #define GEMV7(NW, MM, CO)hipLaunchKernelGGL(( moe_gemv_v7_kernel<SCATTER, NW, MM, CO>) \
+            , dim3(grid), dim3(dim3(NW * 32)), smem7, stream,  \
             xf, asc, wq, wsc, wz, sti, eid, ntp, out, T, N, K, group_size, \
             top_k, block_m, num_valid_tokens, output_scatter, topk_weights, \
             out_top_k, bk)
@@ -828,7 +828,7 @@ static void run_moe_gemm(
     } else {
         dim3 block(MV0_BN, MV0_BM);
         dim3 grid((N + MV0_BN - 1) / MV0_BN, (P + MV0_BM - 1) / MV0_BM);
-        moe_gemm_v0_kernel<SCATTER><<<grid, block, 0, stream>>>(
+       hipLaunchKernelGGL(( moe_gemm_v0_kernel<SCATTER>), dim3(grid), dim3(block), 0, stream, 
             xf, asc, wq, wsc, wz, sti, eid, ntp, out, T, N, K, group_size,
             top_k, block_m, num_valid_tokens, output_scatter, topk_weights,
             out_top_k);
@@ -963,17 +963,17 @@ void launch_moe_gather_reduce_gfx1201(
     const int N = out2.size(1);
     const int M = out.size(0);
     const int M_tk = M * (int)top_k;
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    hipStream_t stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
 
     auto slot_to_row = at::full({M_tk}, -1, out2.options().dtype(at::kInt));
-    moe_build_inverse_map_kernel<<<dim3((P + 255) / 256), dim3(256), 0, stream>>>(
+   hipLaunchKernelGGL(( moe_build_inverse_map_kernel), dim3(dim3((P + 255) / 256)), dim3(dim3(256)), 0, stream, 
         sorted_token_ids.data_ptr<int>(),
         num_tokens_post_padded.data_ptr<int>(),
         slot_to_row.data_ptr<int>(), P, M_tk);
 
     constexpr int TPB = 256;
     dim3 grid((N + TPB - 1) / TPB, M);
-    moe_gather_reduce_kernel<<<grid, dim3(TPB), 0, stream>>>(
+   hipLaunchKernelGGL(( moe_gather_reduce_kernel), dim3(grid), dim3(dim3(TPB)), 0, stream, 
         reinterpret_cast<const __half*>(out2.data_ptr<at::Half>()),
         slot_to_row.data_ptr<int>(),
         topk_weights.data_ptr<float>(),

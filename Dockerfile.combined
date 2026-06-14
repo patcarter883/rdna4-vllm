@@ -10,16 +10,14 @@
 #   our layer   -> the W4A8 dense (v5/v10/v11) + grouped-MoE (v6) FP8-WMMA kernel,
 #                  built in-image so its ABI matches the base's torch (cp312).
 #
-# SOURCE OF TRUTH: the kernel is NOT copied into this repo (a stale copy here is exactly
-# what bit us — adapter calling v10/v11 against a v5-only .so). It is pulled at build time
-# from the canonical csrc via a named BuildKit build-context `w4a8_src`, so the build always
-# tracks the live kernel. Build:
+# SOURCE OF TRUTH: the W4A8 kernel now lives IN this repo at w4a8_fp8_wmma/ — the single
+# canonical copy (see memory: w4a8-single-source-of-truth). It is COPYed straight from the repo
+# and (re)built in-image for gfx1201 / ROCm-7.2.1, so the .so always matches the base's torch.
+# Build (no GPU needed — the HIP kernel cross-compiles):
 #
-#   docker build -f Dockerfile.combined -t vllm22-w4a8:combined \
-#     --build-context w4a8_src=/home/pat/code/vllm-rocm714-gfx1250/vllm/csrc/quantization/w4a8_fp8_wmma .
+#   docker build -f Dockerfile.combined -t vllm22-w4a8:combined .
 #
-# (docker-compose.combined.yml wires this via `additional_contexts`.) No GPU needed — the HIP
-# kernel cross-compiles for gfx1201.
+# (docker-compose.yml builds it by default.)
 #
 # Run: the W4A8 kernel auto-engages via the vllm.general_plugins entry point in every
 # EngineCore worker; disable at runtime (no rebuild) with VLLM_ROCM_USE_W4A8_FP8_WMMA=0.
@@ -34,13 +32,13 @@ ENV ROCM_HOME=/opt/rocm-7.2.1 \
     GPU_ARCHS=${GPU_ARCHS} \
     MAX_JOBS=8
 
-# --- 1. Build + install the W4A8 kernel from the CANONICAL source (build-context) ---
-# `w4a8_src` is a named build-context (not a repo path) -> single source of truth, no drift.
-# Clean any host build/ + *.so first (the canonical tree carries a gfx1250/ROCm-7.14 _C.so that
-# must NOT be reused — we rebuild for gfx1201 / ROCm-7.2.1). ld.lld lives under the system ROCm
-# llvm bin; GPU_ARCHS keeps the offload list off the display iGPU. The source tree is removed
-# after install so the import check resolves the INSTALLED package (sys.path source-shadow trap).
-COPY --from=w4a8_src . /opt/w4a8_fp8_wmma
+# --- 1. Build + install the W4A8 kernel from the in-repo source ---
+# w4a8_fp8_wmma/ is the single canonical copy. Clean any stray build/ + *.so first
+# (.dockerignore already excludes them, but be defensive — never reuse a host .so; we rebuild
+# for gfx1201 / ROCm-7.2.1). ld.lld lives under the system ROCm llvm bin; GPU_ARCHS keeps the
+# offload list off the display iGPU. The source tree is removed after install so the import
+# check resolves the INSTALLED package (sys.path source-shadow trap).
+COPY w4a8_fp8_wmma/ /opt/w4a8_fp8_wmma
 RUN set -eu; \
     . /app/.venv/bin/activate; \
     export PATH="/opt/rocm-7.2.1/lib/llvm/bin:/opt/rocm-7.2.1/bin:${PATH}"; \
@@ -70,7 +68,7 @@ RUN set -eu; \
 # at the all-reduce barrier (the rank1 COMM=61% sync bubble). Gated OFF by default; lights up
 # once the het-TP agent drops the re-targeted (vLLM 0.22.69!) source diff into
 # patches/het_tp_vllm.patch. See patches/HET_TP_HANDOFF.md. Build: --build-arg WITH_HET_TP=1;
-# runtime needs VLLM_TP_CU_WEIGHTS="64,56" (docker-compose.combined.yml).
+# runtime needs VLLM_TP_CU_WEIGHTS="64,56" (docker-compose.yml).
 ARG WITH_HET_TP=0
 COPY patches/het_tp.py patches/het_tp_vllm.patch /tmp/hettp/
 RUN set -eu; \

@@ -3,9 +3,10 @@
 Builds a Python extension `w4a8_fp8_wmma._C` exposing
 `torch.ops.w4a8_fp8_wmma.mmq_fp8_gemm`.
 
-Usage (on the gfx1201 host, with the TheRock build env active):
+Usage (on the gfx1201 host, with the TheRock build env active). This package is the
+single source of truth — it lives in the vllm-gfx1201 repo; iterate here directly:
     source /home/pat/code/vllm-rocm714-gfx1250/activate-build-env.sh
-    cd vllm/csrc/quantization/w4a8_fp8_wmma
+    cd /home/pat/code/vllm-gfx1201/w4a8_fp8_wmma
     python setup.py build_ext --inplace
     python test_correctness.py
 
@@ -42,7 +43,7 @@ setup(
         "v0 scalar fp8 reference; v1 WMMA is on-device work-in-progress."
     ),
     packages=find_packages(),
-    package_data={"w4a8_fp8_wmma": ["crossover_cache.json"]},
+    package_data={"w4a8_fp8_wmma": ["crossover_cache.json", "moe_crossover_cache.json"]},
     include_package_data=True,
     ext_modules=[
         CUDAExtension(

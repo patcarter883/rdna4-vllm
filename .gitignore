@@ -16,3 +16,12 @@ w4a8_fp8_wmma/**/*.so
 w4a8_fp8_wmma/**/*.o
 **/__pycache__/
 *.egg-info/
+
+# profiling sweep artifacts (traces are large; keep scripts, prune traces)
+profiling/triton-cache/
+profiling/**/cells/
+profiling/**/*.pt.trace.json.gz
+
+
+.triton-cache-combined/
+.triton-cache-old/

@@ -34,7 +34,7 @@ approved plan at `~/.claude/plans/while-this-project-is-greedy-stroustrup.md`.
 
 ```bash
 source /home/pat/code/vllm-rocm714-gfx1250/activate-build-env.sh   # sets GPU_ARCHS=gfx1201, ROCM_PATH
-cd /home/pat/code/vllm-rocm714-gfx1250/vllm/csrc/quantization/w4a8_fp8_wmma
+cd /home/pat/code/vllm-gfx1201/w4a8_fp8_wmma                       # the source of truth (in-repo)
 python setup.py build_ext --inplace
 python test_correctness.py        # exercises v0 on gfx1201
 ```

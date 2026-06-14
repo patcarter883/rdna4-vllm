@@ -36,6 +36,7 @@
 #undef __HIP_NO_HALF_CONVERSIONS__
 #undef __HIP_NO_HALF_OPERATORS__
 
+#include <cstdlib>
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <torch/extension.h>
@@ -560,6 +561,7 @@ __global__ void __launch_bounds__(V2_NWARPS * 32) mmq_fp8_gemm_kernel_v4(
 // ============================================================
 using v2i_t = int __attribute__((ext_vector_type(2)));
 using v8f_t = float __attribute__((ext_vector_type(8)));
+using v8h_t = _Float16 __attribute__((ext_vector_type(8)));   // f16 WMMA operand
 
 __global__ void __launch_bounds__(V2_NWARPS * 32) mmq_fp8_gemm_kernel_v5(
     const unsigned char* __restrict__ x_fp8,
@@ -688,6 +690,1679 @@ __global__ void __launch_bounds__(V2_NWARPS * 32) mmq_fp8_gemm_kernel_v5(
     }
 }
 
+// ============================================================
+// v6: K-EXTENSION (AMD RDNA4 WMMA guide part 2, §3 "Extend the K dimension").
+// Each lane loads its operands for TWO consecutive K-subtiles with a SINGLE
+// b128 (int4 / v4i_t = 16 fp8) LDS read, then issues TWO back-to-back WMMAs.
+// Halves the number of LDS load instructions per WMMA vs v5's b64-per-subtile,
+// and hands the scheduler two independent MMAs per load for ILP.
+//
+// The catch: a single b128 must contain THIS lane's 8 fp8 for subtile 2*kp AND
+// its 8 fp8 for subtile 2*kp+1 contiguously. v5's plain K-major layout puts a
+// full subtile (all 16 k of two lanes) in 16 contiguous bytes, which is the
+// WRONG packing. So v6 stores each 32-wide K block under a permutation:
+//   perm(k) within a 32-block: p = (kb&8 ? 16:0) + (kb>>4)*8 + (kb&7),  kb=k&31
+// which lays the block out as chunks [k0:8][k16:24][k8:16][k24:32]. Then a
+// khalf=0 lane's first 16 bytes = {subtile0 lo, subtile1 lo} and a khalf=8
+// lane's = {subtile0 hi, subtile1 hi} -- exactly the two operands it needs.
+// The loaded bytes are BIT-IDENTICAL to what v5 reads, so numerics match v5.
+//
+// Dynamic LDS (extern __shared__, 16B-aligned) sized for the actual (BK+pad) so
+// the b128 row stride LDSBK is a multiple of 16 (required for ds_read_b128) and
+// the pad is sweepable at launch (env VLLM_W4A8_V6_PAD, must be a multiple of
+// 16). Requires group_size % 32 == 0 (k_sub even); else launcher falls to v5.
+// ============================================================
+using v4i_t = int __attribute__((ext_vector_type(4)));
+using v2f_t = float __attribute__((ext_vector_type(2)));
+
+__device__ __forceinline__ int v6_permk(int k) {
+    const int blk = k >> 5;      // which 32-wide K block
+    const int kb = k & 31;       // k within the block
+    return blk * 32 + ((kb & 8) ? 16 : 0) + ((kb >> 4) << 3) + (kb & 7);
+}
+
+__global__ void __launch_bounds__(V2_NWARPS * 32) mmq_fp8_gemm_kernel_v6(
+    const unsigned char* __restrict__ x_fp8,
+    const float*         __restrict__ act_scales,
+    const int*           __restrict__ w_packed,
+    const __half*        __restrict__ w_scales,
+    const int*           __restrict__ w_zeros_packed,
+    __half*              __restrict__ out,
+    int M, int N, int K, int group_size, int lds_pad) {
+
+    const int block_m = blockIdx.y * V2_BM;
+    const int block_n = blockIdx.x * V2_BN;
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+    const int lrow = lane & 15;
+    const int hflag = lane >> 4;          // 0 or 1 (which K-half this lane owns)
+    const int frag_col = lane & 15;
+    const int frag_row0 = (lane >> 4) * 8;
+
+    const int BK = group_size;
+    const int num_k_groups = K / BK;
+    const int packed_per_row = K / PACK_FACTOR;
+    const int k_sub = BK / WMMA_DIM;      // even (BK % 32 == 0)
+    const int npair = k_sub >> 1;         // b128 loads per group
+    const int LDSBK = BK + lds_pad;       // multiple of 16
+
+    extern __shared__ __attribute__((aligned(16))) unsigned char v6_smem[];
+    unsigned char* A_tile = v6_smem;
+    unsigned char* B_tile = v6_smem + V2_BM * LDSBK;
+
+    float running[V2_NFRAG][8];
+    #pragma unroll
+    for (int f = 0; f < V2_NFRAG; ++f)
+        #pragma unroll
+        for (int e = 0; e < 8; ++e) running[f][e] = 0.0f;
+
+    for (int g = 0; g < num_k_groups; ++g) {
+        const int k0 = g * BK;
+
+        // ---- stage activations: uint32 (4 fp8) coalesced loads, permuted dst ----
+        for (int idx = tid * 4; idx < V2_BM * BK; idx += (V2_NWARPS * 32) * 4) {
+            const int r = idx / BK, k = idx % BK, am = block_m + r;
+            unsigned int v = 0u;
+            if (am < M)
+                v = *reinterpret_cast<const unsigned int*>(&x_fp8[am * K + k0 + k]);
+            *reinterpret_cast<unsigned int*>(&A_tile[r * LDSBK + v6_permk(k)]) = v;
+        }
+        // ---- stage weights: expand int4 -> fp8, 8 per chunk, permuted dst ----
+        const int njobs = V2_BN * (BK / PACK_FACTOR);
+        for (int j = tid; j < njobs; j += V2_NWARPS * 32) {
+            const int n = j / (BK / PACK_FACTOR), k8 = j % (BK / PACK_FACTOR);
+            const int an = block_n + n;
+            int word = 0, zp = 8;
+            if (an < N) {
+                word = w_packed[an * packed_per_row + (k0 / PACK_FACTOR) + k8];
+                if (w_zeros_packed != nullptr) {
+                    const int pk = w_zeros_packed[(an / 8) * num_k_groups + g];
+                    zp = (pk >> ((an % 8) * 4)) & 0xF;
+                }
+            }
+            unsigned char* dst = &B_tile[n * LDSBK + v6_permk(k8 * PACK_FACTOR)];
+            #pragma unroll
+            for (int jj = 0; jj < PACK_FACTOR; ++jj)
+                dst[jj] = (an < N)
+                    ? int4_signed_to_e4m3(((word >> (jj * 4)) & 0xF) - zp) : 0;
+        }
+        __syncthreads();
+
+        v8f_t acc[V2_NFRAG];
+        #pragma unroll
+        for (int f = 0; f < V2_NFRAG; ++f) acc[f] = v8f_t{0, 0, 0, 0, 0, 0, 0, 0};
+
+        // hflag selects bytes [0,16) (khalf=0) or [16,32) (khalf=8) of each block.
+        const int a_base = (warp_id * WMMA_DIM + lrow) * LDSBK + hflag * 16;
+        const int b_base = lrow * LDSBK + hflag * 16;
+
+        // 2-deep pipeline at the K-PAIR granularity: prefetch the next pair's
+        // b128 operands while the current pair's two WMMAs run.
+        v4i_t a_cur = *reinterpret_cast<const v4i_t*>(&A_tile[a_base]);
+        v4i_t b_cur[V2_NFRAG];
+        #pragma unroll
+        for (int f = 0; f < V2_NFRAG; ++f)
+            b_cur[f] = *reinterpret_cast<const v4i_t*>(
+                &B_tile[b_base + f * WMMA_DIM * LDSBK]);
+
+        for (int kp = 0; kp < npair; ++kp) {
+            v4i_t a_nx;
+            v4i_t b_nx[V2_NFRAG];
+            if (kp + 1 < npair) {
+                const int off = (kp + 1) * 32;
+                a_nx = *reinterpret_cast<const v4i_t*>(&A_tile[a_base + off]);
+                #pragma unroll
+                for (int f = 0; f < V2_NFRAG; ++f)
+                    b_nx[f] = *reinterpret_cast<const v4i_t*>(
+                        &B_tile[b_base + f * WMMA_DIM * LDSBK + off]);
+            }
+            // split each b128 into its two K-subtile (b64) operands.
+            const v2i_t a_lo = v2i_t{a_cur.x, a_cur.y};
+            const v2i_t a_hi = v2i_t{a_cur.z, a_cur.w};
+            #pragma unroll
+            for (int f = 0; f < V2_NFRAG; ++f) {
+                const v2i_t b_lo = v2i_t{b_cur[f].x, b_cur[f].y};
+                const v2i_t b_hi = v2i_t{b_cur[f].z, b_cur[f].w};
+                acc[f] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(
+                    a_lo, b_lo, acc[f]);
+                acc[f] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(
+                    a_hi, b_hi, acc[f]);
+            }
+            a_cur = a_nx;
+            #pragma unroll
+            for (int f = 0; f < V2_NFRAG; ++f) b_cur[f] = b_nx[f];
+        }
+
+        #pragma unroll
+        for (int f = 0; f < V2_NFRAG; ++f) {
+            const int abs_n = block_n + f * WMMA_DIM + frag_col;
+            const float wsc = (abs_n < N)
+                ? __half2float(w_scales[abs_n * num_k_groups + g]) : 0.0f;
+            #pragma unroll
+            for (int e = 0; e < 8; ++e) running[f][e] += acc[f][e] * wsc;
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        const int abs_m = block_m + warp_id * WMMA_DIM + frag_row0 + e;
+        if (abs_m >= M) continue;
+        const float asc = act_scales[abs_m];
+        #pragma unroll
+        for (int f = 0; f < V2_NFRAG; ++f) {
+            const int abs_n = block_n + f * WMMA_DIM + frag_col;
+            if (abs_n < N) out[abs_m * N + abs_n] = __float2half(running[f][e] * asc);
+        }
+    }
+}
+
+// ============================================================
+// v7: v5's algorithm (raw b64 K-major loads, kt-pipelined) but with a
+// TEMPLATED, SMALLER tile + dynamic LDS to raise occupancy. v5 runs BM=256/4
+// warps/~46KB LDS = 1 block/CU = 4 waves/CU (~12% occupancy, ~= our 12%-of-peak
+// throughput). A smaller tile shrinks LDS so multiple blocks co-reside per CU,
+// giving the scheduler more waves to hide the __syncthreads + LDS-read latency
+// that v6 proved is the real ceiling (load width was not). Tile chosen at launch
+// via VLLM_W4A8_V7_BM (64/128/256); BN fixed at 64.
+// ============================================================
+template <int BM, int BN, int NWARPS, int BKT>
+__global__ void __launch_bounds__(NWARPS * 32) mmq_fp8_gemm_kernel_v7(
+    const unsigned char* __restrict__ x_fp8,
+    const float*         __restrict__ act_scales,
+    const int*           __restrict__ w_packed,
+    const __half*        __restrict__ w_scales,
+    const int*           __restrict__ w_zeros_packed,
+    __half*              __restrict__ out,
+    int M, int N, int K, int group_size, int diag, int swiz) {
+
+    // diag (env VLLM_W4A8_V7_DIAG, perf breakdown only; 0 = normal/correct):
+    //   bit0(1)=skip WMMA, bit1(2)=skip global loads, bit2(4)=skip LDS writes.
+    const bool DIAG_NO_WMMA  = diag & 1;
+    const bool DIAG_NO_GLOBAL = diag & 2;
+    const bool DIAG_NO_STORE = diag & 4;
+    const bool DIAG_NO_LDSREAD = diag & 8;  // skip per-kt LDS operand reloads
+    const bool DIAG_NO_SCALE = diag & 16;   // skip per-group w_scale global read
+    constexpr int NFRAG = BN / WMMA_DIM;
+    constexpr int LDS_PAD = 8;
+    // swiz: map M to the fast (x) grid dim so consecutively-scheduled blocks
+    // share the same block_n weight slab -> it stays resident in L2/MALL across
+    // the M-blocks instead of being re-streamed from VRAM (cuts redundant weight
+    // traffic at large K). swiz=0 keeps N on x (original).
+    const int block_m = (swiz ? blockIdx.x : blockIdx.y) * BM;
+    const int block_n = (swiz ? blockIdx.y : blockIdx.x) * BN;
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+    const int lrow = lane & 15;
+    const int khalf = (lane >> 4) * 8;
+    const int frag_col = lane & 15;
+    const int frag_row0 = (lane >> 4) * 8;
+
+    // BKT>0 makes the group size a compile-time constant so idx/BK & idx%BK in
+    // the staging loops lower to shift/mask instead of runtime integer div/mod.
+    const int BK = BKT ? BKT : group_size;
+    const int num_k_groups = K / BK;
+    const int packed_per_row = K / PACK_FACTOR;
+    const int k_sub = BK / WMMA_DIM;
+    const int LDSBK = BK + LDS_PAD;
+
+    extern __shared__ __attribute__((aligned(16))) unsigned char v7_smem[];
+    unsigned char* A_tile = v7_smem;
+    unsigned char* B_tile = v7_smem + BM * LDSBK;
+    // per-group weight scales staged once (cooperatively) into LDS, instead of
+    // each of the NWARPS warps re-reading the same uncoalesced fp16 scales.
+    __shared__ float v7_wsc[BN];
+
+    float running[NFRAG][8];
+    #pragma unroll
+    for (int f = 0; f < NFRAG; ++f)
+        #pragma unroll
+        for (int e = 0; e < 8; ++e) running[f][e] = 0.0f;
+
+    for (int g = 0; g < num_k_groups; ++g) {
+        const int k0 = g * BK;
+
+        for (int idx = tid * 4; idx < BM * BK; idx += (NWARPS * 32) * 4) {
+            const int r = idx / BK, k = idx % BK, am = block_m + r;
+            unsigned int v = 0u;
+            if (am < M && !DIAG_NO_GLOBAL)
+                v = *reinterpret_cast<const unsigned int*>(&x_fp8[am * K + k0 + k]);
+            if (!DIAG_NO_STORE)
+                *reinterpret_cast<unsigned int*>(&A_tile[r * LDSBK + k]) = v;
+        }
+        const int njobs = BN * (BK / PACK_FACTOR);
+        for (int j = tid; j < njobs; j += NWARPS * 32) {
+            const int n = j / (BK / PACK_FACTOR), k8 = j % (BK / PACK_FACTOR);
+            const int an = block_n + n;
+            int word = 0, zp = 8;
+            if (an < N && !DIAG_NO_GLOBAL) {
+                word = w_packed[an * packed_per_row + (k0 / PACK_FACTOR) + k8];
+                if (w_zeros_packed != nullptr) {
+                    const int pk = w_zeros_packed[(an / 8) * num_k_groups + g];
+                    zp = (pk >> ((an % 8) * 4)) & 0xF;
+                }
+            }
+            if (!DIAG_NO_STORE) {
+                unsigned char* dst = &B_tile[n * LDSBK + k8 * PACK_FACTOR];
+                #pragma unroll
+                for (int jj = 0; jj < PACK_FACTOR; ++jj)
+                    dst[jj] = (an < N)
+                        ? int4_signed_to_e4m3(((word >> (jj * 4)) & 0xF) - zp) : 0;
+            }
+        }
+        // stage this group's BN weight scales into LDS once (cooperative).
+        if (!DIAG_NO_SCALE)
+            for (int i = tid; i < BN; i += NWARPS * 32) {
+                const int an = block_n + i;
+                v7_wsc[i] = (an < N)
+                    ? __half2float(w_scales[an * num_k_groups + g]) : 0.0f;
+            }
+        __syncthreads();
+
+        v8f_t acc[NFRAG];
+        #pragma unroll
+        for (int f = 0; f < NFRAG; ++f) acc[f] = v8f_t{0, 0, 0, 0, 0, 0, 0, 0};
+
+        const int a_base = (warp_id * WMMA_DIM + lrow) * LDSBK + khalf;
+        const int b_base = lrow * LDSBK + khalf;
+        v2i_t a_cur = *reinterpret_cast<const v2i_t*>(&A_tile[a_base]);
+        v2i_t b_cur[NFRAG];
+        #pragma unroll
+        for (int f = 0; f < NFRAG; ++f)
+            b_cur[f] = *reinterpret_cast<const v2i_t*>(&B_tile[b_base + f * WMMA_DIM * LDSBK]);
+
+        for (int kt = 0; kt < k_sub; ++kt) {
+            v2i_t a_nx;
+            v2i_t b_nx[NFRAG];
+            if (!DIAG_NO_LDSREAD && kt + 1 < k_sub) {
+                const int ko = (kt + 1) * WMMA_DIM;
+                a_nx = *reinterpret_cast<const v2i_t*>(&A_tile[a_base + ko]);
+                #pragma unroll
+                for (int f = 0; f < NFRAG; ++f)
+                    b_nx[f] = *reinterpret_cast<const v2i_t*>(
+                        &B_tile[b_base + f * WMMA_DIM * LDSBK + ko]);
+            }
+            if (!DIAG_NO_WMMA) {
+                #pragma unroll
+                for (int f = 0; f < NFRAG; ++f)
+                    acc[f] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(
+                        a_cur, b_cur[f], acc[f]);
+            }
+            if (!DIAG_NO_LDSREAD) {
+                a_cur = a_nx;
+                #pragma unroll
+                for (int f = 0; f < NFRAG; ++f) b_cur[f] = b_nx[f];
+            }
+        }
+
+        #pragma unroll
+        for (int f = 0; f < NFRAG; ++f) {
+            const float wsc = DIAG_NO_SCALE ? 1.0f : v7_wsc[f * WMMA_DIM + frag_col];
+            #pragma unroll
+            for (int e = 0; e < 8; ++e) running[f][e] += acc[f][e] * wsc;
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        const int abs_m = block_m + warp_id * WMMA_DIM + frag_row0 + e;
+        if (abs_m >= M) continue;
+        const float asc = act_scales[abs_m];
+        #pragma unroll
+        for (int f = 0; f < NFRAG; ++f) {
+            const int abs_n = block_n + f * WMMA_DIM + frag_col;
+            if (abs_n < N) out[abs_m * N + abs_n] = __float2half(running[f][e] * asc);
+        }
+    }
+}
+
+// ============================================================
+// v8: v7 tile (BN=128 => 8-acc ILP) + LDS DOUBLE-BUFFERING. The diag breakdown
+// showed WMMA compute is fully hidden and ~50% of time is the serial
+// stage->barrier->compute->barrier structure (+ ~29% global weight reads at
+// large K). v8 ping-pongs two LDS buffers so the next K-group's global load +
+// int4->fp8 expand overlaps the current group's compute, and uses ONE barrier
+// per group instead of two. Needs 2x LDS, so BM is capped (BM<=96 at BN=128,
+// G=128 to fit 64KB). Templated <BM,BN,NWARPS>; CFG via VLLM_W4A8_V8_CFG.
+// ============================================================
+template <int BM, int BN, int NWARPS>
+__global__ void __launch_bounds__(NWARPS * 32) mmq_fp8_gemm_kernel_v8(
+    const unsigned char* __restrict__ x_fp8,
+    const float*         __restrict__ act_scales,
+    const int*           __restrict__ w_packed,
+    const __half*        __restrict__ w_scales,
+    const int*           __restrict__ w_zeros_packed,
+    __half*              __restrict__ out,
+    int M, int N, int K, int group_size) {
+
+    constexpr int NFRAG = BN / WMMA_DIM;
+    constexpr int LDS_PAD = 8;
+    const int block_m = blockIdx.y * BM;
+    const int block_n = blockIdx.x * BN;
+    const int tid = threadIdx.x;
+    const int nthreads = NWARPS * 32;
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+    const int lrow = lane & 15;
+    const int khalf = (lane >> 4) * 8;
+    const int frag_col = lane & 15;
+    const int frag_row0 = (lane >> 4) * 8;
+
+    const int BK = group_size;
+    const int num_k_groups = K / BK;
+    const int packed_per_row = K / PACK_FACTOR;
+    const int k_sub = BK / WMMA_DIM;
+    const int LDSBK = BK + LDS_PAD;
+
+    extern __shared__ __attribute__((aligned(16))) unsigned char v8_smem[];
+    unsigned char* A_buf[2];
+    unsigned char* B_buf[2];
+    A_buf[0] = v8_smem;
+    A_buf[1] = A_buf[0] + BM * LDSBK;
+    B_buf[0] = A_buf[1] + BM * LDSBK;
+    B_buf[1] = B_buf[0] + BN * LDSBK;
+
+    // stage group g into buffer `buf`: A copy (uint32) + B int4->fp8 expand.
+    auto stage = [&](int g, int buf) {
+        const int k0 = g * BK;
+        unsigned char* At = A_buf[buf];
+        unsigned char* Bt = B_buf[buf];
+        for (int idx = tid * 4; idx < BM * BK; idx += nthreads * 4) {
+            const int r = idx / BK, k = idx % BK, am = block_m + r;
+            unsigned int v = 0u;
+            if (am < M)
+                v = *reinterpret_cast<const unsigned int*>(&x_fp8[am * K + k0 + k]);
+            *reinterpret_cast<unsigned int*>(&At[r * LDSBK + k]) = v;
+        }
+        const int njobs = BN * (BK / PACK_FACTOR);
+        for (int j = tid; j < njobs; j += nthreads) {
+            const int n = j / (BK / PACK_FACTOR), k8 = j % (BK / PACK_FACTOR);
+            const int an = block_n + n;
+            int word = 0, zp = 8;
+            if (an < N) {
+                word = w_packed[an * packed_per_row + (k0 / PACK_FACTOR) + k8];
+                if (w_zeros_packed != nullptr) {
+                    const int pk = w_zeros_packed[(an / 8) * num_k_groups + g];
+                    zp = (pk >> ((an % 8) * 4)) & 0xF;
+                }
+            }
+            unsigned char* dst = &Bt[n * LDSBK + k8 * PACK_FACTOR];
+            #pragma unroll
+            for (int jj = 0; jj < PACK_FACTOR; ++jj)
+                dst[jj] = (an < N)
+                    ? int4_signed_to_e4m3(((word >> (jj * 4)) & 0xF) - zp) : 0;
+        }
+    };
+
+    float running[NFRAG][8];
+    #pragma unroll
+    for (int f = 0; f < NFRAG; ++f)
+        #pragma unroll
+        for (int e = 0; e < 8; ++e) running[f][e] = 0.0f;
+
+    stage(0, 0);
+    __syncthreads();
+
+    const int a_base = (warp_id * WMMA_DIM + lrow) * LDSBK + khalf;
+    const int b_base = lrow * LDSBK + khalf;
+
+    for (int g = 0; g < num_k_groups; ++g) {
+        const int cur = g & 1;
+        // prefetch next group into the OTHER buffer; overlaps the compute below
+        // (different buffer, no barrier between) so global latency hides.
+        if (g + 1 < num_k_groups) stage(g + 1, (g + 1) & 1);
+
+        const unsigned char* At = A_buf[cur];
+        const unsigned char* Bt = B_buf[cur];
+        v8f_t acc[NFRAG];
+        #pragma unroll
+        for (int f = 0; f < NFRAG; ++f) acc[f] = v8f_t{0, 0, 0, 0, 0, 0, 0, 0};
+
+        v2i_t a_cur = *reinterpret_cast<const v2i_t*>(&At[a_base]);
+        v2i_t b_cur[NFRAG];
+        #pragma unroll
+        for (int f = 0; f < NFRAG; ++f)
+            b_cur[f] = *reinterpret_cast<const v2i_t*>(&Bt[b_base + f * WMMA_DIM * LDSBK]);
+
+        for (int kt = 0; kt < k_sub; ++kt) {
+            v2i_t a_nx;
+            v2i_t b_nx[NFRAG];
+            if (kt + 1 < k_sub) {
+                const int ko = (kt + 1) * WMMA_DIM;
+                a_nx = *reinterpret_cast<const v2i_t*>(&At[a_base + ko]);
+                #pragma unroll
+                for (int f = 0; f < NFRAG; ++f)
+                    b_nx[f] = *reinterpret_cast<const v2i_t*>(
+                        &Bt[b_base + f * WMMA_DIM * LDSBK + ko]);
+            }
+            #pragma unroll
+            for (int f = 0; f < NFRAG; ++f)
+                acc[f] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(
+                    a_cur, b_cur[f], acc[f]);
+            a_cur = a_nx;
+            #pragma unroll
+            for (int f = 0; f < NFRAG; ++f) b_cur[f] = b_nx[f];
+        }
+
+        #pragma unroll
+        for (int f = 0; f < NFRAG; ++f) {
+            const int abs_n = block_n + f * WMMA_DIM + frag_col;
+            const float wsc = (abs_n < N)
+                ? __half2float(w_scales[abs_n * num_k_groups + g]) : 0.0f;
+            #pragma unroll
+            for (int e = 0; e < 8; ++e) running[f][e] += acc[f][e] * wsc;
+        }
+        __syncthreads();  // stage(g+1) done + compute(g) reads done before reuse
+    }
+
+    #pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        const int abs_m = block_m + warp_id * WMMA_DIM + frag_row0 + e;
+        if (abs_m >= M) continue;
+        const float asc = act_scales[abs_m];
+        #pragma unroll
+        for (int f = 0; f < NFRAG; ++f) {
+            const int abs_n = block_n + f * WMMA_DIM + frag_col;
+            if (abs_n < N) out[abs_m * N + abs_n] = __float2half(running[f][e] * asc);
+        }
+    }
+}
+
+// ============================================================
+// v9: KEEP the winning BM=256/BN=128 tile (8-acc ILP) AND double-buffer, by
+// DECOUPLING the LDS staging depth from the quant group size. We stage BK_LDS
+// (=64 for g128) -deep chunks and ping-pong two buffers, so 2x LDS fits in 64KB
+// (vs the full-128-group double-buffer that didn't). This overlaps the next
+// chunk's global load + int4->fp8 expand with the current chunk's compute and
+// uses one barrier per chunk. The fp32 accumulator persists across the NCHUNK
+// chunks of a quant group; the per-group scale is applied at the group boundary.
+// Requires a compile-time group size (BKT in {32,128}); compile-time BK also
+// folds the staging div/mod to shifts. Templated <BM,BN,NWARPS,BKT>.
+// ============================================================
+template <int BM, int BN, int NWARPS, int BKT>
+__global__ void __launch_bounds__(NWARPS * 32) mmq_fp8_gemm_kernel_v9(
+    const unsigned char* __restrict__ x_fp8,
+    const float*         __restrict__ act_scales,
+    const int*           __restrict__ w_packed,
+    const __half*        __restrict__ w_scales,
+    const int*           __restrict__ w_zeros_packed,
+    __half*              __restrict__ out,
+    int M, int N, int K, int group_size) {
+
+    constexpr int NFRAG = BN / WMMA_DIM;
+    constexpr int LDS_PAD = 8;
+    constexpr int BK_LDS = (BKT >= 128) ? 64 : BKT;  // chunk depth
+    constexpr int NCHUNK = BKT / BK_LDS;             // chunks per quant group
+    constexpr int CK_SUB = BK_LDS / WMMA_DIM;        // WMMA subtiles per chunk
+    constexpr int LDSBK = BK_LDS + LDS_PAD;
+
+    const int block_m = blockIdx.y * BM;
+    const int block_n = blockIdx.x * BN;
+    const int tid = threadIdx.x;
+    const int nthreads = NWARPS * 32;
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+    const int lrow = lane & 15;
+    const int khalf = (lane >> 4) * 8;
+    const int frag_col = lane & 15;
+    const int frag_row0 = (lane >> 4) * 8;
+
+    const int num_k_groups = K / BKT;
+    const int packed_per_row = K / PACK_FACTOR;
+    const int total_chunks = K / BK_LDS;
+
+    extern __shared__ __attribute__((aligned(16))) unsigned char v9_smem[];
+    unsigned char* A_buf[2];
+    unsigned char* B_buf[2];
+    A_buf[0] = v9_smem;
+    A_buf[1] = A_buf[0] + BM * LDSBK;
+    B_buf[0] = A_buf[1] + BM * LDSBK;
+    B_buf[1] = B_buf[0] + BN * LDSBK;
+
+    // stage chunk c (BK_LDS columns at k0=c*BK_LDS) into buffer `buf`.
+    auto stage = [&](int c, int buf) {
+        const int k0 = c * BK_LDS;
+        const int g = c / NCHUNK;     // quant group (for zp)
+        unsigned char* At = A_buf[buf];
+        unsigned char* Bt = B_buf[buf];
+        for (int idx = tid * 4; idx < BM * BK_LDS; idx += nthreads * 4) {
+            const int r = idx / BK_LDS, k = idx % BK_LDS, am = block_m + r;
+            unsigned int v = 0u;
+            if (am < M)
+                v = *reinterpret_cast<const unsigned int*>(&x_fp8[am * K + k0 + k]);
+            *reinterpret_cast<unsigned int*>(&At[r * LDSBK + k]) = v;
+        }
+        const int njobs = BN * (BK_LDS / PACK_FACTOR);
+        for (int j = tid; j < njobs; j += nthreads) {
+            const int n = j / (BK_LDS / PACK_FACTOR), k8 = j % (BK_LDS / PACK_FACTOR);
+            const int an = block_n + n;
+            int word = 0, zp = 8;
+            if (an < N) {
+                word = w_packed[an * packed_per_row + (k0 / PACK_FACTOR) + k8];
+                if (w_zeros_packed != nullptr) {
+                    const int pk = w_zeros_packed[(an / 8) * num_k_groups + g];
+                    zp = (pk >> ((an % 8) * 4)) & 0xF;
+                }
+            }
+            unsigned char* dst = &Bt[n * LDSBK + k8 * PACK_FACTOR];
+            #pragma unroll
+            for (int jj = 0; jj < PACK_FACTOR; ++jj)
+                dst[jj] = (an < N)
+                    ? int4_signed_to_e4m3(((word >> (jj * 4)) & 0xF) - zp) : 0;
+        }
+    };
+
+    float running[NFRAG][8];
+    #pragma unroll
+    for (int f = 0; f < NFRAG; ++f)
+        #pragma unroll
+        for (int e = 0; e < 8; ++e) running[f][e] = 0.0f;
+
+    v8f_t acc[NFRAG];
+    #pragma unroll
+    for (int f = 0; f < NFRAG; ++f) acc[f] = v8f_t{0, 0, 0, 0, 0, 0, 0, 0};
+
+    const int a_base = (warp_id * WMMA_DIM + lrow) * LDSBK + khalf;
+    const int b_base = lrow * LDSBK + khalf;
+
+    stage(0, 0);
+    __syncthreads();
+
+    for (int c = 0; c < total_chunks; ++c) {
+        const int cur = c & 1;
+        if (c + 1 < total_chunks) stage(c + 1, (c + 1) & 1);
+
+        const unsigned char* At = A_buf[cur];
+        const unsigned char* Bt = B_buf[cur];
+        v2i_t a_cur = *reinterpret_cast<const v2i_t*>(&At[a_base]);
+        v2i_t b_cur[NFRAG];
+        #pragma unroll
+        for (int f = 0; f < NFRAG; ++f)
+            b_cur[f] = *reinterpret_cast<const v2i_t*>(&Bt[b_base + f * WMMA_DIM * LDSBK]);
+
+        #pragma unroll
+        for (int kt = 0; kt < CK_SUB; ++kt) {
+            v2i_t a_nx;
+            v2i_t b_nx[NFRAG];
+            if (kt + 1 < CK_SUB) {
+                const int ko = (kt + 1) * WMMA_DIM;
+                a_nx = *reinterpret_cast<const v2i_t*>(&At[a_base + ko]);
+                #pragma unroll
+                for (int f = 0; f < NFRAG; ++f)
+                    b_nx[f] = *reinterpret_cast<const v2i_t*>(
+                        &Bt[b_base + f * WMMA_DIM * LDSBK + ko]);
+            }
+            #pragma unroll
+            for (int f = 0; f < NFRAG; ++f)
+                acc[f] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(
+                    a_cur, b_cur[f], acc[f]);
+            a_cur = a_nx;
+            #pragma unroll
+            for (int f = 0; f < NFRAG; ++f) b_cur[f] = b_nx[f];
+        }
+
+        // quant-group boundary: apply per-group weight scale, reset accumulator.
+        if ((c + 1) % NCHUNK == 0) {
+            const int g = c / NCHUNK;
+            #pragma unroll
+            for (int f = 0; f < NFRAG; ++f) {
+                const int abs_n = block_n + f * WMMA_DIM + frag_col;
+                const float wsc = (abs_n < N)
+                    ? __half2float(w_scales[abs_n * num_k_groups + g]) : 0.0f;
+                #pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    running[f][e] += acc[f][e] * wsc;
+                    acc[f][e] = 0.0f;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        const int abs_m = block_m + warp_id * WMMA_DIM + frag_row0 + e;
+        if (abs_m >= M) continue;
+        const float asc = act_scales[abs_m];
+        #pragma unroll
+        for (int f = 0; f < NFRAG; ++f) {
+            const int abs_n = block_n + f * WMMA_DIM + frag_col;
+            if (abs_n < N) out[abs_m * N + abs_n] = __float2half(running[f][e] * asc);
+        }
+    }
+}
+
+// ============================================================
+// v10: get the (warp-private) activation A OUT of LDS via a warp-shuffle
+// transpose, so LDS holds B (weights) ONLY -> frees ~34KB, the prerequisite to
+// double-buffer B at the winning BM=256/BN=128 tile and kill the per-group
+// barrier serialization (the ~35% floor). A is loaded coalesced from global
+// (lane L -> row L/2, k-half L&1) then shuffled to the WMMA layout
+// (lane L wants row L&15, k-half (L>>4)*8): src lane = 2*(L&15) + (L>>4).
+// DB toggles B double-buffering. Step 1 (DB=false) validates the A-shuffle.
+// ============================================================
+template <int BM, int BN, int NWARPS, int BKT, bool DB>
+__global__ void __launch_bounds__(NWARPS * 32) mmq_fp8_gemm_kernel_v10(
+    const unsigned char* __restrict__ x_fp8,
+    const float*         __restrict__ act_scales,
+    const int*           __restrict__ w_packed,
+    const __half*        __restrict__ w_scales,
+    const int*           __restrict__ w_zeros_packed,
+    __half*              __restrict__ out,
+    int M, int N, int K, int group_size, int swiz) {
+
+    constexpr int NFRAG = BN / WMMA_DIM;
+    constexpr int LDS_PAD = 8;
+    const int block_m = (swiz ? blockIdx.x : blockIdx.y) * BM;
+    const int block_n = (swiz ? blockIdx.y : blockIdx.x) * BN;
+    const int tid = threadIdx.x;
+    const int nthreads = NWARPS * 32;
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+    const int lrow = lane & 15;
+    const int khalf = (lane >> 4) * 8;
+    const int frag_col = lane & 15;
+    const int frag_row0 = (lane >> 4) * 8;
+
+    const int BK = BKT ? BKT : group_size;
+    const int num_k_groups = K / BK;
+    const int packed_per_row = K / PACK_FACTOR;
+    const int k_sub = BK / WMMA_DIM;
+    const int LDSBK = BK + LDS_PAD;
+
+    extern __shared__ __attribute__((aligned(16))) unsigned char v10_smem[];
+    unsigned char* B_buf[2];
+    B_buf[0] = v10_smem;
+    B_buf[1] = v10_smem + (DB ? BN * LDSBK : 0);
+    __shared__ float v10_wsc[2][BN];
+
+    // coalesced global A load for this warp's 16 rows at K-offset k0+kt*16,
+    // then transpose to the WMMA fragment layout via warp shuffle.
+    const int a_row = block_m + warp_id * WMMA_DIM + (lane >> 1);
+    const int a_kh = (lane & 1) * 8;
+    const int a_shfl_src = 2 * (lane & 15) + (lane >> 4);
+    auto load_A = [&](int k0, int kt) -> v2i_t {
+        const int gk = k0 + kt * WMMA_DIM + a_kh;
+        v2i_t v = v2i_t{0, 0};
+        if (a_row < M)
+            v = *reinterpret_cast<const v2i_t*>(&x_fp8[(long)a_row * K + gk]);
+        v2i_t w;
+        w[0] = __shfl(v[0], a_shfl_src);
+        w[1] = __shfl(v[1], a_shfl_src);
+        return w;
+    };
+
+    auto stage_B = [&](int g, int buf) {
+        const int k0 = g * BK;
+        unsigned char* Bt = B_buf[buf];
+        const int njobs = BN * (BK / PACK_FACTOR);
+        for (int j = tid; j < njobs; j += nthreads) {
+            const int n = j / (BK / PACK_FACTOR), k8 = j % (BK / PACK_FACTOR);
+            const int an = block_n + n;
+            int word = 0, zp = 8;
+            if (an < N) {
+                word = w_packed[an * packed_per_row + (k0 / PACK_FACTOR) + k8];
+                if (w_zeros_packed != nullptr) {
+                    const int pk = w_zeros_packed[(an / 8) * num_k_groups + g];
+                    zp = (pk >> ((an % 8) * 4)) & 0xF;
+                }
+            }
+            unsigned char* dst = &Bt[n * LDSBK + k8 * PACK_FACTOR];
+            #pragma unroll
+            for (int jj = 0; jj < PACK_FACTOR; ++jj)
+                dst[jj] = (an < N)
+                    ? int4_signed_to_e4m3(((word >> (jj * 4)) & 0xF) - zp) : 0;
+        }
+        for (int i = tid; i < BN; i += nthreads) {
+            const int an = block_n + i;
+            v10_wsc[buf][i] = (an < N)
+                ? __half2float(w_scales[an * num_k_groups + g]) : 0.0f;
+        }
+    };
+
+    float running[NFRAG][8];
+    #pragma unroll
+    for (int f = 0; f < NFRAG; ++f)
+        #pragma unroll
+        for (int e = 0; e < 8; ++e) running[f][e] = 0.0f;
+
+    const int b_base = lrow * LDSBK + khalf;
+
+    stage_B(0, 0);
+    __syncthreads();
+
+    for (int g = 0; g < num_k_groups; ++g) {
+        const int cur = DB ? (g & 1) : 0;
+        if (DB && g + 1 < num_k_groups) stage_B(g + 1, (g + 1) & 1);
+        const int k0 = g * BK;
+        const unsigned char* Bt = B_buf[cur];
+
+        v8f_t acc[NFRAG];
+        #pragma unroll
+        for (int f = 0; f < NFRAG; ++f) acc[f] = v8f_t{0, 0, 0, 0, 0, 0, 0, 0};
+
+        v2i_t a_cur = load_A(k0, 0);
+        for (int kt = 0; kt < k_sub; ++kt) {
+            v2i_t a_nx;
+            if (kt + 1 < k_sub) a_nx = load_A(k0, kt + 1);
+            #pragma unroll
+            for (int f = 0; f < NFRAG; ++f) {
+                v2i_t b = *reinterpret_cast<const v2i_t*>(
+                    &Bt[b_base + f * WMMA_DIM * LDSBK + kt * WMMA_DIM]);
+                acc[f] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(
+                    a_cur, b, acc[f]);
+            }
+            a_cur = a_nx;
+        }
+
+        #pragma unroll
+        for (int f = 0; f < NFRAG; ++f) {
+            const float wsc = v10_wsc[cur][f * WMMA_DIM + frag_col];
+            #pragma unroll
+            for (int e = 0; e < 8; ++e) running[f][e] += acc[f][e] * wsc;
+        }
+        if (!DB) {
+            __syncthreads();
+            if (g + 1 < num_k_groups) { stage_B(g + 1, 0); __syncthreads(); }
+        } else {
+            __syncthreads();
+        }
+    }
+
+    #pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        const int abs_m = block_m + warp_id * WMMA_DIM + frag_row0 + e;
+        if (abs_m >= M) continue;
+        const float asc = act_scales[abs_m];
+        #pragma unroll
+        for (int f = 0; f < NFRAG; ++f) {
+            const int abs_n = block_n + f * WMMA_DIM + frag_col;
+            if (abs_n < N) out[abs_m * N + abs_n] = __float2half(running[f][e] * asc);
+        }
+    }
+}
+
+// ============================================================
+// v11: DECODE-specialised W4A8 GEMV for small M. No WMMA, no B-LDS, no barriers
+// -- it just STREAMS the weights coalesced and does the dot product, so it hits
+// memory bandwidth instead of paying the prefill tile machinery. One warp per
+// output column n: the 32 lanes stream w_packed[n] (its K/8 int32 row) in b128
+// chunks (v4i = 4 int32 = 32 fp8/lane), expand int4->fp8 in-register, multiply by
+// the staged activations, accumulate with the per-group weight scale. Activations
+// (M,K) fp8 are staged once into LDS (needs M*K <= ~64KB, i.e. small M). M
+// accumulators per lane; warp-reduce -> out[m][n]. Requires K % 1024 == 0 (warp
+// step = 32 lanes * 32 k) and group_size % 32 == 0.
+// ============================================================
+template <int NWARPS, int MMAX>
+__global__ void __launch_bounds__(NWARPS * 32) mmq_fp8_gemv_kernel_v11(
+    const unsigned char* __restrict__ x_fp8,    // (M, K)
+    const float*         __restrict__ act_scales,
+    const int*           __restrict__ w_packed, // (N, K/8)
+    const __half*        __restrict__ w_scales, // (N, K/g)
+    const int*           __restrict__ w_zeros,  // (N/8, K/g) or null
+    __half*              __restrict__ out,       // (M, N)
+    int M, int N, int K, int group_size, int BK) {  // BK: K-chunk staged in LDS
+
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+    const int n = blockIdx.x * NWARPS + warp_id;   // output column for this warp
+
+    const int num_groups = K / group_size;
+
+    // K-TILED: stage only (M, BK) fp8 into LDS per chunk and accumulate across
+    // chunks in registers, so LDS = M*BK (<=64KB) is independent of total K. This
+    // lifts the old M*K<=65536 cap that locked v11 out of large-K decode layers.
+    extern __shared__ __attribute__((aligned(16))) unsigned char v11_a[];
+
+    // weight row + zero-point indexing for this output column (guarded for n>=N:
+    // those warps still cooperate in the staging loop + barriers, but skip compute).
+    const int* wq = (n < N) ? w_packed + (long)n * (K / PACK_FACTOR) : nullptr;
+    const int zrow = (n / 8) * num_groups;
+    const int zsh = (n % 8) * 4;
+
+    float acc[MMAX];
+    #pragma unroll
+    for (int m = 0; m < MMAX; ++m) acc[m] = 0.0f;
+
+    for (int kc = 0; kc < K; kc += BK) {
+        const int ck = (K - kc < BK) ? (K - kc) : BK;    // this chunk's k (mult of 1024)
+        // stage activation slice (M, ck) cooperatively: v11_a[m*ck+kk] = x_fp8[m*K+kc+kk]
+        const int tile = M * ck;
+        for (int i = tid; i < tile; i += NWARPS * 32) {
+            const int m = i / ck, kk = i - m * ck;
+            v11_a[i] = x_fp8[(long)m * K + kc + kk];
+        }
+        __syncthreads();
+        if (n < N) {
+            const int* wqc = wq + kc / PACK_FACTOR;       // weights for this K-chunk
+            const int ppr_chunk = ck / PACK_FACTOR;
+            // each lane streams int32 indices lane*4 in steps of 32*4 (b128/lane).
+            for (int base = lane * 4; base < ppr_chunk; base += 32 * 4) {
+                const v4i_t wv = *reinterpret_cast<const v4i_t*>(&wqc[base]);
+                const int k0 = base * PACK_FACTOR;        // first k of these 32, within chunk
+                const int g = (kc + k0) / group_size;     // global group (32 k stay in one)
+                const float wsc = __half2float(w_scales[(long)n * num_groups + g]);
+                int zp = 8;
+                if (w_zeros != nullptr) zp = (w_zeros[zrow + g] >> zsh) & 0xF;
+                // weight -> f32 ONCE (nibble-zp in [-15,15] is exact in e4m3, so the
+                // old int4->fp8->f32 round-trip == (float)(nibble-zp)); reuse across the
+                // M rows. Activations packed-converted 2/instruction. Same recipe that
+                // took the MoE GEMV from 1.x to <1.0 vs stock.
+                float wf[32];
+                #pragma unroll
+                for (int t = 0; t < 32; ++t)
+                    wf[t] = (float)(((wv[t >> 3] >> ((t & 7) * 4)) & 0xF) - zp);
+                for (int m = 0; m < M; ++m) {
+                    const unsigned int* ar4 =
+                        reinterpret_cast<const unsigned int*>(v11_a + m * ck + k0);
+                    float p = 0.0f;
+                    #pragma unroll
+                    for (int q = 0; q < 8; ++q) {
+                        const unsigned int a4 = ar4[q];
+                        const v2f_t lo = __builtin_amdgcn_cvt_pk_f32_fp8(a4, false);
+                        const v2f_t hi = __builtin_amdgcn_cvt_pk_f32_fp8(a4, true);
+                        const int b = q * 4;
+                        p += lo[0] * wf[b] + lo[1] * wf[b + 1]
+                           + hi[0] * wf[b + 2] + hi[1] * wf[b + 3];
+                    }
+                    acc[m] += p * wsc;
+                }
+            }
+        }
+        __syncthreads();   // before the next chunk overwrites the LDS tile
+    }
+
+    if (n >= N) return;
+    // warp-reduce each m's partial across the 32 lanes.
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        for (int m = 0; m < M; ++m)
+            acc[m] += __shfl_xor(acc[m], off);
+
+    if (lane == 0)
+        for (int m = 0; m < M; ++m)
+            out[(long)m * N + n] = __float2half(acc[m] * act_scales[m]);
+}
+
+// ============================================================
+// v12: SMALL-M split-K WMMA. The small-batch (M=4-64) regime is occupancy-bound,
+// not FLOP-bound: a single full-K tile launches only N/BN blocks (e.g. 32 at
+// M<=16, N=4096), starving the 64-CU GPU -> ~108 GB/s weight read, ~1.8x behind
+// Triton's register-direct fp16 path. v12 SPLITS K across `splitk` blocks
+// (grid.z), each accumulating its K-range's partial and atomicAdd-ing into an
+// fp32 (M,N) accumulator -> splitk x more blocks in flight, same HBM traffic. The
+// per-row act scale distributes over the split sum, so each block applies it to
+// its partial before the atomic. Structure == v5 (raw fp8 WMMA, bank-padded LDS)
+// over a group sub-range. Output is fp32; a convert kernel casts to fp16.
+// ============================================================
+template <int BM, int BN>
+__global__ void __launch_bounds__((BM / 16) * 32) mmq_fp8_gemm_kernel_v12(
+    const unsigned char* __restrict__ x_fp8,
+    const float*         __restrict__ act_scales,
+    const int*           __restrict__ w_packed,
+    const __half*        __restrict__ w_scales,
+    const int*           __restrict__ w_zeros_packed,
+    float*               __restrict__ out_acc,   // (M, N) fp32, pre-zeroed (atomic)
+    int M, int N, int K, int group_size, int splitk) {
+
+    constexpr int NWARPS = BM / 16;
+    constexpr int NFRAG = BN / 16;
+    const int block_m = blockIdx.y * BM;
+    const int block_n = blockIdx.x * BN;
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+    const int lrow = lane & 15;
+    const int khalf = (lane >> 4) * 8;
+    const int frag_col = lane & 15;
+    const int frag_row0 = (lane >> 4) * 8;
+
+    const int BK = group_size;
+    const int num_k_groups = K / BK;
+    const int packed_per_row = K / PACK_FACTOR;
+    const int k_sub = BK / WMMA_DIM;
+    constexpr int LDS_PAD = 8;
+    const int LDSBK = BK + LDS_PAD;
+
+    // this block's contiguous K-group sub-range [g0, g1).
+    const int gps = (num_k_groups + splitk - 1) / splitk;
+    const int g0 = blockIdx.z * gps;
+    int g1 = g0 + gps;
+    if (g1 > num_k_groups) g1 = num_k_groups;
+    if (g0 >= g1) return;
+
+    __shared__ unsigned char A_tile[BM * (MAX_GROUP_SIZE + LDS_PAD)];
+    __shared__ unsigned char B_tile[BN * (MAX_GROUP_SIZE + LDS_PAD)];
+
+    float running[NFRAG][8];
+    #pragma unroll
+    for (int f = 0; f < NFRAG; ++f)
+        #pragma unroll
+        for (int e = 0; e < 8; ++e) running[f][e] = 0.0f;
+
+    for (int g = g0; g < g1; ++g) {
+        const int k0 = g * BK;
+        for (int idx = tid * 4; idx < BM * BK; idx += (NWARPS * 32) * 4) {
+            const int r = idx / BK, k = idx % BK, am = block_m + r;
+            unsigned int v = 0u;
+            if (am < M)
+                v = *reinterpret_cast<const unsigned int*>(&x_fp8[am * K + k0 + k]);
+            *reinterpret_cast<unsigned int*>(&A_tile[r * LDSBK + k]) = v;
+        }
+        const int njobs = BN * (BK / PACK_FACTOR);
+        for (int j = tid; j < njobs; j += NWARPS * 32) {
+            const int n = j / (BK / PACK_FACTOR), k8 = j % (BK / PACK_FACTOR);
+            const int an = block_n + n;
+            int word = 0, zp = 8;
+            if (an < N) {
+                word = w_packed[an * packed_per_row + (k0 / PACK_FACTOR) + k8];
+                if (w_zeros_packed != nullptr) {
+                    const int pk = w_zeros_packed[(an / 8) * num_k_groups + g];
+                    zp = (pk >> ((an % 8) * 4)) & 0xF;
+                }
+            }
+            unsigned char* dst = &B_tile[n * LDSBK + k8 * PACK_FACTOR];
+            if (an < N) {
+                // pack 2 nibbles per cvt_pk_fp8_f32 (was 1 via cvt_pk(v,v)) -> halves
+                // the expansion converts, which cap this LDS-staged path's throughput.
+                #pragma unroll
+                for (int jj = 0; jj < PACK_FACTOR; jj += 2) {
+                    const float a = (float)(((word >> (jj * 4)) & 0xF) - zp);
+                    const float b = (float)(((word >> ((jj + 1) * 4)) & 0xF) - zp);
+                    const int p = __builtin_amdgcn_cvt_pk_fp8_f32(a, b, 0, false);
+                    dst[jj] = p & 0xFF;
+                    dst[jj + 1] = (p >> 8) & 0xFF;
+                }
+            } else {
+                #pragma unroll
+                for (int jj = 0; jj < PACK_FACTOR; ++jj) dst[jj] = 0;
+            }
+        }
+        __syncthreads();
+
+        v8f_t acc[NFRAG];
+        #pragma unroll
+        for (int f = 0; f < NFRAG; ++f) acc[f] = v8f_t{0, 0, 0, 0, 0, 0, 0, 0};
+
+        const int a_base = (warp_id * WMMA_DIM + lrow) * LDSBK + khalf;
+        const int b_base = lrow * LDSBK + khalf;
+        v2i_t a_cur = *reinterpret_cast<const v2i_t*>(&A_tile[a_base]);
+        v2i_t b_cur[NFRAG];
+        #pragma unroll
+        for (int f = 0; f < NFRAG; ++f)
+            b_cur[f] = *reinterpret_cast<const v2i_t*>(&B_tile[b_base + f * WMMA_DIM * LDSBK]);
+
+        for (int kt = 0; kt < k_sub; ++kt) {
+            v2i_t a_nx;
+            v2i_t b_nx[NFRAG];
+            if (kt + 1 < k_sub) {
+                const int ko = (kt + 1) * WMMA_DIM;
+                a_nx = *reinterpret_cast<const v2i_t*>(&A_tile[a_base + ko]);
+                #pragma unroll
+                for (int f = 0; f < NFRAG; ++f)
+                    b_nx[f] = *reinterpret_cast<const v2i_t*>(
+                        &B_tile[b_base + f * WMMA_DIM * LDSBK + ko]);
+            }
+            #pragma unroll
+            for (int f = 0; f < NFRAG; ++f)
+                acc[f] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(
+                    a_cur, b_cur[f], acc[f]);
+            a_cur = a_nx;
+            #pragma unroll
+            for (int f = 0; f < NFRAG; ++f) b_cur[f] = b_nx[f];
+        }
+
+        #pragma unroll
+        for (int f = 0; f < NFRAG; ++f) {
+            const int abs_n = block_n + f * WMMA_DIM + frag_col;
+            const float wsc = (abs_n < N)
+                ? __half2float(w_scales[abs_n * num_k_groups + g]) : 0.0f;
+            #pragma unroll
+            for (int e = 0; e < 8; ++e) running[f][e] += acc[f][e] * wsc;
+        }
+        __syncthreads();
+    }
+
+    // epilogue: per-row act scale, atomic-accumulate the K-split partial.
+    #pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        const int abs_m = block_m + warp_id * WMMA_DIM + frag_row0 + e;
+        if (abs_m >= M) continue;
+        const float asc = act_scales[abs_m];
+        #pragma unroll
+        for (int f = 0; f < NFRAG; ++f) {
+            const int abs_n = block_n + f * WMMA_DIM + frag_col;
+            if (abs_n < N) atomicAdd(&out_acc[abs_m * N + abs_n], running[f][e] * asc);
+        }
+    }
+}
+
+__global__ void cvt_f32_f16_kernel(const float* __restrict__ in,
+                                   __half* __restrict__ out, long n) {
+    const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __float2half(in[i]);
+}
+
+// ============================================================
+// v13: SMALL-M REGISTER-DIRECT WMMA + split-K. The small-batch (M=4-64) loss is
+// the int4->fp8 LDS round-trip: v5/v10 stage expanded weights in LDS (108 GB/s)
+// where Triton dequants register-direct (190). v13 feeds the fp8 WMMA B operand
+// straight from registers: load int4 weights COALESCED (lane L -> col L/2,
+// k-half L&1: 2-lane 8B bursts, the same pattern v10's A-shuffle hits 273 GB/s
+// with), warp-SHUFFLE to the B-fragment layout (src = 2*(L&15)+(L>>4)), expand
+// int4->fp8 in-register -- no B LDS, no barrier. A is register-direct too (v10's
+// shuffle). Produces the EXACT v5 fragment values, so bit-identical. split-K
+// (grid.z) restores occupancy at small M (few N-tiles otherwise). fp32 atomic out.
+// ============================================================
+template <int BM, int BN>
+__global__ void __launch_bounds__((BM / 16) * 32) mmq_fp8_gemm_kernel_v13(
+    const unsigned char* __restrict__ x_fp8,
+    const float*         __restrict__ act_scales,
+    const int*           __restrict__ w_packed,
+    const __half*        __restrict__ w_scales,
+    const int*           __restrict__ w_zeros_packed,
+    float*               __restrict__ out_acc,   // (M, N) fp32, pre-zeroed (atomic)
+    int M, int N, int K, int group_size, int splitk) {
+
+    constexpr int NWARPS = BM / 16;
+    constexpr int NFRAG = BN / 16;
+    const int block_m = blockIdx.y * BM;
+    const int block_n = blockIdx.x * BN;
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+    const int frag_col = lane & 15;
+    const int frag_row0 = (lane >> 4) * 8;
+
+    const int BK = group_size;
+    const int num_k_groups = K / BK;
+    const int ppr = K / PACK_FACTOR;
+    const int k_sub = BK / WMMA_DIM;
+
+    const int gps = (num_k_groups + splitk - 1) / splitk;
+    const int g0 = blockIdx.z * gps;
+    int g1 = g0 + gps;
+    if (g1 > num_k_groups) g1 = num_k_groups;
+    if (g0 >= g1) return;
+
+    // A register-direct (coalesced load + shuffle to fragment), like v10.
+    const int a_row = block_m + warp_id * WMMA_DIM + (lane >> 1);
+    const int a_kh = (lane & 1) * 8;
+    const int shfl_src = 2 * (lane & 15) + (lane >> 4);
+    // B register-direct: this lane loads column (L/2) of each N-frag, k-half (L&1).
+    const int b_col_lane = lane >> 1;   // 0..15 -> which of the frag's 16 cols
+    const int b_whalf = lane & 1;       // which 8-k word within the 16-k subtile
+
+    float running[NFRAG][8];
+    #pragma unroll
+    for (int f = 0; f < NFRAG; ++f)
+        #pragma unroll
+        for (int e = 0; e < 8; ++e) running[f][e] = 0.0f;
+
+    for (int g = g0; g < g1; ++g) {
+        const int k0 = g * BK;
+        v8f_t acc[NFRAG];
+        #pragma unroll
+        for (int f = 0; f < NFRAG; ++f) acc[f] = v8f_t{0, 0, 0, 0, 0, 0, 0, 0};
+
+        for (int kt = 0; kt < k_sub; ++kt) {
+            const int k_abs = k0 + kt * WMMA_DIM;
+            // ---- A: coalesced global load + warp-shuffle to fragment ----
+            v2i_t av = v2i_t{0, 0};
+            if (a_row < M)
+                av = *reinterpret_cast<const v2i_t*>(&x_fp8[(long)a_row * K + k_abs + a_kh]);
+            v2i_t a_cur;
+            a_cur[0] = __shfl(av[0], shfl_src);
+            a_cur[1] = __shfl(av[1], shfl_src);
+            // ---- B: per frag, coalesced int4 load + shuffle + in-register expand ----
+            #pragma unroll
+            for (int f = 0; f < NFRAG; ++f) {
+                const int load_col = block_n + f * WMMA_DIM + b_col_lane;
+                int wword = (load_col < N)
+                    ? w_packed[(long)load_col * ppr + k_abs / PACK_FACTOR + b_whalf] : 0;
+                const int b_word = __shfl(wword, shfl_src);  // -> col (L&15), k-half (L>>4)
+                const int nf = block_n + f * WMMA_DIM + (lane & 15);
+                int zp = 8;
+                if (w_zeros_packed != nullptr && nf < N)
+                    zp = (w_zeros_packed[(nf / 8) * num_k_groups + g] >> ((nf % 8) * 4)) & 0xF;
+                unsigned char bf[8];
+                #pragma unroll
+                for (int jj = 0; jj < 8; ++jj)
+                    bf[jj] = int4_signed_to_e4m3(((b_word >> (jj * 4)) & 0xF) - zp);
+                const v2i_t b_cur = *reinterpret_cast<const v2i_t*>(bf);
+                acc[f] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(
+                    a_cur, b_cur, acc[f]);
+            }
+        }
+        #pragma unroll
+        for (int f = 0; f < NFRAG; ++f) {
+            const int abs_n = block_n + f * WMMA_DIM + frag_col;
+            const float wsc = (abs_n < N)
+                ? __half2float(w_scales[abs_n * num_k_groups + g]) : 0.0f;
+            #pragma unroll
+            for (int e = 0; e < 8; ++e) running[f][e] += acc[f][e] * wsc;
+        }
+    }
+
+    #pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        const int abs_m = block_m + warp_id * WMMA_DIM + frag_row0 + e;
+        if (abs_m >= M) continue;
+        const float asc = act_scales[abs_m];
+        #pragma unroll
+        for (int f = 0; f < NFRAG; ++f) {
+            const int abs_n = block_n + f * WMMA_DIM + frag_col;
+            if (abs_n < N) atomicAdd(&out_acc[abs_m * N + abs_n], running[f][e] * asc);
+        }
+    }
+}
+
+// ============================================================
+// v14: SMALL-M WMMA with N-SPLIT warps. v10/v5 use BM=256 -> at M=8 the WMMA
+// computes 256 rows for 8 real (32x wasted WMMA throughput). v14 fixes BM=16 (one
+// M-subtile, <=16 real -> only 2x waste) but keeps NWARPS warps by splitting the N
+// dimension instead of M: all warps share the 16 rows (one A staging), each warp
+// owns WFRAG = (BN/16)/NWARPS of the N-fragments and cooperates on the B staging.
+// So small BM (low WMMA waste) AND many staging threads (the thing BM=16 in v10
+// lacked). split-K (grid.z) for occupancy; fp32 atomic out -> fp16.
+// ============================================================
+template <int BN, int NWARPS, int GTILE>
+__global__ void __launch_bounds__(NWARPS * 32) mmq_fp8_gemm_kernel_v14(
+    const unsigned char* __restrict__ x_fp8,
+    const float*         __restrict__ act_scales,
+    const int*           __restrict__ w_packed,
+    const __half*        __restrict__ w_scales,
+    const int*           __restrict__ w_zeros_packed,
+    float*               __restrict__ out_acc,   // (M,N) fp32 pre-zeroed (atomic)
+    int M, int N, int K, int group_size, int splitk) {
+
+    constexpr int NFRAG = BN / 16;
+    constexpr int WFRAG = NFRAG / NWARPS;   // N-fragments per warp
+    const int block_m = blockIdx.y * 16;    // BM = 16
+    const int block_n = blockIdx.x * BN;
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+    const int lrow = lane & 15;
+    const int khalf = (lane >> 4) * 8;
+    const int frag_col = lane & 15;
+    const int frag_row0 = (lane >> 4) * 8;
+
+    const int BK = group_size;
+    const int num_k_groups = K / BK;
+    const int packed_per_row = K / PACK_FACTOR;
+    const int k_sub = BK / WMMA_DIM;
+    constexpr int LDS_PAD = 8;
+    const int LDSBK = BK + LDS_PAD;
+
+    const int gps = (num_k_groups + splitk - 1) / splitk;
+    const int g0 = blockIdx.z * gps;
+    int g1 = g0 + gps; if (g1 > num_k_groups) g1 = num_k_groups;
+    if (g0 >= g1) return;
+
+    // GTILE groups staged per __syncthreads pair (the v6 multi-group sync-reduction
+    // win, applied to the dense N-split WMMA). Static LDS sized for GTILE groups.
+    __shared__ unsigned char A_tile[GTILE * 16 * (MAX_GROUP_SIZE + LDS_PAD)];
+    __shared__ unsigned char B_tile[GTILE * BN * (MAX_GROUP_SIZE + LDS_PAD)];
+
+    float running[WFRAG][8];
+    #pragma unroll
+    for (int f = 0; f < WFRAG; ++f)
+        #pragma unroll
+        for (int e = 0; e < 8; ++e) running[f][e] = 0.0f;
+
+    const int njobs = BN * (BK / PACK_FACTOR);
+    for (int gt = g0; gt < g1; gt += GTILE) {
+        const int gend = (gt + GTILE < g1) ? (gt + GTILE) : g1;
+        for (int gi = gt; gi < gend; ++gi) {
+            const int k0 = gi * BK;
+            unsigned char* Ag = A_tile + (gi - gt) * 16 * LDSBK;
+            unsigned char* Bg = B_tile + (gi - gt) * BN * LDSBK;
+            for (int idx = tid * 4; idx < 16 * BK; idx += (NWARPS * 32) * 4) {
+                const int r = idx / BK, k = idx % BK, am = block_m + r;
+                unsigned int v = 0u;
+                if (am < M)
+                    v = *reinterpret_cast<const unsigned int*>(&x_fp8[am * K + k0 + k]);
+                *reinterpret_cast<unsigned int*>(&Ag[r * LDSBK + k]) = v;
+            }
+            for (int j = tid; j < njobs; j += NWARPS * 32) {
+                const int n = j / (BK / PACK_FACTOR), k8 = j % (BK / PACK_FACTOR);
+                const int an = block_n + n;
+                int word = 0, zp = 8;
+                if (an < N) {
+                    word = w_packed[an * packed_per_row + (k0 / PACK_FACTOR) + k8];
+                    if (w_zeros_packed != nullptr) {
+                        const int pk = w_zeros_packed[(an / 8) * num_k_groups + gi];
+                        zp = (pk >> ((an % 8) * 4)) & 0xF;
+                    }
+                }
+                unsigned char* dst = &Bg[n * LDSBK + k8 * PACK_FACTOR];
+                if (an < N) {
+                    #pragma unroll
+                    for (int jj = 0; jj < PACK_FACTOR; jj += 2) {
+                        const float a = (float)(((word >> (jj * 4)) & 0xF) - zp);
+                        const float b = (float)(((word >> ((jj + 1) * 4)) & 0xF) - zp);
+                        const int p = __builtin_amdgcn_cvt_pk_fp8_f32(a, b, 0, false);
+                        dst[jj] = p & 0xFF; dst[jj + 1] = (p >> 8) & 0xFF;
+                    }
+                } else {
+                    #pragma unroll
+                    for (int jj = 0; jj < PACK_FACTOR; ++jj) dst[jj] = 0;
+                }
+            }
+        }
+        __syncthreads();
+
+        for (int gi = gt; gi < gend; ++gi) {
+            const unsigned char* Ag = A_tile + (gi - gt) * 16 * LDSBK;
+            const unsigned char* Bg = B_tile + (gi - gt) * BN * LDSBK;
+            v8f_t acc[WFRAG];
+            #pragma unroll
+            for (int f = 0; f < WFRAG; ++f) acc[f] = v8f_t{0, 0, 0, 0, 0, 0, 0, 0};
+            const int a_base = lrow * LDSBK + khalf;       // all warps share the 16 rows
+            for (int kt = 0; kt < k_sub; ++kt) {
+                const v2i_t a_cur = *reinterpret_cast<const v2i_t*>(&Ag[a_base + kt * WMMA_DIM]);
+                #pragma unroll
+                for (int wf = 0; wf < WFRAG; ++wf) {
+                    const int f = warp_id * WFRAG + wf;     // global N-fragment
+                    const v2i_t b_cur = *reinterpret_cast<const v2i_t*>(
+                        &Bg[(f * WMMA_DIM + lrow) * LDSBK + khalf + kt * WMMA_DIM]);
+                    acc[wf] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(
+                        a_cur, b_cur, acc[wf]);
+                }
+            }
+            #pragma unroll
+            for (int wf = 0; wf < WFRAG; ++wf) {
+                const int f = warp_id * WFRAG + wf;
+                const int abs_n = block_n + f * WMMA_DIM + frag_col;
+                const float wsc = (abs_n < N)
+                    ? __half2float(w_scales[abs_n * num_k_groups + gi]) : 0.0f;
+                #pragma unroll
+                for (int e = 0; e < 8; ++e) running[wf][e] += acc[wf][e] * wsc;
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        const int abs_m = block_m + frag_row0 + e;     // 16 rows, no warp offset
+        if (abs_m >= M) continue;
+        const float asc = act_scales[abs_m];
+        #pragma unroll
+        for (int wf = 0; wf < WFRAG; ++wf) {
+            const int f = warp_id * WFRAG + wf;
+            const int abs_n = block_n + f * WMMA_DIM + frag_col;
+            if (abs_n < N) atomicAdd(&out_acc[abs_m * N + abs_n], running[wf][e] * asc);
+        }
+    }
+}
+
+// ============================================================
+// v15: MARLIN-style REGISTER-DIRECT WMMA. Weights are pre-repacked offline into
+// WMMA-B-fragment lane-order -- w_rep[n_tile][k_tile][lane] holds exactly the 8
+// int4 nibbles lane `lane` needs for the (col=16*n_tile+(lane&15),
+// k=16*k_tile+(lane>>4)*8 .. +8) fragment slot. So a single coalesced 128-byte
+// load per warp (32 consecutive int32) fills the B fragment with NO LDS staging
+// and NO warp shuffle -- the thing that capped the LDS path at ~108 GB/s while
+// Triton's register-resident tl.dot hit ~195. int4->fp8 expand stays in-register.
+// A is staged to LDS (16 rows, small). N-split warps (BM=16), split-K, fp32 atomic.
+// ============================================================
+template <int BN, int NWARPS>
+__global__ void __launch_bounds__(NWARPS * 32) mmq_fp8_gemm_kernel_v15(
+    const unsigned char* __restrict__ x_fp8,
+    const float*         __restrict__ act_scales,
+    const int*           __restrict__ w_rep,       // (N/16, K/16, 32) int32 lane-order
+    const __half*        __restrict__ w_scales,    // (N, K/group) fp16
+    const int*           __restrict__ w_zeros_packed,
+    float*               __restrict__ out_acc,     // (M, N) fp32 pre-zeroed (atomic)
+    int M, int N, int K, int group_size, int splitk) {
+
+    constexpr int NFRAG = BN / 16;
+    constexpr int WFRAG = NFRAG / NWARPS;
+    const int block_m = blockIdx.y * 16;
+    const int block_n = blockIdx.x * BN;
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+    const int lrow = lane & 15;
+    const int khalf = (lane >> 4) * 8;
+    const int frag_col = lane & 15;
+    const int frag_row0 = (lane >> 4) * 8;
+
+    const int BK = group_size;
+    const int num_k_groups = K / BK;
+    const int k_sub = BK / WMMA_DIM;
+    const int ktiles = K / WMMA_DIM;     // total 16-wide k-tiles
+    constexpr int LDS_PAD = 8;
+    const int LDSBK = BK + LDS_PAD;
+
+    const int gps = (num_k_groups + splitk - 1) / splitk;
+    const int g0 = blockIdx.z * gps;
+    int g1 = g0 + gps; if (g1 > num_k_groups) g1 = num_k_groups;
+    if (g0 >= g1) return;
+
+    // FULLY register-direct: A via v10 warp-shuffle, B via repacked coalesced load.
+    // NO LDS, NO __syncthreads -- directly attacks the latency-bound small-M wall
+    // (the per-group A-staging barriers were the last sync left in the WMMA path).
+    (void)LDSBK; (void)frag_row0; (void)lrow; (void)khalf;
+    float running[WFRAG][8];
+    #pragma unroll
+    for (int f = 0; f < WFRAG; ++f)
+        #pragma unroll
+        for (int e = 0; e < 8; ++e) running[f][e] = 0.0f;
+
+    const int* rep_w[WFRAG];
+    #pragma unroll
+    for (int wf = 0; wf < WFRAG; ++wf) {
+        const int f = warp_id * WFRAG + wf;
+        const int n_tile = block_n / 16 + f;
+        rep_w[wf] = w_rep + (long)n_tile * ktiles * 32;
+    }
+    const int a_row = block_m + (lane >> 1);   // all warps share the 16 rows
+    const int a_kh = (lane & 1) * 8;
+    const int a_shfl = 2 * (lane & 15) + (lane >> 4);
+
+    for (int g = g0; g < g1; ++g) {
+        int zp_w[WFRAG];
+        #pragma unroll
+        for (int wf = 0; wf < WFRAG; ++wf) {
+            const int f = warp_id * WFRAG + wf;
+            const int nc = block_n + f * 16 + (lane & 15);
+            zp_w[wf] = (w_zeros_packed != nullptr && nc < N)
+                ? ((w_zeros_packed[(nc / 8) * num_k_groups + g] >> ((nc % 8) * 4)) & 0xF) : 8;
+        }
+        v8f_t acc[WFRAG];
+        #pragma unroll
+        for (int f = 0; f < WFRAG; ++f) acc[f] = v8f_t{0, 0, 0, 0, 0, 0, 0, 0};
+        for (int kt = 0; kt < k_sub; ++kt) {
+            const int gk = g * BK + kt * WMMA_DIM + a_kh;
+            v2i_t av = v2i_t{0, 0};
+            if (a_row < M)
+                av = *reinterpret_cast<const v2i_t*>(&x_fp8[(long)a_row * K + gk]);
+            v2i_t a_cur;
+            a_cur[0] = __shfl(av[0], a_shfl);
+            a_cur[1] = __shfl(av[1], a_shfl);
+            const int kabs = g * k_sub + kt;
+            #pragma unroll
+            for (int wf = 0; wf < WFRAG; ++wf) {
+                const int bword = rep_w[wf][kabs * 32 + lane];
+                const int zp = zp_w[wf];
+                unsigned char bf[8];
+                #pragma unroll
+                for (int jj = 0; jj < 8; ++jj)
+                    bf[jj] = int4_signed_to_e4m3(((bword >> (jj * 4)) & 0xF) - zp);
+                const v2i_t b_cur = *reinterpret_cast<const v2i_t*>(bf);
+                acc[wf] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(
+                    a_cur, b_cur, acc[wf]);
+            }
+        }
+        #pragma unroll
+        for (int wf = 0; wf < WFRAG; ++wf) {
+            const int f = warp_id * WFRAG + wf;
+            const int abs_n = block_n + f * 16 + frag_col;
+            const float wsc = (abs_n < N)
+                ? __half2float(w_scales[abs_n * num_k_groups + g]) : 0.0f;
+            #pragma unroll
+            for (int e = 0; e < 8; ++e) running[wf][e] += acc[wf][e] * wsc;
+        }
+    }   // no __syncthreads in the K loop -- fully register-direct
+
+    #pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        const int abs_m = block_m + frag_row0 + e;
+        if (abs_m >= M) continue;
+        const float asc = act_scales[abs_m];
+        #pragma unroll
+        for (int wf = 0; wf < WFRAG; ++wf) {
+            const int f = warp_id * WFRAG + wf;
+            const int abs_n = block_n + f * 16 + frag_col;
+            if (abs_n < N) atomicAdd(&out_acc[abs_m * N + abs_n], running[wf][e] * asc);
+        }
+    }
+}
+
+// ============================================================
+// v16: the ONE structural axis untested across the 20 fp8 variants -- f16 WMMA.
+// Triton wins dense M=16-32 with an fp16 tl.dot (int4->fp16 register-direct);
+// every hand-written variant so far used the fp8 WMMA. v16 is v15's exact
+// zero-LDS / zero-sync structure (same A-shuffle, same w_rep B-layout) but feeds
+// __builtin_amdgcn_wmma_f32_16x16x16_f16 -- A = fp8->f16 (raw value, scale at
+// epilogue), B = (nibble-zp) as f16. Tests whether the fp8-WMMA instruction's
+// scheduling (not the data path) was the ~108 GB/s small-GEMM wall.
+// ============================================================
+template <int BN, int NWARPS>
+__global__ void __launch_bounds__(NWARPS * 32) mmq_fp8_gemm_kernel_v16(
+    const unsigned char* __restrict__ x_fp8,
+    const float*         __restrict__ act_scales,
+    const int*           __restrict__ w_rep,       // (N/16, K/16, 32) int32 lane-order
+    const __half*        __restrict__ w_scales,    // (N, K/group) fp16
+    const int*           __restrict__ w_zeros_packed,
+    float*               __restrict__ out_acc,     // (M, N) fp32 pre-zeroed (atomic)
+    int M, int N, int K, int group_size, int splitk) {
+
+    constexpr int NFRAG = BN / 16;
+    constexpr int WFRAG = NFRAG / NWARPS;
+    const int block_m = blockIdx.y * 16;
+    const int block_n = blockIdx.x * BN;
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+    const int frag_col = lane & 15;
+    const int frag_row0 = (lane >> 4) * 8;
+
+    const int BK = group_size;
+    const int num_k_groups = K / BK;
+    const int k_sub = BK / WMMA_DIM;
+    const int ktiles = K / WMMA_DIM;
+
+    const int gps = (num_k_groups + splitk - 1) / splitk;
+    const int g0 = blockIdx.z * gps;
+    int g1 = g0 + gps; if (g1 > num_k_groups) g1 = num_k_groups;
+    if (g0 >= g1) return;
+
+    float running[WFRAG][8];
+    #pragma unroll
+    for (int f = 0; f < WFRAG; ++f)
+        #pragma unroll
+        for (int e = 0; e < 8; ++e) running[f][e] = 0.0f;
+
+    const int* rep_w[WFRAG];
+    #pragma unroll
+    for (int wf = 0; wf < WFRAG; ++wf) {
+        const int f = warp_id * WFRAG + wf;
+        const int n_tile = block_n / 16 + f;
+        rep_w[wf] = w_rep + (long)n_tile * ktiles * 32;
+    }
+    const int a_row = block_m + (lane >> 1);   // all warps share the 16 rows
+    const int a_kh = (lane & 1) * 8;
+    const int a_shfl = 2 * (lane & 15) + (lane >> 4);
+
+    for (int g = g0; g < g1; ++g) {
+        int zp_w[WFRAG];
+        #pragma unroll
+        for (int wf = 0; wf < WFRAG; ++wf) {
+            const int f = warp_id * WFRAG + wf;
+            const int nc = block_n + f * 16 + (lane & 15);
+            zp_w[wf] = (w_zeros_packed != nullptr && nc < N)
+                ? ((w_zeros_packed[(nc / 8) * num_k_groups + g] >> ((nc % 8) * 4)) & 0xF) : 8;
+        }
+        v8f_t acc[WFRAG];
+        #pragma unroll
+        for (int f = 0; f < WFRAG; ++f) acc[f] = v8f_t{0, 0, 0, 0, 0, 0, 0, 0};
+        for (int kt = 0; kt < k_sub; ++kt) {
+            const int gk = g * BK + kt * WMMA_DIM + a_kh;
+            v2i_t av = v2i_t{0, 0};
+            if (a_row < M)
+                av = *reinterpret_cast<const v2i_t*>(&x_fp8[(long)a_row * K + gk]);
+            v2i_t a_cur;
+            a_cur[0] = __shfl(av[0], a_shfl);
+            a_cur[1] = __shfl(av[1], a_shfl);
+            // fp8 A fragment -> f16 (raw e4m3 value; per-row act_scale at epilogue)
+            const unsigned char* ab = reinterpret_cast<const unsigned char*>(&a_cur);
+            v8h_t a_h;
+            #pragma unroll
+            for (int jj = 0; jj < 8; ++jj) a_h[jj] = (_Float16)e4m3_to_f32(ab[jj]);
+            const int kabs = g * k_sub + kt;
+            #pragma unroll
+            for (int wf = 0; wf < WFRAG; ++wf) {
+                const int bword = rep_w[wf][kabs * 32 + lane];
+                const int zp = zp_w[wf];
+                v8h_t b_h;
+                #pragma unroll
+                for (int jj = 0; jj < 8; ++jj)
+                    b_h[jj] = (_Float16)(((bword >> (jj * 4)) & 0xF) - zp);
+                acc[wf] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(
+                    a_h, b_h, acc[wf]);
+            }
+        }
+        #pragma unroll
+        for (int wf = 0; wf < WFRAG; ++wf) {
+            const int f = warp_id * WFRAG + wf;
+            const int abs_n = block_n + f * 16 + frag_col;
+            const float wsc = (abs_n < N)
+                ? __half2float(w_scales[abs_n * num_k_groups + g]) : 0.0f;
+            #pragma unroll
+            for (int e = 0; e < 8; ++e) running[wf][e] += acc[wf][e] * wsc;
+        }
+    }
+
+    #pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        const int abs_m = block_m + frag_row0 + e;
+        if (abs_m >= M) continue;
+        const float asc = act_scales[abs_m];
+        #pragma unroll
+        for (int wf = 0; wf < WFRAG; ++wf) {
+            const int f = warp_id * WFRAG + wf;
+            const int abs_n = block_n + f * 16 + frag_col;
+            if (abs_n < N) atomicAdd(&out_acc[abs_m * N + abs_n], running[wf][e] * asc);
+        }
+    }
+}
+
+// ============================================================
+// v17: true W4A16 (the real analogue of Triton's path). v16 showed f16 WMMA only
+// marginally beats fp8 WMMA -- but v16 STILL fp8-quantizes activations (an extra
+// act-quant kernel launch + per-row max + fp8->f16 round-trip), pure overhead
+// Triton's W4A16 never pays. v17 feeds fp16 activations DIRECTLY to the f16 WMMA
+// (no act-quant, no act_scale): isolates whether removing the W4A8 act-quant
+// overhead lets the hand-written kernel reach Triton. splitk==1 writes f16 out
+// directly (no out_acc / no cvt epilogue -- kills 2 more launches).
+// ============================================================
+template <int BN, int NWARPS>
+__global__ void __launch_bounds__(NWARPS * 32) mmq_w4a16_gemm_kernel_v17(
+    const __half*        __restrict__ x_h,         // (M, K) fp16 -- DIRECT, no quant
+    const int*           __restrict__ w_rep,       // (N/16, K/16, 32) int32 lane-order
+    const __half*        __restrict__ w_scales,    // (N, K/group) fp16
+    const int*           __restrict__ w_zeros_packed,
+    float*               __restrict__ out_acc,     // (M, N) fp32 (atomic; used if splitk>1)
+    __half*              __restrict__ out_h,        // (M, N) fp16 (direct; used if splitk==1)
+    int M, int N, int K, int group_size, int splitk) {
+
+    constexpr int NFRAG = BN / 16;
+    constexpr int WFRAG = NFRAG / NWARPS;
+    const int block_m = blockIdx.y * 16;
+    const int block_n = blockIdx.x * BN;
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+    const int frag_col = lane & 15;
+    const int frag_row0 = (lane >> 4) * 8;
+
+    const int BK = group_size;
+    const int num_k_groups = K / BK;
+    const int k_sub = BK / WMMA_DIM;
+    const int ktiles = K / WMMA_DIM;
+
+    const int gps = (num_k_groups + splitk - 1) / splitk;
+    const int g0 = blockIdx.z * gps;
+    int g1 = g0 + gps; if (g1 > num_k_groups) g1 = num_k_groups;
+    if (g0 >= g1) return;
+
+    float running[WFRAG][8];
+    #pragma unroll
+    for (int f = 0; f < WFRAG; ++f)
+        #pragma unroll
+        for (int e = 0; e < 8; ++e) running[f][e] = 0.0f;
+
+    const int* rep_w[WFRAG];
+    #pragma unroll
+    for (int wf = 0; wf < WFRAG; ++wf) {
+        const int f = warp_id * WFRAG + wf;
+        const int n_tile = block_n / 16 + f;
+        rep_w[wf] = w_rep + (long)n_tile * ktiles * 32;
+    }
+    const int a_row = block_m + (lane >> 1);
+    const int a_kh = (lane & 1) * 8;
+    const int a_shfl = 2 * (lane & 15) + (lane >> 4);
+
+    for (int g = g0; g < g1; ++g) {
+        int zp_w[WFRAG];
+        #pragma unroll
+        for (int wf = 0; wf < WFRAG; ++wf) {
+            const int f = warp_id * WFRAG + wf;
+            const int nc = block_n + f * 16 + (lane & 15);
+            zp_w[wf] = (w_zeros_packed != nullptr && nc < N)
+                ? ((w_zeros_packed[(nc / 8) * num_k_groups + g] >> ((nc % 8) * 4)) & 0xF) : 8;
+        }
+        v8f_t acc[WFRAG];
+        #pragma unroll
+        for (int f = 0; f < WFRAG; ++f) acc[f] = v8f_t{0, 0, 0, 0, 0, 0, 0, 0};
+        for (int kt = 0; kt < k_sub; ++kt) {
+            const int gk = g * BK + kt * WMMA_DIM + a_kh;
+            v8h_t av = v8h_t{0, 0, 0, 0, 0, 0, 0, 0};
+            if (a_row < M)
+                av = *reinterpret_cast<const v8h_t*>(&x_h[(long)a_row * K + gk]);
+            // shuffle the 8 fp16 (4x32-bit) to A-fragment lane order (same a_shfl as v15)
+            v8h_t a_h;
+            int* avi = reinterpret_cast<int*>(&av);
+            int* ahi = reinterpret_cast<int*>(&a_h);
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) ahi[i] = __shfl(avi[i], a_shfl);
+            const int kabs = g * k_sub + kt;
+            #pragma unroll
+            for (int wf = 0; wf < WFRAG; ++wf) {
+                const int bword = rep_w[wf][kabs * 32 + lane];
+                const int zp = zp_w[wf];
+                v8h_t b_h;
+                #pragma unroll
+                for (int jj = 0; jj < 8; ++jj)
+                    b_h[jj] = (_Float16)(((bword >> (jj * 4)) & 0xF) - zp);
+                acc[wf] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(
+                    a_h, b_h, acc[wf]);
+            }
+        }
+        #pragma unroll
+        for (int wf = 0; wf < WFRAG; ++wf) {
+            const int f = warp_id * WFRAG + wf;
+            const int abs_n = block_n + f * 16 + frag_col;
+            const float wsc = (abs_n < N)
+                ? __half2float(w_scales[abs_n * num_k_groups + g]) : 0.0f;
+            #pragma unroll
+            for (int e = 0; e < 8; ++e) running[wf][e] += acc[wf][e] * wsc;
+        }
+    }
+
+    #pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        const int abs_m = block_m + frag_row0 + e;
+        if (abs_m >= M) continue;
+        #pragma unroll
+        for (int wf = 0; wf < WFRAG; ++wf) {
+            const int f = warp_id * WFRAG + wf;
+            const int abs_n = block_n + f * 16 + frag_col;
+            if (abs_n >= N) continue;
+            if (splitk == 1) out_h[abs_m * N + abs_n] = (__half)running[wf][e];   // direct, no cvt
+            else atomicAdd(&out_acc[abs_m * N + abs_n], running[wf][e]);
+        }
+    }
+}
+
 }  // namespace w4a8_fp8_wmma
 
 // =================== Host launcher ===================
@@ -723,7 +2398,341 @@ void launch_mmq_fp8_gemm_gfx1201(
     const int* w_zeros_ptr = (w_zeros.defined() && w_zeros.numel() > 0)
                              ? w_zeros.data_ptr<int>() : nullptr;
 
-    if (version == 5) {
+    if (version == 13) {
+        // small-M register-direct WMMA (no B-LDS) + split-K. CFG VLLM_W4A8_V13_CFG
+        // (BMxBN, def 16x64), VLLM_W4A8_V13_SPLITK (def 8). fp32 atomic -> fp16.
+        int bm = 16, bn = 64, splitk = 8;
+        if (const char* e = std::getenv("VLLM_W4A8_V13_CFG")) {
+            const char* p = e; bm = std::atoi(p);
+            while (*p && *p != 'x' && *p != 'X') ++p;
+            if (*p) bn = std::atoi(p + 1);
+        }
+        if (const char* e = std::getenv("VLLM_W4A8_V13_SPLITK")) splitk = std::atoi(e);
+        const int nkg = K / group_size;
+        if (splitk > nkg) splitk = nkg;
+        if (splitk < 1) splitk = 1;
+        auto out_acc = at::zeros({M, N}, x.options().dtype(at::kFloat));
+        dim3 grid((N + bn - 1) / bn, (M + bm - 1) / bm, splitk);
+        #define V13_L(BM, BN) mmq_fp8_gemm_kernel_v13<BM, BN><<<grid, dim3((BM/16)*32), 0, stream>>>( \
+            x_fp8.data_ptr<unsigned char>(), act_scales.data_ptr<float>(), \
+            w_packed.data_ptr<int>(), \
+            reinterpret_cast<const __half*>(scales.data_ptr<at::Half>()), w_zeros_ptr, \
+            out_acc.data_ptr<float>(), M, N, K, group_size, splitk)
+        if (bm == 16 && bn == 64) V13_L(16, 64);
+        else if (bm == 16 && bn == 32) V13_L(16, 32);
+        else if (bm == 16 && bn == 128) V13_L(16, 128);
+        else if (bm == 32 && bn == 64) V13_L(32, 64);
+        else if (bm == 32 && bn == 128) V13_L(32, 128);
+        else if (bm == 64 && bn == 64) V13_L(64, 64);
+        else TORCH_CHECK(false, "unsupported V13_CFG ", bm, "x", bn);
+        #undef V13_L
+        const long ne = (long)M * N;
+        cvt_f32_f16_kernel<<<dim3((ne + 255) / 256), dim3(256), 0, stream>>>(
+            out_acc.data_ptr<float>(),
+            reinterpret_cast<__half*>(out.data_ptr<at::Half>()), ne);
+    } else if (version == 14) {
+        // small-M WMMA, N-split warps + split-K. CFG VLLM_W4A8_V14_CFG (BNxNWARPS,
+        // def 128x8), VLLM_W4A8_V14_SPLITK (def 4). fp32 atomic -> fp16.
+        TORCH_CHECK(group_size == 128 || group_size == 32,
+                    "v14 needs group_size 32 or 128; got ", group_size);
+        int bn = 128, nw = 8, splitk = 4;
+        if (const char* e = std::getenv("VLLM_W4A8_V14_CFG")) {
+            const char* p = e; bn = std::atoi(p);
+            while (*p && *p != 'x' && *p != 'X') ++p;
+            if (*p) nw = std::atoi(p + 1);
+        }
+        if (const char* e = std::getenv("VLLM_W4A8_V14_SPLITK")) splitk = std::atoi(e);
+        int gt = 4;  // multi-group staging (the v6 sync-reduction win)
+        if (const char* e = std::getenv("VLLM_W4A8_V14_GTILE")) gt = std::atoi(e);
+        if (gt != 1 && gt != 2 && gt != 4) gt = 1;
+        const int nkg = K / group_size;
+        if (splitk > nkg) splitk = nkg;
+        if (splitk < 1) splitk = 1;
+        auto out_acc = at::zeros({M, N}, x.options().dtype(at::kFloat));
+        dim3 grid((N + bn - 1) / bn, (M + 15) / 16, splitk);
+        #define V14_L(BN, NW, GT) mmq_fp8_gemm_kernel_v14<BN, NW, GT><<<grid, dim3(NW*32), 0, stream>>>( \
+            x_fp8.data_ptr<unsigned char>(), act_scales.data_ptr<float>(), \
+            w_packed.data_ptr<int>(), \
+            reinterpret_cast<const __half*>(scales.data_ptr<at::Half>()), w_zeros_ptr, \
+            out_acc.data_ptr<float>(), M, N, K, group_size, splitk)
+        // GTILE x BN static LDS must stay <=64KB (array sized for MAX_GROUP_SIZE):
+        // BN<=64 -> up to GTILE 4; BN=128 -> up to 2; BN=256 -> 1.
+        #define V14_G4(BN, NW) do { if (gt>=4) V14_L(BN,NW,4); else if (gt>=2) V14_L(BN,NW,2); else V14_L(BN,NW,1); } while(0)
+        #define V14_G2(BN, NW) do { if (gt>=2) V14_L(BN,NW,2); else V14_L(BN,NW,1); } while(0)
+        if (bn == 128 && nw == 8) V14_G2(128, 8);
+        else if (bn == 128 && nw == 4) V14_G2(128, 4);
+        else if (bn == 64 && nw == 4) V14_G4(64, 4);
+        else if (bn == 64 && nw == 2) V14_G4(64, 2);
+        else if (bn == 64 && nw == 1) V14_G4(64, 1);
+        else if (bn == 32 && nw == 2) V14_G4(32, 2);
+        else if (bn == 32 && nw == 1) V14_G4(32, 1);
+        else if (bn == 256 && nw == 8) V14_L(256, 8, 1);
+        else TORCH_CHECK(false, "unsupported V14_CFG ", bn, "x", nw);
+        #undef V14_G2
+        #undef V14_G4
+        #undef V14_L
+        const long ne = (long)M * N;
+        cvt_f32_f16_kernel<<<dim3((ne + 255) / 256), dim3(256), 0, stream>>>(
+            out_acc.data_ptr<float>(),
+            reinterpret_cast<__half*>(out.data_ptr<at::Half>()), ne);
+    } else if (version == 12) {
+        // small-M split-K WMMA. CFG VLLM_W4A8_V12_CFG (BMxBN, def 64x64),
+        // VLLM_W4A8_V12_SPLITK (def 8). fp32 atomic accumulate -> cast to fp16.
+        TORCH_CHECK(group_size == 128 || group_size == 32,
+                    "v12 needs group_size 32 or 128; got ", group_size);
+        int bm = 64, bn = 64, splitk = 8;
+        if (const char* e = std::getenv("VLLM_W4A8_V12_CFG")) {
+            const char* p = e; bm = std::atoi(p);
+            while (*p && *p != 'x' && *p != 'X') ++p;
+            if (*p) bn = std::atoi(p + 1);
+        }
+        if (const char* e = std::getenv("VLLM_W4A8_V12_SPLITK")) splitk = std::atoi(e);
+        const int num_k_groups = K / group_size;
+        if (splitk > num_k_groups) splitk = num_k_groups;
+        if (splitk < 1) splitk = 1;
+        auto out_acc = at::zeros({M, N}, x.options().dtype(at::kFloat));
+        dim3 grid((N + bn - 1) / bn, (M + bm - 1) / bm, splitk);
+        #define V12_L(BM, BN) mmq_fp8_gemm_kernel_v12<BM, BN><<<grid, dim3((BM/16)*32), 0, stream>>>( \
+            x_fp8.data_ptr<unsigned char>(), act_scales.data_ptr<float>(), \
+            w_packed.data_ptr<int>(), \
+            reinterpret_cast<const __half*>(scales.data_ptr<at::Half>()), w_zeros_ptr, \
+            out_acc.data_ptr<float>(), M, N, K, group_size, splitk)
+        if (bm == 16 && bn == 64) V12_L(16, 64);
+        else if (bm == 32 && bn == 64) V12_L(32, 64);
+        else if (bm == 64 && bn == 64) V12_L(64, 64);
+        else if (bm == 32 && bn == 128) V12_L(32, 128);
+        else if (bm == 64 && bn == 128) V12_L(64, 128);
+        else if (bm == 16 && bn == 128) V12_L(16, 128);
+        else TORCH_CHECK(false, "unsupported V12_CFG ", bm, "x", bn);
+        #undef V12_L
+        const long ne = (long)M * N;
+        cvt_f32_f16_kernel<<<dim3((ne + 255) / 256), dim3(256), 0, stream>>>(
+            out_acc.data_ptr<float>(),
+            reinterpret_cast<__half*>(out.data_ptr<at::Half>()), ne);
+    } else if (version == 11) {
+        // v11: decode GEMV, K-TILED. one warp per output column; streams weights.
+        TORCH_CHECK(K % 1024 == 0, "v11 needs K % 1024 == 0; got ", K);
+        TORCH_CHECK(group_size % 32 == 0, "v11 needs group_size % 32; got ", group_size);
+        TORCH_CHECK(M <= 16, "v11 is decode-only (M <= 16); got M=", M);
+        int nw = 16;
+        if (const char* e = std::getenv("VLLM_W4A8_V11_NW")) nw = std::atoi(e);
+        // Pick BK = largest multiple of 1024 with M*BK <= 64KB LDS (and <= K). The
+        // kernel clamps the final chunk, so BK need not divide K. M<=16 => BK>=4096.
+        int BK = K;
+        const int budget = 65536;
+        if ((size_t)M * K > (size_t)budget) {
+            int allow = (budget / M) & ~1023;      // round down to multiple of 1024
+            if (allow < 1024) allow = 1024;        // M<=16 guarantees M*1024 <= 16384
+            BK = (allow < K) ? allow : K;
+        }
+        if (const char* e = std::getenv("VLLM_W4A8_V11_BK")) { int b = std::atoi(e); if (b > 0) BK = b; }
+        const size_t shmem = (size_t)M * BK;
+        dim3 block(nw * 32);
+        dim3 grid((N + nw - 1) / nw);
+        auto L = [&](auto kern) { kern<<<grid, block, shmem, stream>>>(
+            x_fp8.data_ptr<unsigned char>(), act_scales.data_ptr<float>(),
+            w_packed.data_ptr<int>(),
+            reinterpret_cast<const __half*>(scales.data_ptr<at::Half>()), w_zeros_ptr,
+            reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, K, group_size, BK); };
+        if (nw == 8) L(mmq_fp8_gemv_kernel_v11<8, 16>);
+        else if (nw == 16) L(mmq_fp8_gemv_kernel_v11<16, 16>);
+        else if (nw == 32) L(mmq_fp8_gemv_kernel_v11<32, 16>);
+        else TORCH_CHECK(false, "V11_NW must be 8/16/32");
+    } else if (version == 10) {
+        // v10: A out of LDS (warp-shuffle transpose) -> B-only LDS -> double-buffer
+        // B at the full BM=256/BN=128 tile. CFG VLLM_W4A8_V10_CFG (def 256x128),
+        // DB via VLLM_W4A8_V10_DB (def 1), swiz via VLLM_W4A8_V7_SWIZ.
+        TORCH_CHECK(group_size == 128 || group_size == 32,
+                    "v10 needs group_size 32 or 128; got ", group_size);
+        int bm = 256, bn = 128, db = 1, swiz = 1;
+        if (const char* e = std::getenv("VLLM_W4A8_V10_CFG")) {
+            const char* x = e; bm = std::atoi(x);
+            while (*x && *x != 'x' && *x != 'X') ++x;
+            if (*x) bn = std::atoi(x + 1);
+        }
+        if (const char* e = std::getenv("VLLM_W4A8_V10_DB")) db = std::atoi(e);
+        if (const char* e = std::getenv("VLLM_W4A8_V7_SWIZ")) swiz = std::atoi(e);
+        const int LDSBK = group_size + 8;
+        const size_t shmem = static_cast<size_t>(db ? 2 : 1) * bn * LDSBK;
+        dim3 grid = swiz ? dim3((M + bm - 1) / bm, (N + bn - 1) / bn)
+                         : dim3((N + bn - 1) / bn, (M + bm - 1) / bm);
+        auto launch = [&](auto kern, int nwarps) {
+            dim3 block(nwarps * 32);
+            kern<<<grid, block, shmem, stream>>>(
+                x_fp8.data_ptr<unsigned char>(),
+                act_scales.data_ptr<float>(),
+                w_packed.data_ptr<int>(),
+                reinterpret_cast<const __half*>(scales.data_ptr<at::Half>()),
+                w_zeros_ptr,
+                reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
+                M, N, K, group_size, swiz);
+        };
+        #define V10_L(BM, BN, G) do { \
+            if (db) launch(mmq_fp8_gemm_kernel_v10<BM, BN, BM/16, G, true>, BM/16); \
+            else    launch(mmq_fp8_gemm_kernel_v10<BM, BN, BM/16, G, false>, BM/16); \
+        } while (0)
+        #define V10_BKT(BM, BN) do { \
+            if (group_size == 128) V10_L(BM, BN, 128); else V10_L(BM, BN, 32); \
+        } while (0)
+        if (bm == 16 && bn == 128) V10_BKT(16, 128);
+        else if (bm == 32 && bn == 128) V10_BKT(32, 128);
+        else if (bm == 64 && bn == 128) V10_BKT(64, 128);
+        else if (bm == 128 && bn == 128) V10_BKT(128, 128);
+        else if (bm == 256 && bn == 128) V10_BKT(256, 128);
+        else if (bm == 256 && bn == 256) V10_BKT(256, 256);
+        else if (bm == 384 && bn == 128) V10_BKT(384, 128);
+        else if (bm == 512 && bn == 128) V10_BKT(512, 128);
+        else TORCH_CHECK(false, "unsupported V10_CFG ", bm, "x", bn);
+        #undef V10_BKT
+        #undef V10_L
+    } else if (version == 9) {
+        // v9: decoupled-depth double-buffer; keeps BM=256/BN=128 8-acc tile.
+        // Needs a compile-time group size (32 or 128). CFG VLLM_W4A8_V9_CFG.
+        TORCH_CHECK(group_size == 128 || group_size == 32,
+                    "v9 needs group_size 32 or 128; got ", group_size);
+        int bm = 256, bn = 128;
+        if (const char* e = std::getenv("VLLM_W4A8_V9_CFG")) {
+            const char* x = e; bm = std::atoi(x);
+            while (*x && *x != 'x' && *x != 'X') ++x;
+            if (*x) bn = std::atoi(x + 1);
+        }
+        const int bk_lds = (group_size >= 128) ? 64 : group_size;
+        const size_t shmem = static_cast<size_t>(2) * (bm + bn) * (bk_lds + 8);
+        dim3 grid((N + bn - 1) / bn, (M + bm - 1) / bm);
+        auto launch = [&](auto kern, int nwarps) {
+            dim3 block(nwarps * 32);
+            kern<<<grid, block, shmem, stream>>>(
+                x_fp8.data_ptr<unsigned char>(),
+                act_scales.data_ptr<float>(),
+                w_packed.data_ptr<int>(),
+                reinterpret_cast<const __half*>(scales.data_ptr<at::Half>()),
+                w_zeros_ptr,
+                reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
+                M, N, K, group_size);
+        };
+        #define V9_BKT(BM, BN) do { \
+            if (group_size == 128) launch(mmq_fp8_gemm_kernel_v9<BM, BN, BM/16, 128>, BM/16); \
+            else launch(mmq_fp8_gemm_kernel_v9<BM, BN, BM/16, 32>, BM/16); \
+        } while (0)
+        if (bm == 128 && bn == 128) V9_BKT(128, 128);
+        else if (bm == 192 && bn == 128) V9_BKT(192, 128);
+        else if (bm == 256 && bn == 128) V9_BKT(256, 128);
+        else if (bm == 256 && bn == 64) V9_BKT(256, 64);
+        else TORCH_CHECK(false, "unsupported V9_CFG ", bm, "x", bn);
+        #undef V9_BKT
+    } else if (version == 8) {
+        // v8: double-buffered (overlap staging with compute, 1 barrier/group).
+        // CFG via VLLM_W4A8_V8_CFG="BMxBN" (default 96x128 — the largest BM that
+        // fits 2x LDS at BN=128/G=128 in 64KB while keeping 8-acc ILP).
+        int bm = 96, bn = 128;
+        if (const char* e = std::getenv("VLLM_W4A8_V8_CFG")) {
+            const char* x = e; bm = std::atoi(x);
+            while (*x && *x != 'x' && *x != 'X') ++x;
+            if (*x) bn = std::atoi(x + 1);
+        }
+        const int LDSBK = group_size + 8;
+        const size_t shmem = static_cast<size_t>(2) * (bm + bn) * LDSBK;
+        dim3 grid((N + bn - 1) / bn, (M + bm - 1) / bm);
+        auto launch = [&](auto kern, int nwarps) {
+            dim3 block(nwarps * 32);
+            kern<<<grid, block, shmem, stream>>>(
+                x_fp8.data_ptr<unsigned char>(),
+                act_scales.data_ptr<float>(),
+                w_packed.data_ptr<int>(),
+                reinterpret_cast<const __half*>(scales.data_ptr<at::Half>()),
+                w_zeros_ptr,
+                reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
+                M, N, K, group_size);
+        };
+        #define V8_LAUNCH(BM, BN) \
+            launch(mmq_fp8_gemm_kernel_v8<BM, BN, BM / 16>, BM / 16)
+        if (bm == 64 && bn == 128) V8_LAUNCH(64, 128);
+        else if (bm == 80 && bn == 128) V8_LAUNCH(80, 128);
+        else if (bm == 96 && bn == 128) V8_LAUNCH(96, 128);
+        else if (bm == 112 && bn == 128) V8_LAUNCH(112, 128);
+        else if (bm == 128 && bn == 64) V8_LAUNCH(128, 64);
+        else if (bm == 256 && bn == 128) V8_LAUNCH(256, 128);  // only fits small G
+        else TORCH_CHECK(false, "unsupported V8_CFG ", bm, "x", bn);
+        #undef V8_LAUNCH
+    } else if (version == 7) {
+        // v7: v5 algorithm, templated (BM x BN) tile + dynamic LDS, to sweep
+        // occupancy (tile size) AND WMMA-ILP depth (BN/16 = independent accs per
+        // warp; peak needs ~8). Config via VLLM_W4A8_V7_CFG = "BMxBN"
+        // (default "256x128", the swept optimum: BN=128 => 8 independent WMMA
+        // accumulators/warp = peak's NACC, BM=256 amortizes staging; ~1.3x v5).
+        // One warp per 16 rows (NWARPS = BM/16).
+        int bm = 256, bn = 128;
+        if (const char* e = std::getenv("VLLM_W4A8_V7_CFG")) {
+            const char* x = e;
+            bm = std::atoi(x);
+            while (*x && *x != 'x' && *x != 'X') ++x;
+            if (*x) bn = std::atoi(x + 1);
+        }
+        int diag = 0;
+        if (const char* e = std::getenv("VLLM_W4A8_V7_DIAG")) diag = std::atoi(e);
+        int swiz = 1;  // default on: weight-slab L2/MALL reuse
+        if (const char* e = std::getenv("VLLM_W4A8_V7_SWIZ")) swiz = std::atoi(e);
+        const int LDSBK = group_size + 8;
+        const size_t shmem = static_cast<size_t>(bm + bn) * LDSBK;
+        dim3 grid = swiz ? dim3((M + bm - 1) / bm, (N + bn - 1) / bn)
+                         : dim3((N + bn - 1) / bn, (M + bm - 1) / bm);
+        auto launch = [&](auto kern, int nwarps) {
+            dim3 block(nwarps * 32);
+            kern<<<grid, block, shmem, stream>>>(
+                x_fp8.data_ptr<unsigned char>(),
+                act_scales.data_ptr<float>(),
+                w_packed.data_ptr<int>(),
+                reinterpret_cast<const __half*>(scales.data_ptr<at::Half>()),
+                w_zeros_ptr,
+                reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
+                M, N, K, group_size, diag, swiz);
+        };
+        // Pick a compile-time-BK instantiation for the common group sizes
+        // (128/32) so the staging div/mod fold to shifts; else BKT=0 (runtime).
+        #define V7_BKT(BM, BN) do { \
+            if (group_size == 128) launch(mmq_fp8_gemm_kernel_v7<BM, BN, BM/16, 128>, BM/16); \
+            else if (group_size == 32) launch(mmq_fp8_gemm_kernel_v7<BM, BN, BM/16, 32>, BM/16); \
+            else launch(mmq_fp8_gemm_kernel_v7<BM, BN, BM/16, 0>, BM/16); \
+        } while (0)
+        if (bm == 64 && bn == 64) V7_BKT(64, 64);
+        else if (bm == 64 && bn == 128) V7_BKT(64, 128);
+        else if (bm == 80 && bn == 128) V7_BKT(80, 128);
+        else if (bm == 96 && bn == 128) V7_BKT(96, 128);
+        else if (bm == 112 && bn == 128) V7_BKT(112, 128);
+        else if (bm == 128 && bn == 64) V7_BKT(128, 64);
+        else if (bm == 128 && bn == 128) V7_BKT(128, 128);
+        else if (bm == 128 && bn == 256) V7_BKT(128, 256);
+        else if (bm == 192 && bn == 128) V7_BKT(192, 128);
+        else if (bm == 256 && bn == 64) V7_BKT(256, 64);
+        else if (bm == 256 && bn == 128) V7_BKT(256, 128);
+        else if (bm == 256 && bn == 192) V7_BKT(256, 192);
+        else TORCH_CHECK(false, "unsupported V7_CFG ", bm, "x", bn);
+        #undef V7_BKT
+    } else if (version == 6) {
+        // v6: K-extension -- b128 dual-subtile loads + 2 WMMAs per load.
+        // Requires group_size % 32 == 0; pad must be a multiple of 16 for the
+        // b128 alignment / row stride. Sweepable via VLLM_W4A8_V6_PAD (def 16).
+        TORCH_CHECK(group_size % 32 == 0,
+                    "v6 needs group_size % 32 == 0; got ", group_size);
+        int lds_pad = 16;
+        if (const char* e = std::getenv("VLLM_W4A8_V6_PAD")) {
+            lds_pad = std::atoi(e);
+            TORCH_CHECK(lds_pad >= 0 && lds_pad % 16 == 0,
+                        "VLLM_W4A8_V6_PAD must be a non-negative multiple of 16");
+        }
+        const int LDSBK = group_size + lds_pad;
+        const size_t shmem = static_cast<size_t>(V2_BM + V2_BN) * LDSBK;
+        dim3 block(V2_NWARPS * 32);
+        dim3 grid((N + V2_BN - 1) / V2_BN, (M + V2_BM - 1) / V2_BM);
+        mmq_fp8_gemm_kernel_v6<<<grid, block, shmem, stream>>>(
+            x_fp8.data_ptr<unsigned char>(),
+            act_scales.data_ptr<float>(),
+            w_packed.data_ptr<int>(),
+            reinterpret_cast<const __half*>(scales.data_ptr<at::Half>()),
+            w_zeros_ptr,
+            reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
+            M, N, K, group_size, lds_pad);
+    } else if (version == 5) {
         // v5: raw fp8 WMMA builtin + direct K-major int2 loads.
         dim3 block(V2_NWARPS * 32);
         dim3 grid((N + V2_BN - 1) / V2_BN, (M + V2_BM - 1) / V2_BM);
@@ -783,5 +2792,152 @@ void launch_mmq_fp8_gemm_gfx1201(
             w_zeros_ptr,
             reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
             M, N, K, group_size);
+    }
+}
+
+// =================== v15 launcher (register-direct, repacked weights) ===================
+void launch_mmq_fp8_gemm_v15_gfx1201(
+    const at::Tensor& x,           // (M, K) fp16
+    const at::Tensor& w_rep,       // (N/16, K/16, 32) int32 lane-order
+    const at::Tensor& scales,      // (N, K/group) fp16
+    const at::Tensor& w_zeros,     // (N/8, K/group) int32 or empty
+    at::Tensor& out,               // (M, N) fp16
+    int64_t N) {
+    using namespace w4a8_fp8_wmma;
+    const int M = x.size(0);
+    const int K = x.size(1);
+    const int group_size = K / scales.size(1);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    auto x_fp8 = at::empty({M, K}, x.options().dtype(at::kByte));
+    auto act_scales = at::empty({M}, x.options().dtype(at::kFloat));
+    compute_act_fp8_and_scales_kernel<<<dim3(M), dim3(ACTQUANT_BLOCK), 0, stream>>>(
+        reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),
+        x_fp8.data_ptr<unsigned char>(), act_scales.data_ptr<float>(), M, K);
+    const int* wz = (w_zeros.defined() && w_zeros.numel() > 0) ? w_zeros.data_ptr<int>() : nullptr;
+    int bn = 64, nw = 4, splitk = 2;
+    if (const char* e = std::getenv("VLLM_W4A8_V15_CFG")) {
+        const char* p = e; bn = std::atoi(p);
+        while (*p && *p != 'x' && *p != 'X') ++p;
+        if (*p) nw = std::atoi(p + 1);
+    }
+    if (const char* e = std::getenv("VLLM_W4A8_V15_SPLITK")) splitk = std::atoi(e);
+    const int nkg = K / group_size;
+    if (splitk > nkg) splitk = nkg; if (splitk < 1) splitk = 1;
+    auto out_acc = at::zeros({M, (int)N}, x.options().dtype(at::kFloat));
+    dim3 grid(((int)N + bn - 1) / bn, (M + 15) / 16, splitk);
+    #define V15_L(BN, NW) mmq_fp8_gemm_kernel_v15<BN, NW><<<grid, dim3(NW*32), 0, stream>>>( \
+        x_fp8.data_ptr<unsigned char>(), act_scales.data_ptr<float>(), w_rep.data_ptr<int>(), \
+        reinterpret_cast<const __half*>(scales.data_ptr<at::Half>()), wz, \
+        out_acc.data_ptr<float>(), M, (int)N, K, group_size, splitk)
+    if (bn == 64 && nw == 4) V15_L(64, 4);
+    else if (bn == 64 && nw == 2) V15_L(64, 2);
+    else if (bn == 128 && nw == 8) V15_L(128, 8);
+    else if (bn == 128 && nw == 4) V15_L(128, 4);
+    else if (bn == 32 && nw == 2) V15_L(32, 2);
+    else if (bn == 256 && nw == 8) V15_L(256, 8);
+    else TORCH_CHECK(false, "unsupported V15_CFG ", bn, "x", nw);
+    #undef V15_L
+    const long ne = (long)M * N;
+    w4a8_fp8_wmma::cvt_f32_f16_kernel<<<dim3((ne + 255) / 256), dim3(256), 0, stream>>>(
+        out_acc.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), ne);
+}
+
+// v16: f16-WMMA twin of v15 (same w_rep contract). Reuses v15's repacked weights.
+void launch_mmq_fp8_gemm_v16_gfx1201(
+    const at::Tensor& x,           // (M, K) fp16
+    const at::Tensor& w_rep,       // (N/16, K/16, 32) int32 lane-order
+    const at::Tensor& scales,      // (N, K/group) fp16
+    const at::Tensor& w_zeros,     // (N/8, K/group) int32 or empty
+    at::Tensor& out,               // (M, N) fp16
+    int64_t N) {
+    using namespace w4a8_fp8_wmma;
+    const int M = x.size(0);
+    const int K = x.size(1);
+    const int group_size = K / scales.size(1);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    auto x_fp8 = at::empty({M, K}, x.options().dtype(at::kByte));
+    auto act_scales = at::empty({M}, x.options().dtype(at::kFloat));
+    compute_act_fp8_and_scales_kernel<<<dim3(M), dim3(ACTQUANT_BLOCK), 0, stream>>>(
+        reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),
+        x_fp8.data_ptr<unsigned char>(), act_scales.data_ptr<float>(), M, K);
+    const int* wz = (w_zeros.defined() && w_zeros.numel() > 0) ? w_zeros.data_ptr<int>() : nullptr;
+    int bn = 64, nw = 4, splitk = 2;
+    if (const char* e = std::getenv("VLLM_W4A8_V16_CFG")) {
+        const char* p = e; bn = std::atoi(p);
+        while (*p && *p != 'x' && *p != 'X') ++p;
+        if (*p) nw = std::atoi(p + 1);
+    }
+    if (const char* e = std::getenv("VLLM_W4A8_V16_SPLITK")) splitk = std::atoi(e);
+    const int nkg = K / group_size;
+    if (splitk > nkg) splitk = nkg; if (splitk < 1) splitk = 1;
+    auto out_acc = at::zeros({M, (int)N}, x.options().dtype(at::kFloat));
+    dim3 grid(((int)N + bn - 1) / bn, (M + 15) / 16, splitk);
+    #define V16_L(BN, NW) mmq_fp8_gemm_kernel_v16<BN, NW><<<grid, dim3(NW*32), 0, stream>>>( \
+        x_fp8.data_ptr<unsigned char>(), act_scales.data_ptr<float>(), w_rep.data_ptr<int>(), \
+        reinterpret_cast<const __half*>(scales.data_ptr<at::Half>()), wz, \
+        out_acc.data_ptr<float>(), M, (int)N, K, group_size, splitk)
+    if (bn == 64 && nw == 4) V16_L(64, 4);
+    else if (bn == 64 && nw == 2) V16_L(64, 2);
+    else if (bn == 128 && nw == 8) V16_L(128, 8);
+    else if (bn == 128 && nw == 4) V16_L(128, 4);
+    else if (bn == 32 && nw == 2) V16_L(32, 2);
+    else if (bn == 32 && nw == 1) V16_L(32, 1);
+    else if (bn == 256 && nw == 8) V16_L(256, 8);
+    else TORCH_CHECK(false, "unsupported V16_CFG ", bn, "x", nw);
+    #undef V16_L
+    const long ne = (long)M * N;
+    w4a8_fp8_wmma::cvt_f32_f16_kernel<<<dim3((ne + 255) / 256), dim3(256), 0, stream>>>(
+        out_acc.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), ne);
+}
+
+// v17: true W4A16 -- fp16 activations DIRECT (no act-quant), same w_rep contract.
+void launch_mmq_w4a16_gemm_v17_gfx1201(
+    const at::Tensor& x,           // (M, K) fp16
+    const at::Tensor& w_rep,       // (N/16, K/16, 32) int32 lane-order
+    const at::Tensor& scales,      // (N, K/group) fp16
+    const at::Tensor& w_zeros,     // (N/8, K/group) int32 or empty
+    at::Tensor& out,               // (M, N) fp16
+    int64_t N) {
+    using namespace w4a8_fp8_wmma;
+    const int M = x.size(0);
+    const int K = x.size(1);
+    const int group_size = K / scales.size(1);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const int* wz = (w_zeros.defined() && w_zeros.numel() > 0) ? w_zeros.data_ptr<int>() : nullptr;
+    int bn = 64, nw = 4, splitk = 1;
+    if (const char* e = std::getenv("VLLM_W4A8_V17_CFG")) {
+        const char* p = e; bn = std::atoi(p);
+        while (*p && *p != 'x' && *p != 'X') ++p;
+        if (*p) nw = std::atoi(p + 1);
+    }
+    if (const char* e = std::getenv("VLLM_W4A8_V17_SPLITK")) splitk = std::atoi(e);
+    const int nkg = K / group_size;
+    if (splitk > nkg) splitk = nkg; if (splitk < 1) splitk = 1;
+    // splitk==1 -> direct f16 write (no out_acc, no cvt). splitk>1 -> f32 atomic + cvt.
+    at::Tensor out_acc;
+    float* oacc = nullptr;
+    if (splitk > 1) {
+        out_acc = at::zeros({M, (int)N}, x.options().dtype(at::kFloat));
+        oacc = out_acc.data_ptr<float>();
+    }
+    const __half* xh = reinterpret_cast<const __half*>(x.data_ptr<at::Half>());
+    const __half* sh = reinterpret_cast<const __half*>(scales.data_ptr<at::Half>());
+    __half* oh = reinterpret_cast<__half*>(out.data_ptr<at::Half>());
+    dim3 grid(((int)N + bn - 1) / bn, (M + 15) / 16, splitk);
+    #define V17_L(BN, NW) mmq_w4a16_gemm_kernel_v17<BN, NW><<<grid, dim3(NW*32), 0, stream>>>( \
+        xh, w_rep.data_ptr<int>(), sh, wz, oacc, oh, M, (int)N, K, group_size, splitk)
+    if (bn == 64 && nw == 4) V17_L(64, 4);
+    else if (bn == 64 && nw == 2) V17_L(64, 2);
+    else if (bn == 128 && nw == 8) V17_L(128, 8);
+    else if (bn == 128 && nw == 4) V17_L(128, 4);
+    else if (bn == 32 && nw == 2) V17_L(32, 2);
+    else if (bn == 32 && nw == 1) V17_L(32, 1);
+    else if (bn == 256 && nw == 8) V17_L(256, 8);
+    else TORCH_CHECK(false, "unsupported V17_CFG ", bn, "x", nw);
+    #undef V17_L
+    if (splitk > 1) {
+        const long ne = (long)M * N;
+        w4a8_fp8_wmma::cvt_f32_f16_kernel<<<dim3((ne + 255) / 256), dim3(256), 0, stream>>>(
+            oacc, oh, ne);
     }
 }

@@ -156,6 +156,14 @@ def main():
     for c in cases:
         res.append(run(*c, version=5, asym=False))
         res.append(run(*c, version=5, asym=True))
+    print("=== grouped v6 (A-out-of-LDS WMMA) ===")
+    for c in cases:
+        res.append(run(*c, version=6, asym=False))
+        res.append(run(*c, version=6, asym=True))
+    print("=== grouped v7 (decode GEMV) ===")
+    for c in cases:
+        res.append(run(*c, version=7, asym=False))
+        res.append(run(*c, version=7, asym=True))
     print("=" * 50)
     if all(res):
         print(f"ALL PASSED ({len(res)})"); sys.exit(0)

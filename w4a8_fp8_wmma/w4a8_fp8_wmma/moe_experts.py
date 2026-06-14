@@ -33,6 +33,7 @@ Weight layout: AWQ MoE weights arrive packed-along-output with AWQ bit order.
 ``zeros (E, N//8, K//group)`` int32 — the same convention the dense AWQ path was
 validated against (``_convert_awq_to_standard_format`` + the AutoGPTQ repack).
 """
+import json
 import logging
 import os
 
@@ -64,30 +65,94 @@ def _moe_enabled() -> bool:
 
 
 def _moe_version() -> int:
-    """Grouped-kernel version: 5 = fp8 WMMA (default), 0 = scalar golden (debug)."""
-    return int(os.environ.get("VLLM_ROCM_W4A8_FP8_WMMA_MOE_VERSION", "5"))
+    """Grouped-kernel version: 6 = fp8 WMMA with A out of LDS (default; bit-exact
+    to v5 and >= v5, ~5-11% faster at large M), 5 = fp8 WMMA A-in-LDS, 0 = scalar
+    golden (debug)."""
+    return int(os.environ.get("VLLM_ROCM_W4A8_FP8_WMMA_MOE_VERSION", "6"))
+
+
+def _force_mode() -> str:
+    """Override the per-shape tuning gate. VLLM_ROCM_W4A8_FORCE:
+    'auto' (default) crossover cache; 'on'/'1' always our grouped op; 'off'/'0'
+    always stock Triton MoE. Same env/semantics as the dense path's gate."""
+    v = os.environ.get("VLLM_ROCM_W4A8_FORCE", "auto").strip().lower()
+    if v in ("on", "1", "true"):
+        return "on"
+    if v in ("off", "0", "false"):
+        return "off"
+    return "auto"
 
 
 def _moe_min_m() -> int:
     """M-adaptive dispatch threshold: route batches with M < this to the stock
-    Triton MoE (decode regime, where our padded-sorted grouped op pays an ~8x
-    block-padding penalty at low occupancy + a torch-level scatter), and use our
-    FP8-WMMA grouped op only for M >= this (large-M prefill, compute-bound, ~12%
-    padding waste, where we win). Mirrors the dense path's crossover so the MoE
-    pathway is always >= stock. Tunable; 0 forces our op for all M."""
-    return int(os.environ.get("VLLM_ROCM_W4A8_FP8_WMMA_MOE_MIN_M", "512"))
+    Triton MoE (tiny-decode regime), and use our FP8-WMMA grouped op for M >=
+    this. Mirrors the dense path's crossover so the MoE pathway is always >=
+    stock. Tunable; 0 forces our op for all M. Default 64: micro-bench (block_m=64
+    + dynamic LDS) shows we beat stock moe_wna16 at M>=64 (~0.84-0.98x) and only
+    lose at very small decode batches (M<=32)."""
+    return int(os.environ.get("VLLM_ROCM_W4A8_FP8_WMMA_MOE_MIN_M", "64"))
+
+
+# --------------------------------------------------------------------------- #
+# M-adaptive dispatch via an AOT crossover cache (offline-tuned, O(1) lookup).
+# moe_crossover_cache.json: "E,hidden,inter,group,top_k" -> [lo, hi] (the M-window
+# where our op beats stock moe_wna16) or null (never). Unknown shape -> stock, so
+# the MoE pathway is ALWAYS >= stock (no regression). Tuned by tune_moe_crossover.py.
+# --------------------------------------------------------------------------- #
+_MOE_XOVER = None
+
+
+def _moe_crossover_for(E, hidden, inter, group, top_k):
+    global _MOE_XOVER
+    if _MOE_XOVER is None:
+        path = os.environ.get(
+            "VLLM_ROCM_W4A8_FP8_WMMA_MOE_CACHE",
+            os.path.join(os.path.dirname(__file__), "moe_crossover_cache.json"))
+        try:
+            with open(path) as f:
+                _MOE_XOVER = json.load(f)
+        except (OSError, ValueError):
+            _MOE_XOVER = {}
+    return _MOE_XOVER.get(f"{E},{hidden},{inter},{group},{top_k}")
+
+
+def _moe_should_engage(M, w13_op, w2_op, w13_s, topk_ids) -> bool:
+    """Whether to run our grouped op (vs falling back to stock) for this batch.
+    Env VLLM_ROCM_W4A8_FP8_WMMA_MOE_MIN_M forces a simple M>=threshold (tuning /
+    forcing). Otherwise consult the AOT crossover cache for this exact (sharded)
+    expert shape: engage iff lo<=M<=hi; unknown shape -> stock (never regress)."""
+    force = _force_mode()
+    if force == "on":
+        return True
+    if force == "off":
+        return False
+    env = os.environ.get("VLLM_ROCM_W4A8_FP8_WMMA_MOE_MIN_M")
+    if env is not None:
+        return M >= int(env)
+    E = w13_op.size(0)
+    hidden = w2_op.size(1)
+    inter = w2_op.size(2) * 8
+    top_k = topk_ids.size(1)
+    group = hidden // w13_s.size(2)
+    win = _moe_crossover_for(E, hidden, inter, group, top_k)
+    if not win:
+        return False
+    # list of proven-winning [lo, hi] intervals; engage iff M lands in one.
+    return any(lo <= M <= hi for lo, hi in win)
 
 
 def _choose_block_m(M: int, top_k: int, num_experts: int) -> int:
-    """moe_align block size = our v5 tile M (16/32/64). Pick the smallest that
-    keeps per-expert occupancy reasonable, mirroring fused_marlin_moe's heuristic
-    but constrained to our kernel's allowed tile sizes."""
-    block_m = 64
-    for bm in (16, 32, 64):
-        block_m = bm
-        if num_experts > 0 and M * top_k / num_experts / bm < 0.9:
-            break
-    return block_m
+    """moe_align block size = our v5 tile M. block_m/16 = warps/block, so larger
+    block_m -> higher occupancy (but more padding at low per-expert load). Env
+    override VLLM_ROCM_W4A8_FP8_WMMA_MOE_BLOCK_M forces a fixed value (tuning)."""
+    env = os.environ.get("VLLM_ROCM_W4A8_FP8_WMMA_MOE_BLOCK_M")
+    if env:
+        return int(env)
+    # Occupancy-first: block_m=64 = 4 warps/block, which dominates the per-expert
+    # padding cost in micro-benchmarks (we win at M=64-512 with bm=64 but lose
+    # with bm=16/32). The dispatch routes tiny-M decode to the stock kernel, so
+    # the engaged path always has enough rows to justify the largest tile.
+    return 64
 
 
 # --------------------------------------------------------------------------- #
@@ -285,6 +350,23 @@ def _run_grouped_moe(x, w1, w2, w1_s, w2_s, w1_zp, w2_zp,
     if out_dtype is None:
         out_dtype = x.dtype
 
+    # Bounded-memory chunking: the padded-sorted scratch (out1/buf2) is O(M*top_k),
+    # which can spike past the KV-cache budget at large M -- e.g. vLLM's startup
+    # memory-profiling dummy run at max_num_batched_tokens. Process tokens in chunks
+    # so peak scratch is O(chunk*top_k) regardless of M. No-op when M <= chunk (the
+    # engaged decode/mid-M regime). Skipped for router-weight-on-input (top_k==1,
+    # tiny scratch, and the weight is already folded into x).
+    chunk = int(os.environ.get("VLLM_ROCM_W4A8_FP8_WMMA_MOE_APPLY_CHUNK", "4096"))
+    if chunk and M > chunk and not apply_router_weight_on_input:
+        out = torch.empty((M, K), dtype=out_dtype, device=dev)
+        for lo in range(0, M, chunk):
+            hi = min(lo + chunk, M)
+            out[lo:hi] = _run_grouped_moe(
+                x[lo:hi], w1, w2, w1_s, w2_s, w1_zp, w2_zp,
+                topk_weights[lo:hi], topk_ids[lo:hi], activation,
+                global_num_experts, expert_map, False, version, out_dtype)
+        return out
+
     # The op requires fp16 scales; convert defensively (no-op if already fp16).
     if w1_s.dtype != torch.float16:
         w1_s = w1_s.to(torch.float16)
@@ -295,7 +377,23 @@ def _run_grouped_moe(x, w1, w2, w1_s, w2_s, w1_zp, w2_zp,
     if w2_zp is None:
         w2_zp = torch.empty(0, dtype=torch.int32, device=dev)
 
-    block_m = _choose_block_m(M, top_k, E_local)
+    # DECODE specialisation: at small M the WMMA grouped kernels (v5/v6) waste
+    # most of their block_m-row tiles on routing padding (1-2 real rows/expert)
+    # and pay a __syncthreads per K-group. v7 is a grouped GEMV that compacts to
+    # the REAL routed rows and streams weights barrier-free -- op micro-bench
+    # (Qwen3.6 expert shape, gemm1): 3-4.6x faster than v6 at T<=8, crossing back
+    # near T~64. Use it (with the smallest block_m, less padding) for gemm1, and
+    # its SCATTER variant for the fused gemm2+reduce (the atomic scatter is
+    # contention-free at decode). Gated by M<=GEMV_MAX_M; v0 (golden) opts out.
+    gemv_max = int(os.environ.get("VLLM_ROCM_W4A8_FP8_WMMA_MOE_GEMV_MAX_M", "96"))
+    use_gemv = version != 0 and M <= gemv_max
+    # GEMV uses block_m=8 (not a WMMA multiple -- it doesn't tile): caps real
+    # rows/block at 8 so the acc[COLS][MMAX] register footprint stays small
+    # (MMAX=8) even at batched decode M=16-32, where block_m=16 oversized MMAX
+    # and crushed occupancy. Large per-expert counts just spill into more blocks.
+    gemv_bm = int(os.environ.get("VLLM_ROCM_W4A8_FP8_WMMA_MOE_GEMV_BLOCK_M", "8"))
+    block_m = gemv_bm if use_gemv else _choose_block_m(M, top_k, E_local)
+    gver = 7 if use_gemv else version
     # pad_sorted_ids=True rounds the sorted_ids length up to a multiple of
     # block_m (the op binding needs P % block_m == 0 and exactly P/block_m
     # blocks). The trailing rows past num_tokens_post_padded (ntp) are left
@@ -314,33 +412,42 @@ def _run_grouped_moe(x, w1, w2, w1_s, w2_s, w1_zp, w2_zp,
 
     # gemm1 (w13): padded-sorted (P, 2*inter)
     out1 = mmq(x16, w1, w1_s, sorted_ids, expert_ids, ntp,
-               top_k, block_m, version=version, w_zeros=w1_zp)
+               top_k, block_m, version=gver, w_zeros=w1_zp)
 
     # gate * up -> (P, inter)
     act_dim = out1.size(1) // 2 if activation.is_gated else out1.size(1)
     buf2 = torch.empty((P, act_dim), dtype=torch.float16, device=dev)
     apply_moe_activation(activation, buf2, out1)
 
-    # gemm2 (w2): identity-gather (each padded row is its own activation, so
-    # top_k=1 and the gather index = row). Real rows: sorted_ids < num_valid AND
-    # row < ntp; others get sentinel >= P so the op skips them.
-    num_valid = M * top_k
-    row_idx = torch.arange(P, dtype=torch.int32, device=dev)
-    valid = (sorted_ids < num_valid) & (row_idx < ntp)
-    ident = torch.where(
-        valid, row_idx, torch.full((P,), P, dtype=torch.int32, device=dev))
-    out2 = mmq(buf2, w2, w2_s, ident, expert_ids, ntp,
-               1, block_m, version=version, w_zeros=w2_zp)
+    if apply_router_weight_on_input:
+        tw_flat = torch.ones(M * top_k, dtype=torch.float32, device=dev)
+    else:
+        tw_flat = topk_weights.reshape(-1).to(torch.float32).contiguous()
 
-    # scatter-reduce over tokens, weighted by topk_weights, fp32 accumulate
-    slots = sorted_ids[valid].long()
-    tokens = slots // top_k
-    contrib = out2[valid].to(torch.float32)
-    if not apply_router_weight_on_input:
-        w = topk_weights.reshape(-1)[slots].to(torch.float32).unsqueeze(1)
-        contrib = contrib * w
-    acc = torch.zeros((M, K), dtype=torch.float32, device=dev)
-    acc.index_add_(0, tokens, contrib)
+    if use_gemv:
+        # gemm2 via the fused v7 SCATTER epilogue. v7 compacts to the real routed
+        # slots (identity-gather src=row_pad, validity from sorted_ids), so unlike
+        # the non-scatter+gather_reduce path it never touches the padding rows. The
+        # atomic scatter is contention-free at decode (few tokens). output must be
+        # pre-zeroed (captured in any HIP graph).
+        output = torch.zeros((M, K), dtype=torch.float32, device=dev)
+        w4a8_fp8_wmma.mmq_fp8_moe_gemm_scatter(
+            buf2.contiguous(), w2, w2_s, sorted_ids, expert_ids, ntp, tw_flat,
+            output, top_k, block_m, version=gver, w_zeros=w2_zp)
+        return output.to(out_dtype)
+
+    # gemm2 (w2) + topk-weight + reduce. SINGLE PATH (no adaptive branch): gemm2
+    # NON-scatter -> (P,N), then the custom HIP gather-reduce kernel. The old fused
+    # atomic-scatter epilogue's top_k-contended global atomicAdds dominated at
+    # prefill (+3.7ms at T=2048); this kernel does a contention-free per-token
+    # gather-reduce. GPU microbench (35B-A3B dims, bit-matches scatter rel~2e-4):
+    # 3.71x faster than scatter at prefill, 1.83x at mid, ~par at decode (~50us
+    # behind, <0.3% e2e). HIP-graph safe everywhere (no atomics, static shapes).
+    ident = torch.arange(P, dtype=torch.int32, device=dev)
+    out2 = mmq(buf2.contiguous(), w2, w2_s, ident, expert_ids, ntp, 1, block_m,
+               version=version, w_zeros=w2_zp)                        # (P, K) fp16
+    acc = w4a8_fp8_wmma.mmq_fp8_moe_gather_reduce(
+        out2.contiguous(), sorted_ids, tw_flat, ntp, top_k)           # (M, K) fp32
     return acc.to(out_dtype)
 
 
@@ -601,7 +708,132 @@ def register_moe(verbose: bool = True) -> bool:
     _MOE_REGISTERED = True
     if verbose:
         print("[w4a8_fp8_wmma] AWQ MoE hook installed (gfx12x): supported "
-              "AWQ-4bit asym experts -> grouped FP8-WMMA; GPTQ/CT untouched")
+              "AWQ-4bit asym experts -> grouped FP8-WMMA; GPTQ/CT via own hooks")
+    return True
+
+
+# --------------------------------------------------------------------------- #
+# GPTQ-MoE hook (auto_gptq; symmetric uint4b8). Mirrors the AWQ oracle override,
+# but in the `auto_gptq` namespace and with the SYMMETRIC conversion (no zeros).
+# --------------------------------------------------------------------------- #
+# GPTQ-4bit MoE routes through `AutoGPTQMoEMethod`, which (like AWQMarlinMoEMethod)
+# picks its experts via the shared `select_wna16_moe_backend` oracle -> stock
+# `MarlinExperts` on gfx1201. register_moe only patches the `awq_marlin` namespace,
+# so GPTQ was left on Marlin (it reached us only via the marlin-UNsupported fallback
+# to MoeWNA16Method). This hook closes that gap for the common marlin-supported case.
+_MOE_GPTQ_REGISTERED = False
+_GPTQ_OVERRIDE_LOGGED = False
+
+
+def register_moe_gptq(verbose: bool = True) -> bool:
+    """Route GPTQ-4bit (symmetric uint4b8, no desc_act) MoE expert layers on gfx12x
+    to our grouped FP8-WMMA kernel by overriding `AutoGPTQMoEMethod`'s oracle pick +
+    patching convert/make in the `auto_gptq` namespace ONLY. Symmetric -> w_zeros=None
+    (implicit uint4b8 zp=8); GPTQ weights are GPTQ-convention K-packed, same as the
+    compressed-tensors path -> reuse `_ct_moe_to_op_layout`. Idempotent; AWQ/CT/Marlin
+    untouched; no-op off gfx12x / disabled / unsupported config.
+
+    NOTE (gfx1201): this hook is DORMANT on RDNA4 — `check_moe_marlin_supports_layer`
+    is False there, so `AutoGPTQMoEMethod.get_quant_method` immediately falls back to
+    `MoeWNA16Config -> MoeWNA16Method` BEFORE this override matters (verified
+    2026-06-13: GPTQ MoE runs through `register_moe_wna16`, which engages our op under
+    FORCE/crossover exactly like AWQ). This hook only fires on hardware where
+    GPTQMoeMarlin IS supported (AutoGPTQMoEMethod actually used) — kept for that case,
+    untested on it."""
+    global _MOE_GPTQ_REGISTERED
+    if _MOE_GPTQ_REGISTERED:
+        return True
+    if not _moe_enabled():
+        if verbose:
+            print("[w4a8_fp8_wmma] GPTQ MoE disabled via env")
+        return False
+    if not _on_gfx12x():
+        if verbose:
+            print("[w4a8_fp8_wmma] GPTQ MoE: not gfx12x, leaving on Marlin")
+        return False
+
+    import w4a8_fp8_wmma  # noqa: F401
+    import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+    from vllm.model_executor.layers.quantization import auto_gptq
+    from vllm.model_executor.layers.quantization.auto_gptq import (
+        AutoGPTQConfig,
+        AutoGPTQMoEMethod,
+    )
+
+    our_experts_cls = get_experts_cls()
+    _orig_init = AutoGPTQMoEMethod.__init__
+    _orig_convert = auto_gptq.convert_to_wna16_moe_kernel_format
+    _orig_make = auto_gptq.make_wna16_moe_kernel
+
+    def _gptq_supported(quant_config) -> bool:
+        # 4-bit GPTQ is uint4b8 (symmetric); our op needs no activation reorder
+        # (no desc_act / non-trivial g_idx) and a supported group size.
+        try:
+            return (isinstance(quant_config, AutoGPTQConfig)
+                    and quant_config.quant_type.size_bits == 4
+                    and not getattr(quant_config, "desc_act", False)
+                    and _supported_group_size(quant_config.group_size))
+        except Exception:
+            return False
+
+    def _patched_init(self, quant_config, moe):
+        _orig_init(self, quant_config, moe)
+        if _gptq_supported(quant_config):
+            self.wna16_moe_backend = W4A8_FP8_WMMA_BACKEND
+            self.experts_cls = our_experts_cls
+            global _GPTQ_OVERRIDE_LOGGED
+            if verbose and not _GPTQ_OVERRIDE_LOGGED:
+                _GPTQ_OVERRIDE_LOGGED = True
+                print("[w4a8_fp8_wmma] GPTQ MoE -> W4A8Fp8WmmaExperts "
+                      f"(symmetric int4 g={quant_config.group_size}); grouped FP8-WMMA")
+
+    def _patched_convert(backend, layer, quant_config, input_dtype, w13, w2,
+                         w13_scale, w2_scale, w13_g_idx=None, w2_g_idx=None,
+                         w13_qzeros=None, w2_qzeros=None, w13_bias=None,
+                         w2_bias=None, **kw):
+        if backend is not W4A8_FP8_WMMA_BACKEND:
+            return _orig_convert(
+                backend, layer, quant_config, input_dtype, w13, w2, w13_scale,
+                w2_scale, w13_g_idx=w13_g_idx, w2_g_idx=w2_g_idx,
+                w13_qzeros=w13_qzeros, w2_qzeros=w2_qzeros, w13_bias=w13_bias,
+                w2_bias=w2_bias, **kw)
+        # GPTQ symmetric uint4b8: K-packed (E, K//8, N) -> our (E, N, K//8); zeros=None.
+        w13_p, w13_s = _ct_moe_to_op_layout(w13, w13_scale)
+        w2_p, w2_s = _ct_moe_to_op_layout(w2, w2_scale)
+        E = w13.shape[0]
+        empty_si = torch.empty((E, 0), dtype=torch.int32, device=w13.device)
+        return (w13_p, w2_p, w13_s, w2_s, None, None, empty_si, empty_si,
+                None, None, None, None, w13_bias, w2_bias)
+
+    def _patched_make(moe_quant_config, moe_config, experts_cls,
+                      is_k_full=False, w13_g_idx=None, w2_g_idx=None,
+                      w13_g_idx_sort_indices=None, w2_g_idx_sort_indices=None,
+                      routing_tables=None):
+        if experts_cls is not our_experts_cls:
+            return _orig_make(
+                moe_quant_config, moe_config, experts_cls, is_k_full,
+                w13_g_idx, w2_g_idx, w13_g_idx_sort_indices,
+                w2_g_idx_sort_indices, routing_tables)
+        from vllm.model_executor.layers.fused_moe.all2all_utils import (
+            maybe_make_prepare_finalize,
+        )
+        prepare_finalize = maybe_make_prepare_finalize(
+            moe=moe_config, quant_config=moe_quant_config,
+            routing_tables=routing_tables, allow_new_interface=True,
+            use_monolithic=False)
+        assert prepare_finalize is not None
+        experts = our_experts_cls(moe_config=moe_config,
+                                  quant_config=moe_quant_config)
+        return mk.FusedMoEKernel(prepare_finalize, experts)
+
+    AutoGPTQMoEMethod.__init__ = _patched_init
+    auto_gptq.convert_to_wna16_moe_kernel_format = _patched_convert
+    auto_gptq.make_wna16_moe_kernel = _patched_make
+
+    _MOE_GPTQ_REGISTERED = True
+    if verbose:
+        print("[w4a8_fp8_wmma] GPTQ MoE hook installed (gfx12x): symmetric int4 "
+              "experts -> grouped FP8-WMMA; AWQ/CT/Marlin untouched")
     return True
 
 
@@ -777,8 +1009,10 @@ def register_moe_wna16(verbose: bool = True) -> bool:
         global _WNA16_OVERRIDE_LOGGED
         if verbose and not _WNA16_OVERRIDE_LOGGED:
             _WNA16_OVERRIDE_LOGGED = True
-            print("[w4a8_fp8_wmma] WNA16 MoE -> grouped FP8-WMMA "
-                  f"(int4 g={layer.group_size} has_zp={has_zp}); Triton bypassed")
+            print("[w4a8_fp8_wmma] WNA16 MoE weights ready for grouped FP8-WMMA "
+                  f"(int4 g={layer.group_size} has_zp={has_zp}); engages PER-BATCH "
+                  "iff _moe_should_engage (crossover cache or "
+                  "VLLM_ROCM_W4A8_FP8_WMMA_MOE_MIN_M) — else stock Triton fused_moe")
 
     def _patched_apply(self, layer, x, topk_weights, topk_ids,
                        shared_experts, shared_experts_input):
@@ -786,11 +1020,13 @@ def register_moe_wna16(verbose: bool = True) -> bool:
             return _orig_apply(self, layer, x, topk_weights, topk_ids,
                                shared_experts, shared_experts_input)
         x2 = x.reshape(-1, x.shape[-1])
-        # M-adaptive dispatch: small-M (decode) -> stock Triton MoE (our
-        # padded-sorted op pays an ~8x block-padding penalty there). Safe because
-        # this hook keeps the original uint8 weights (the int32 conversion is a
-        # zero-copy view), so _orig_apply still has what it needs.
-        if x2.size(0) < _moe_min_m():
+        # M-adaptive dispatch via the AOT crossover cache: engage our op only in
+        # the proven-winning M-window for this exact (TP-sharded) expert shape;
+        # otherwise fall back to stock (decode + un-tuned shapes stay >= stock).
+        # Safe because this hook keeps the original uint8 weights (the int32
+        # conversion is a zero-copy view), so _orig_apply still has what it needs.
+        if not _moe_should_engage(x2.size(0), layer._w4a8_w13, layer._w4a8_w2,
+                                  layer._w4a8_w13s, topk_ids):
             return _orig_apply(self, layer, x, topk_weights, topk_ids,
                                shared_experts, shared_experts_input)
         act = layer.activation

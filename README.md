@@ -9,8 +9,8 @@
   <img src="https://img.shields.io/badge/Status-Working-brightgreen" alt="Status" />
   <img src="https://img.shields.io/badge/TP%3D2-298_dec_%2F_1887_total_tok%2Fs-red" alt="Throughput" />
   <img src="https://img.shields.io/badge/GPU-gfx1201_(RDNA4)-ED1C24?logo=amd&logoColor=white" alt="GPU" />
-  <img src="https://img.shields.io/badge/ROCm-TheRock_7.14-ED1C24?logo=amd&logoColor=white" alt="ROCm" />
-  <img src="https://img.shields.io/badge/vLLM-0.22.0-4B2E83" alt="vLLM" />
+  <img src="https://img.shields.io/badge/ROCm-7.2.1-ED1C24?logo=amd&logoColor=white" alt="ROCm" />
+  <img src="https://img.shields.io/badge/vLLM-0.22.69-4B2E83" alt="vLLM" />
   <img src="https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white" alt="Docker" />
   <a href="https://github.com/patcarter883/rdna4-vllm/actions/workflows/build-image.yml"><img src="https://github.com/patcarter883/rdna4-vllm/actions/workflows/build-image.yml/badge.svg" alt="build-image" /></a>
 </p>
@@ -18,11 +18,11 @@
 ---
 
 This repo brings up [vLLM](https://github.com/vllm-project/vllm) on **AMD RDNA4** GPUs —
-gfx1201 (RX 9070 XT / 9070) and gfx1200 (RX 9060 XT / 9060) — which the stock ROCm vLLM
-image does not support. It ships three prebuilt **fat `gfx1200;gfx1201`** wheels (vLLM,
-aiter, flash-attention) that run on either die, the two source fixes needed to load
-Qwen3.5/3.6 MoE models, and an optional **W4A8-FP8-WMMA MoE kernel**. The goal is: clone,
-set one env var, `docker compose up`.
+gfx1201 (RX 9070 XT / 9070) — which the stock ROCm vLLM image does not support. It layers
+our **W4A8-FP8-WMMA MoE kernel** (built in-image from the in-repo `w4a8_fp8_wmma/` source)
+plus a surgical `moe_wna16` source fix onto the collaborator's tuned-attention vLLM 0.22.69
+base image (`tcclaviger/vllm22:dev`), which provides the engine + RDNA4 attention. The goal
+is: clone, set one env var, `docker compose up`.
 
 > ⚠️ **This is overwhelmingly other people's work.** The serving engine is vLLM;
 > the kernels are AMD aiter, Dao-AILab flash-attention, and Composable Kernel; the
@@ -36,13 +36,14 @@ set one env var, `docker compose up`.
 ```bash
 git clone https://github.com/patcarter883/rdna4-vllm && cd rdna4-vllm
 cp .env.template .env
-$EDITOR .env                       # set HF_HOME (+ HF_TOKEN for the download), and WHEELS_BASE
+$EDITOR .env                       # set HF_HOME (+ HF_TOKEN for the download)
 
 # Fetch the model into your HF cache (one-time, needs network + token):
 HF_HOME=/your/hf-cache hf download cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit
 
-# Bring it up (both GPUs, stock kernels). First boot is SLOW — see "Cold start".
-docker compose --profile tp2-baseline up --build
+# Bring it up (both GPUs). First boot is SLOW — see "Cold start". A/B the W4A8
+# kernel with USE_W4A8=0 in .env (pure tuned-attention baseline).
+docker compose --profile serve up --build
 
 # In another shell, once it's serving:
 ./scripts/smoke.sh
@@ -66,18 +67,16 @@ Then hit the OpenAI-compatible API at `http://localhost:8000/v1`.
 
 ## Profiles
 
-One image, three `docker compose --profile` modes (see [docker-compose.yml](docker-compose.yml)):
+One image, two `docker compose --profile` modes (see [docker-compose.yml](docker-compose.yml)):
 
-| Profile | GPUs | Model (default) | Kernels | Notes |
-|---|---|---|---|---|
-| `tp2-baseline` | 0,1 (`CU_NUM=56`) | Qwen3.6-35B-A3B-AWQ-4bit | stock vLLM | the validated **298 dec / 1887 total tok/s** result |
-| `tp2-w4a8` | 0,1 (`CU_NUM=56`) | Qwen3.6-35B-A3B-AWQ-4bit | W4A8-FP8-WMMA MoE | custom kernel; low batch is mandatory (below) |
-| `single` | one card | Mellum2-12B-A2.5B-AWQ-INT4 | stock or W4A8 | 35B won't fit one 16 GB card |
+| Profile | GPUs | Model (default) | Notes |
+|---|---|---|---|
+| `serve` | 0,1 (`CU_NUM=56`) | Qwen3.6-35B-A3B-AWQ-4bit | TP=2; W4A8 on by default — set `USE_W4A8=0` for the stock **298 dec / 1887 total tok/s** baseline. Low batch is mandatory (below). |
+| `single` | one card | Qwen2.5-Coder-7B-AWQ | one 16 GB card, quick smoke / coherence checks (35B won't fit one card) |
 
 ```bash
-docker compose --profile tp2-baseline up --build   # proven baseline
-docker compose --profile tp2-w4a8     up --build    # custom MoE kernel
-docker compose --profile single       up --build    # one GPU, small model
+docker compose --profile serve  up --build   # TP=2 (W4A8 on; USE_W4A8=0 for baseline)
+docker compose --profile single up --build   # one GPU, small model
 ```
 
 **Why `CU_NUM=56` for TP=2.** The reference rig is heterogeneous (9070 XT = 64 CU,
@@ -93,32 +92,19 @@ means routing the ViT through flash_attn / disabling AOTriton SDPA — out of sc
 
 ---
 
-## gfx1200 (RX 9060 XT / 9060) — same fast path, no extra steps
+## gfx1200 (RX 9060 XT / 9060) — ISA-compatible, combined image is gfx1201-only for now
 
 gfx1200 (Navi 44) is the smaller RDNA4 die and shares the exact ISA this stack targets
-(FP8 WMMA, wave32, no TDM), so it's a first-class target. **The default Release wheels
-are fat `gfx1200;gfx1201`** — one set runs on either die — so a 9060 uses the **same
-`docker compose up`** as a 9070, nothing special required:
+(FP8 WMMA, wave32, no TDM). **Note (2026-06):** since consolidating onto the combined image,
+the W4A8 kernel is built for **gfx1201 only** (`GPU_ARCHS=gfx1201` in `docker-compose.yml`),
+and gfx1200 coverage also depends on the base image (`tcclaviger/vllm22:dev`). To target a
+9060: build the W4A8 layer fat — `w4a8_fp8_wmma/setup.py` defaults to `gfx1200;gfx1201`, so set
+`GPU_ARCHS=gfx1200;gfx1201` for the build — and confirm the base image carries gfx1200 objects.
 
-```bash
-docker compose --profile single up --build      # or tp2-baseline on two 16 GB 9060 XTs
-```
-
-(How: AMD GPU code objects are arch-exact, so the wheels carry *both* arches' objects —
-verified: flash-attn 2662 gfx1200 + 2662 gfx1201; the vLLM `_C/_moe_C/_rocm_C` likewise;
-aiter JITs per-arch at runtime. The W4A8 kernel is built fat in-image too.)
-
-A from-source build (`docker-compose.fromsource.yml`, `GPU_ARCHS` selectable) is there if
-you want to compile it yourself or trim to one die.
-
-> ⚠️ **Built for it, not yet hardware-validated** — there's no gfx1200 card in the lab.
-> The binaries provably contain gfx1200 code objects and the identical RDNA4 stack is
-> validated on gfx1201, but a 9060 owner should expect to shake out the first real-hardware
-> bugs — **please post on [issue #2](https://github.com/patcarter883/rdna4-vllm/issues/2).**
-> Notes: the aiter A8W8 tuning configs and the kernel crossover cache were tuned on
-> gfx1201's 64-CU die, so they'll be suboptimal (not broken) on the 32-CU Navi 44; and the
-> 35B MoE needs ~23 GB, i.e. two **16 GB** 9060 XTs (8 GB cards host only smaller models
-> via the `single` profile).
+> ⚠️ **Not hardware-validated** — there's no gfx1200 card in the lab; see
+> [issue #2](https://github.com/patcarter883/rdna4-vllm/issues/2). The crossover caches were
+> tuned on gfx1201's 64-CU die, so they'll be suboptimal (not broken) on the 32-CU Navi 44; and
+> the 35B MoE needs ~23 GB, i.e. two **16 GB** 9060 XTs.
 
 ---
 
@@ -130,9 +116,11 @@ the image** against the container's torch (ABI must match) and auto-engages via 
 `vllm.general_plugins` entry point in every EngineCore worker — no code changes to
 your serving script.
 
-- Built in by default (`WITH_W4A8=1`); set `WITH_W4A8=0` to ship a pure baseline image.
-- Toggle at run time without a rebuild: `VLLM_ROCM_USE_W4A8_FP8_WMMA=0` disables it.
-- **Low batch is mandatory** for the `tp2-w4a8` profile. The MoE apply scratch is
+- Built into the image from the in-repo `w4a8_fp8_wmma/` source (the single source of
+  truth), compiled for gfx1201 against the base image's torch.
+- Toggle at run time without a rebuild: `VLLM_ROCM_USE_W4A8_FP8_WMMA=0` (or `USE_W4A8=0`
+  in `.env`) disables it for a pure tuned-attention baseline.
+- **Low batch is mandatory** for the `serve` profile with W4A8 on. The MoE apply scratch is
   O(M·top_k) padded-sorted and OOMs the KV cache at the 8192 profiling batch on a
   16 GB card — hence `--max-model-len 2048 --max-num-batched-tokens 2048
   --gpu-memory-utilization 0.92`.
@@ -164,8 +152,8 @@ If you need to confirm it's compiling and not wedged: the containers run with
 ```bash
 ./scripts/smoke.sh                       # /v1/models + one chat completion
 # Throughput (run inside the image — needs the gfx1201 vLLM/torch):
-docker compose --profile tp2-baseline run --rm --entrypoint python3 \
-  tp2-baseline /workspace/test/bench_tp2.py     # warmup + timed; ~298/1887 on a warm cache
+docker compose --profile serve run --rm --entrypoint python3 \
+  serve /workspace/test/bench_tp2.py     # warmup + timed; ~298/1887 on a warm cache
 ```
 
 `test/bench_tp2.py` does a warmup `generate()` (to JIT-compile decode/MoE kernels)
@@ -173,29 +161,20 @@ then times a second one, so the number isn't compile-contaminated.
 
 ---
 
-## Building the wheels yourself
+## Building / iterating the W4A8 kernel
 
-The default `docker compose up` **downloads** the three gfx1201 wheels from a GitHub
-Release — point `WHEELS_BASE` at yours. Two ways to produce them:
+There are no wheels to fetch — vLLM, RDNA4 attention, aiter and flash-attention come from the
+base image (`tcclaviger/vllm22:dev`), and the W4A8 kernel is compiled **inside the image** from
+the in-repo `w4a8_fp8_wmma/` source on every `docker compose build` (cross-compiled for gfx1201;
+no GPU needed to build). The surgical `moe_wna16` `tp_size` fix is applied inline in
+[`Dockerfile.combined`](Dockerfile.combined).
 
-1. **From-source Docker build** (fully reproducible, ~2–4h): switch to the
-   from-source overlay. It clones the patched trees and compiles in-container.
-   ```bash
-   docker compose -f docker-compose.yml -f docker-compose.fromsource.yml \
-     --profile tp2-baseline up --build
-   ```
-   You must set the `*_REPO`/`*_REF` build-args to your pushed/forked patched
-   trees — see [Dockerfile.fromsource](Dockerfile.fromsource) for the exact commits.
-
-2. **Bare-metal build** (how the published wheels were made): on a gfx1201 host
-   with the TheRock build venv, run [`scripts/build-wheels.sh`](scripts/build-wheels.sh),
-   then `gh release create v0.22.0-gfx1201 wheels/*.whl`.
-
-The wheels are pinned to **gfx1201 + py3.12 + torch 2.10+rocm7.14**; they will not
-load on a different ABI. The base image `rocm/vllm-dev:nightly-therock714` and the
-two source fixes ([patches/moe_wna16.py](patches/moe_wna16.py) for the WNA16-MoE
-`tp_size` attribute, and the `apache-tvm-ffi==0.1.10` pin for the tilelang MHC path)
-are documented inline in the [Dockerfile](Dockerfile).
+To iterate the kernel on bare metal (op-level tests + microbench) using the TheRock build venv:
+```bash
+source /home/pat/code/vllm-rocm714-gfx1250/activate-build-env.sh
+cd w4a8_fp8_wmma && python setup.py build_ext --inplace && python test_correctness.py
+```
+`w4a8_fp8_wmma/` is the single source of truth; edits there flow into the next image build.
 
 ---
 

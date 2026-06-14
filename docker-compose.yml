@@ -1,122 +1,92 @@
-# vLLM on AMD RDNA4 (gfx1201) — three serving profiles share one image.
+# Combined stack: collaborator's tuned-attention vLLM (tcclaviger/vllm22:dev) + our W4A8 kernel.
+# Built by Dockerfile.combined. The base image's ENTRYPOINT is `vllm serve "$@"`, so each
+# service's `command` is JUST the serve args (do NOT prefix `vllm serve`).
 #
-#   docker compose --profile tp2-baseline up --build   # 2 GPUs, stock kernels (proven 298/1887 tok/s)
-#   docker compose --profile tp2-w4a8     up --build    # 2 GPUs, W4A8-FP8-WMMA MoE kernel engaged
-#   docker compose --profile single       up --build    # 1 GPU, small AWQ MoE model
+#   docker compose --profile serve   up --build   # TP=2 combined
+#   docker compose --profile single  up --build   # 1 GPU, small model
 #
-# Copy .env.template -> .env and fill HF_HOME (+ HF_TOKEN for the first download)
-# before running. See README.md.
+# Copy .env.template -> .env (HF_HOME, ports). NOTE: requires a free GPU window — coordinate,
+# the cards are shared. The W4A8 kernel auto-engages via the vllm.general_plugins entry point;
+# the tuned attention (triton_attn default + startup autotuner) is the base's default on gfx1201.
 
-x-gfx1201-common: &gfx1201-common
+x-combined-common: &combined-common
   build:
     context: .
-    dockerfile: Dockerfile
+    dockerfile: Dockerfile.combined
+    # The W4A8 kernel is in-repo at w4a8_fp8_wmma/ (single source of truth); Dockerfile.combined
+    # COPYs it from the build context and rebuilds it in-image for gfx1201.
     args:
-      # Override to point at your own Release of the three wheels.
-      WHEELS_BASE: ${WHEELS_BASE:-https://github.com/patcarter883/rdna4-vllm/releases/download/v0.22.0-rdna4}
-      WITH_W4A8: ${WITH_W4A8:-1}
-  image: vllm-gfx1201:latest
-  # Manual control only — never auto-restart. If a kernel test wedges a card we
-  # want it to stay down so logs can be inspected.
-  restart: "no"
+      BASE_IMAGE: ${COMBINED_BASE_IMAGE:-tcclaviger/vllm22:dev}
+      GPU_ARCHS: gfx1201
+      # Heterogeneous-TP proportional sharding. 0 = off (default). Set WITH_HET_TP=1 only after
+      # the re-targeted patch lands in patches/het_tp_vllm.patch (see patches/HET_TP_HANDOFF.md).
+      WITH_HET_TP: ${WITH_HET_TP:-0}
+  image: vllm22-w4a8:combined
+  restart: "no"            # never auto-restart — a wedged card should stay down for log inspection
   devices:
     - /dev/kfd:/dev/kfd
     - /dev/dri:/dev/dri
-  group_add:
-    - video
-  security_opt:
-    - seccomp=unconfined
-    - label=disable
-  cap_add:
-    - SYS_PTRACE          # lets py-spy attach to diagnose the cold-compile vs hang ambiguity
+  group_add: [video]
+  security_opt: [seccomp=unconfined, label=disable]
+  cap_add: [SYS_PTRACE]
   ipc: host
   shm_size: "16gb"
   ports:
     - "${VLLM_HOST_PORT:-8000}:8000"
   volumes:
-    # HuggingFace cache (models). rw so first-run downloads land here if online.
     - ${HF_HOME:-./.hf-cache}:/root/.cache/huggingface
-    # Persistent Triton JIT cache — WITHOUT this the first TP=2 run pays a
-    # 15-30 min cold FLA-GDN autotune compile EVERY boot. Survives --rm.
-    - ${VLLM_HOST_TRITON_CACHE:-./.triton-cache}:/root/.triton
-    # Make the benchmark script available inside the container (read-only).
-    - ./test:/workspace/test:ro
-  environment: &gfx1201-env
-    HF_HUB_OFFLINE: "1"          # resolve from the mounted cache; no network at run time
+    # Persistent Triton cache — MANDATORY. Both Qwen3.6 variants are GDN hybrids: a cold boot
+    # pays the FLA-GDN autotune compile (~15-30 min) PLUS the base's attention startup autotune.
+    # This makes it one-time. Survives --rm.
+    - ${VLLM_HOST_TRITON_CACHE:-./.triton-cache-combined}:/root/.triton
+  environment: &combined-env
+    HF_HUB_OFFLINE: "1"
     GPU_ARCHS: gfx1201
-    # Route aiter JIT through the TheRock LLVM bin (ld.lld / amdclang).
-    PATH: /opt/rocm/lib/llvm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    ROCM_HOME: /opt/rocm-7.2.1
+    PATH: /opt/rocm-7.2.1/lib/llvm/bin:/app/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    # W4A8 toggles (baked as ENV in the image; override here). Set USE=0 for a pure
+    # tuned-attention baseline (clean A/B vs the W4A8 layer).
+    VLLM_ROCM_USE_W4A8_FP8_WMMA: "${USE_W4A8:-1}"
+    VLLM_ROCM_W4A8_FP8_WMMA_MOE: "1"
+    VLLM_ROCM_W4A8_FP8_WMMA_MOE_VERSION: "6"
 
 services:
-  # --- TP=2 baseline: stock vLLM gfx1201 kernels (W4A8 disabled at run time) ---
-  tp2-baseline:
-    <<: *gfx1201-common
-    profiles: ["tp2-baseline"]
-    container_name: vllm-gfx1201-tp2-baseline
+  # --- TP=2 combined: tuned attention + W4A8, both Qwen3.6 cards (64+56 CU heterogeneous) ---
+  serve:
+    <<: *combined-common
+    profiles: ["serve"]
+    container_name: vllm22-w4a8-serve
     environment:
-      <<: *gfx1201-env
+      <<: *combined-env
       ROCR_VISIBLE_DEVICES: "0,1"
-      CU_NUM: "56"                       # lower of the two cards; required for heterogeneous TP=2
-      VLLM_ROCM_USE_W4A8_FP8_WMMA: "0"   # off => stock WNA16/Marlin MoE path
-    command:
-      - vllm
-      - serve
+      CU_NUM: "56"                       # lower of the two cards (conservative even-TP fallback).
+      # Proportional het-TP: uncomment once the image is built with WITH_HET_TP=1. "64,56" =
+      # CU counts of the 9070 XT + 9070; the helper fail-safes to even if unset/unbuilt.
+      # VLLM_TP_CU_WEIGHTS: "64,56"
+    command:                             # entrypoint prepends `vllm serve`
       - ${VLLM_MODEL_ID:-cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit}
       - --host=0.0.0.0
       - --port=8000
       - --tensor-parallel-size=2
-      - --enforce-eager
-      - --limit-mm-per-prompt={"image":0,"video":0}   # text-only; skips the ViT AOTriton hang
-      - --gpu-memory-utilization=${VLLM_GPU_MEMORY_UTIL:-0.90}
-      - --max-model-len=${VLLM_MAX_MODEL_LEN:-8192}
-
-  # --- TP=2 with the W4A8-FP8-WMMA MoE kernel (low batch is MANDATORY) ---
-  tp2-w4a8:
-    <<: *gfx1201-common
-    profiles: ["tp2-w4a8"]
-    container_name: vllm-gfx1201-tp2-w4a8
-    environment:
-      <<: *gfx1201-env
-      ROCR_VISIBLE_DEVICES: "0,1"
-      CU_NUM: "56"
-      VLLM_ROCM_USE_W4A8_FP8_WMMA: "1"   # master on; the general_plugins entry point wires the hooks
-      # Bisect knobs (leave at defaults for normal runs):
-      #   VLLM_ROCM_W4A8_FP8_WMMA_MOE=0          -> disable just the MoE hook (Marlin baseline)
-      #   VLLM_ROCM_W4A8_FP8_WMMA_MOE_VERSION=0  -> scalar golden grouped kernel (isolate v5 WMMA numerics)
-    command:
-      - vllm
-      - serve
-      - ${VLLM_MODEL_ID:-cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit}
-      - --host=0.0.0.0
-      - --port=8000
-      - --tensor-parallel-size=2
-      - --enforce-eager
       - --limit-mm-per-prompt={"image":0,"video":0}
-      # The W4A8 MoE apply scratch (O(M*top_k) padded-sorted) OOMs the KV cache
-      # at the 8192 profiling batch on a 16 GB card. These low caps are REQUIRED.
-      - --gpu-memory-utilization=${VLLM_W4A8_GPU_MEMORY_UTIL:-0.92}
-      - --max-model-len=${VLLM_W4A8_MAX_MODEL_LEN:-2048}
-      - --max-num-batched-tokens=${VLLM_W4A8_MAX_NUM_BATCHED_TOKENS:-2048}
+      # W4A8 MoE apply OOMs at the 8192-token profiling batch on 16 GB cards — keep caps low.
+      - --max-model-len=${VLLM_MAX_MODEL_LEN:-4096}
+      - --max-num-batched-tokens=${VLLM_MAX_BATCHED:-4096}
+      - --gpu-memory-utilization=${VLLM_GPU_MEMORY_UTIL:-0.92}
 
-  # --- Single GPU: 35B won't fit 16 GB, so default to a small AWQ MoE ---
+  # --- single GPU: small AWQ model for quick smoke / coherence checks ---
   single:
-    <<: *gfx1201-common
+    <<: *combined-common
     profiles: ["single"]
-    container_name: vllm-gfx1201-single
+    container_name: vllm22-w4a8-single
     environment:
-      <<: *gfx1201-env
-      ROCR_VISIBLE_DEVICES: "${SINGLE_GPU_INDEX:-0}"   # 0 = 9070 XT (64 CU), 1 = 9070 (56 CU)
-      # No CU_NUM — single-card auto-detect is correct (and required, since the
-      # two cards differ). VLLM_ROCM_USE_W4A8_FP8_WMMA inherits the image default (1);
-      # set it to 0 in .env for the stock path.
-      VLLM_ROCM_USE_W4A8_FP8_WMMA: "${WITH_W4A8:-1}"
+      <<: *combined-env
+      HIP_VISIBLE_DEVICES: "0"
+      ROCR_VISIBLE_DEVICES: "0"
     command:
-      - vllm
-      - serve
-      - ${SINGLE_MODEL_ID:-cyankiwi/Mellum2-12B-A2.5B-Instruct-AWQ-INT4}
+      - ${VLLM_SINGLE_MODEL_ID:-Qwen/Qwen2.5-Coder-7B-Instruct-AWQ}   # pure transformer: no FLA-GDN compile
       - --host=0.0.0.0
       - --port=8000
-      - --enforce-eager
-      - --limit-mm-per-prompt={"image":0,"video":0}
-      - --gpu-memory-utilization=${VLLM_GPU_MEMORY_UTIL:-0.90}
-      - --max-model-len=${VLLM_SINGLE_MAX_MODEL_LEN:-4096}
+      - --tensor-parallel-size=1
+      - --max-model-len=4096
+      - --gpu-memory-utilization=0.90
