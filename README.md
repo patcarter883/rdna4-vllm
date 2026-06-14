@@ -87,8 +87,10 @@ single-card runs auto-detect correctly, and only the TP profiles set it.
 **Why text-only by default.** The compose files pass `--limit-mm-per-prompt
 {"image":0,"video":0}`. These are vision-language models, but the ViT path uses
 Torch-SDPA, which trips a gfx1201 AOTriton hazard and hangs memory profiling.
-Text generation routes through the working `ROCM_ATTN` backend. (Enabling vision
-means routing the ViT through flash_attn / disabling AOTriton SDPA — out of scope here.)
+Text generation routes through the base image's tuned `triton_attn` backend (the gfx1201
+default on the combined image, with the startup autotuner — not the narrow `rocm_attn` fast
+path). (Enabling vision means routing the ViT through flash_attn / disabling AOTriton SDPA —
+out of scope here.)
 
 ---
 
