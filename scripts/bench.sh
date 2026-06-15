@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
-# Turnkey TP=2 throughput benchmark — reproduces the published 298 dec / 1887 total tok/s.
+# Turnkey TP=2 throughput benchmark for the shipped path (cudagraphs ON — enforce_eager is
+# profiling-only per CONTRIBUTING).
 #
 # Runs the `bench` compose profile (test/bench_tp2.py: warmup generate -> timed generate)
 # and stamps the current git SHA into each appended result so a published number maps back
 # to a commit. Results are appended to profiling/bench-results/results.jsonl (host-visible).
 #
 # Usage:
-#   ./scripts/bench.sh                  # stock headline baseline (USE_W4A8=0)
-#   USE_W4A8=1 ./scripts/bench.sh       # bench the W4A8 kernel path instead
+#   ./scripts/bench.sh                       # stock, graphs on (production path)
+#   USE_W4A8=1 ./scripts/bench.sh            # W4A8 kernel, graphs on
+#   ENFORCE_EAGER=1 USE_W4A8=0 ./scripts/bench.sh   # legacy eager 298/1887 (profiling only)
 #
 # Notes:
 #   - Needs a free 2-GPU window (cards are shared) and a WARM Triton cache; a cold boot pays

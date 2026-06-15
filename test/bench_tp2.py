@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """TP=2 throughput benchmark for the gfx1201 stack (offline vLLM LLM API).
 
-Reproduces the reported figure for cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit on two
-gfx1201 cards: ~298 decode tok/s, ~1887 total (prefill+decode) tok/s, on a WARM
-Triton cache. Does a warmup generate() (which JIT-compiles decode + MoE kernels)
+Measures cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit on two gfx1201 cards on a WARM Triton
+cache. Does a warmup generate() (which JIT-compiles decode/MoE + captures cudagraphs)
 then times a second generate() so the number isn't compile-contaminated.
+
+By default this measures the SHIPPED path: full torch.compile + cudagraphs ON
+(enforce_eager is profiling-only — see CONTRIBUTING). The legacy ~298 dec / ~1887
+total tok/s headline was an EAGER, stock number; reproduce it with
+ENFORCE_EAGER=1 USE_W4A8=0. The cudagraph default is the conservative RDNA4/ROCm
+capture set [1,2,4,8,16,32,64,128] (the vLLM default stalls capture on ROCm).
 
 Run INSIDE the image (it needs the gfx1201 vLLM/aiter/torch). The turnkey way is
 the `bench` compose profile, which mounts this script + a results dir and wires
@@ -17,12 +22,13 @@ the same TP=2 / het-TP / W4A8 env as `serve`:
 or copy it into a running container. Honors the same env as the compose profiles
 (ROCR_VISIBLE_DEVICES, CU_NUM, VLLM_ROCM_USE_W4A8_FP8_WMMA, ...).
 
-The published headline (298 dec / 1887 total tok/s) is the STOCK path; the `bench`
-profile defaults USE_W4A8=0 to reproduce it. Set USE_W4A8=1 to bench the kernel.
+USE_W4A8=0 benches the stock path; USE_W4A8=1 benches the W4A8 kernel.
 
 Env knobs: MODEL, TP, N_PROMPTS, OUT_TOKENS, GPU_MEM_UTIL, MAX_MODEL_LEN,
 MAX_NUM_BATCHED (per-forward batch; decoupled from MAX_MODEL_LEN so a production
-context length doesn't force a single giant prefill forward at init).
+context length doesn't force a single giant prefill forward at init),
+ENFORCE_EAGER (default 0 = graphs on; 1 = profiling-only eager), CUDAGRAPH_SIZES
+(JSON list; the capture set used when graphs are on).
 Traceability: set BENCH_RESULTS_JSONL=<path> to append one JSON record per run
 (throughput + full config + BENCH_GIT_SHA + timestamp) so a published number maps
 back to a commit. The `bench` profile sets both for you.
@@ -49,6 +55,14 @@ def main():
     # validates the real KV config without that spike. Set =max_len to recover the
     # old coupled behaviour.
     max_batched = int(os.environ.get("MAX_NUM_BATCHED", "4096"))
+    # enforce_eager is PROFILING-ONLY (see CONTRIBUTING "cudagraphs ON" rule). A throughput
+    # number must reflect the SHIPPED path, which serves with full torch.compile + cudagraphs,
+    # so the default here is graphs ON. Set ENFORCE_EAGER=1 ONLY to profile a launch-bound
+    # regime (and label the result eager). The legacy 298/1887 headline was an eager number.
+    enforce_eager = os.environ.get("ENFORCE_EAGER", "0") == "1"
+    # When graphs are on, capture only the conservative RDNA4/ROCm set — the vLLM default
+    # (51 sizes to 512) stalls/hangs capture on ROCm under FULL_AND_PIECEWISE (vLLM #19579/#39010).
+    cudagraph_sizes = json.loads(os.environ.get("CUDAGRAPH_SIZES", "[1,2,4,8,16,32,64,128]"))
 
     # A non-trivial shared prefix so prefill is meaningful (~hundreds of tokens).
     base = ("You are a careful systems engineer. Explain, step by step and with "
@@ -57,11 +71,11 @@ def main():
                for i in range(n_prompts)]
     sp = SamplingParams(temperature=0.0, max_tokens=out_tokens, ignore_eos=True)
 
-    llm = LLM(
+    llm_kwargs = dict(
         model=model,
         tensor_parallel_size=tp,
         dtype="float16",
-        enforce_eager=True,
+        enforce_eager=enforce_eager,
         trust_remote_code=True,
         limit_mm_per_prompt={"image": 0, "video": 0},
         gpu_memory_utilization=gpu_mem,
@@ -69,6 +83,9 @@ def main():
         max_num_batched_tokens=max_batched,
         enable_chunked_prefill=True,
     )
+    if not enforce_eager:   # graphs on → ship the conservative capture set, not vLLM's default
+        llm_kwargs["compilation_config"] = {"cudagraph_capture_sizes": cudagraph_sizes}
+    llm = LLM(**llm_kwargs)
 
     print("=== warmup generate (JIT-compiles decode/MoE; not timed) ===", flush=True)
     llm.generate(prompts[:4], sp)
@@ -100,6 +117,8 @@ def main():
             "tp": tp,
             "w4a8": os.environ.get("VLLM_ROCM_USE_W4A8_FP8_WMMA", "?"),
             "cu_weights": os.environ.get("VLLM_TP_CU_WEIGHTS", "even"),
+            "enforce_eager": enforce_eager,
+            "cudagraph_sizes": None if enforce_eager else cudagraph_sizes,
             "n_prompts": n_prompts,
             "out_tokens": out_tokens,
             "max_model_len": max_len,

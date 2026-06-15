@@ -93,6 +93,11 @@ services:
       - --max-model-len=${VLLM_MAX_MODEL_LEN:-4096}
       - --max-num-batched-tokens=${VLLM_MAX_BATCHED:-4096}
       - --gpu-memory-utilization=${VLLM_GPU_MEMORY_UTIL:-0.92}
+      # Conservative cudagraph capture set for RDNA4/ROCm. The vLLM default (51 sizes up to 512)
+      # under FULL_AND_PIECEWISE stalls/hangs capture on ROCm and wastes VRAM (vLLM #19579/#39010;
+      # AMD/verl tuning guidance) — and these 16 GB cards serve low-batch anyway. Capture only the
+      # batch sizes we actually hit. Override with VLLM_CUDAGRAPH_SIZES.
+      - --compilation-config=${VLLM_CUDAGRAPH_SIZES:-{"cudagraph_capture_sizes":[1,2,4,8,16,32,64,128]}}
 
   # --- TP=2 throughput benchmark: reproduces the published 298 dec / 1887 total tok/s ---
   # One-command repro of the headline figure. Same image/devices/het-TP env as `serve`, but
@@ -117,6 +122,10 @@ services:
       # giant prefill forward. The W4A8 MoE apply scratch is separately bounded by MOE_APPLY_CHUNK.
       MAX_MODEL_LEN: "${MAX_MODEL_LEN:-8192}"
       MAX_NUM_BATCHED: "${MAX_NUM_BATCHED:-4096}"
+      # Shipped path = graphs ON (enforce_eager is profiling-only, CONTRIBUTING). When graphs are on
+      # the offline bench uses the same conservative RDNA4/ROCm capture set as the serving profiles.
+      ENFORCE_EAGER: "${ENFORCE_EAGER:-0}"
+      CUDAGRAPH_SIZES: "${CUDAGRAPH_SIZES:-[1,2,4,8,16,32,64,128]}"
       BENCH_GIT_SHA: "${BENCH_GIT_SHA:-unknown}"       # stamped by scripts/bench.sh for traceability
       BENCH_RESULTS_JSONL: "/workspace/bench-results/results.jsonl"
     volumes:                                           # <<: doesn't merge lists — re-list the anchor's mounts
@@ -144,6 +153,8 @@ services:
       - --tensor-parallel-size=1
       - --max-model-len=4096
       - --gpu-memory-utilization=0.90
+      # Conservative RDNA4/ROCm cudagraph capture set (see serve; avoids ROCm capture stall + VRAM).
+      - --compilation-config=${VLLM_CUDAGRAPH_SIZES:-{"cudagraph_capture_sizes":[1,2,4,8,16,32,64,128]}}
 
   # --- ZAYA1-8B + CCA: hybrid CCA + FP8-MoE second model on the SAME combined image ---
   # The image bakes ZAYA support (Dockerfile.combined WITH_ZAYA=1). CCA has no TP>1, so this is
@@ -189,6 +200,8 @@ services:
       - --enable-auto-tool-choice
       - --tool-call-parser=zaya_xml
       - --gpu-memory-utilization=${ZAYA_GPU_MEMORY_UTIL:-0.90}
+      # Conservative RDNA4/ROCm cudagraph capture set (see serve; avoids ROCm capture stall + VRAM).
+      - --compilation-config=${VLLM_CUDAGRAPH_SIZES:-{"cudagraph_capture_sizes":[1,2,4,8,16,32,64,128]}}
     healthcheck:                         # so the rsa proxy can wait for a serving backend
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=3).status==200 else 1)"]
       interval: 15s

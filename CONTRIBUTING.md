@@ -65,8 +65,16 @@ Consequences for contributors:
    to localize a regression (kernel numerics vs wiring vs baseline). See
    `w4a8_fp8_wmma/TASK6_HANDOFF.md` and the bench in `w4a8_fp8_wmma/bench_vs_triton.py`.
 5. **Perf claims** must come from `test/bench_tp2.py` (warmup-generate then timed) on
-   a **warm** Triton cache, and state the GPU layout — the published baseline is
-   **298 dec / 1887 total tok/s** (heterogeneous TP=2, CU_NUM=56). Quote the config.
+   a **warm** Triton cache, and state the GPU layout. Quote the config.
+   **`enforce_eager` is PROFILING-ONLY.** Every throughput number — and every shipped
+   profile — runs the production path: full `torch.compile` + cudagraphs ON. `enforce_eager`
+   (cudagraphs off) is permitted *only* to profile a launch-bound regime, and such numbers
+   must be labelled "eager" and never published as the serving figure. There is no in-between
+   (no "graphs on but compile off"). Corollary: on RDNA4/ROCm always pass a conservative
+   `cudagraph_capture_sizes` (default `[1,2,4,8,16,32,64,128]`) — the vLLM default 51-size
+   set to 512 stalls/hangs capture on ROCm under FULL_AND_PIECEWISE (vLLM #19579/#39010).
+   (The legacy **298 dec / 1887 total tok/s** baseline was an *eager* number; re-baseline
+   under graphs.)
 6. **Offline scripts that build `vllm.LLM(...)` with TP>1 MUST guard the engine under
    `if __name__ == "__main__":`** — vLLM spawns TP workers, which re-import the module;
    an unguarded top-level `LLM(...)` dies at worker spawn with `RuntimeError: An attempt
