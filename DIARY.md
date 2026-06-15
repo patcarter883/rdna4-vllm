@@ -833,3 +833,60 @@ under BACKED dynamic shapes or registering the op as a `splitting_op` (run eager
 pieces, like attention). This also **corrects** the earlier "W4A8 cudagraph capture confirmed"
 note — whatever mode that was, it was not 0.22 full-compile. Full data + runners live in
 `profiling/bench-eager-vs-graphs/` (`SUMMARY.md`).
+
+## Act XV — the served cudagraph path finally boots on 16 GB, and the numbers land
+
+The promise from Act XIV — "make W4A8 graph-capable" — got paid (M1–M4: `vllm::w4a8_dense_apply`
+clears all three Inductor blockers), and this act is what it took to actually **serve** the 35B
+on two 16 GB cards with cudagraphs on, end to end, plus the first honest cross-the-board numbers.
+
+**Getting `serve` to boot with cudagraphs was a five-wall slog**, each wall a different resource
+ceiling on RDNA4 / 16 GB:
+1. **Cudagraph capture set.** vLLM's default (51 sizes to 512, `FULL_AND_PIECEWISE`) *stalls
+   capture on ROCm* (vLLM #19579/#39010) — a 12-min wedge at 3 % GPU. Capped to a conservative
+   `[1,2,4,8,16,32,64]` (verl's AMD guidance); these cards serve low-batch anyway.
+2. **KV-cache OOM at init.** `fp8_per_token_head` + `gpu-util 0.92` left no room for cache blocks;
+   `--kv-cache-dtype=fp8` + `gpu-util 0.96` clears it.
+3. **Mamba state blocks.** The GDN/Mamba hybrid needs one Mamba block per decode seq and only ~36
+   fit; `max-num-seqs 256` aborted cudagraph capture → set **`--max-num-seqs 32`** (< the 43× KV
+   ceiling; KV peaks ~60 % under 32 in-flight).
+4. **Async-scheduler desync.** Under concurrency the batch-queue path threw a scheduler `KeyError`
+   + multiproc `AssertionError`; **`--no-async-scheduling`** (serial `step()`) removes it.
+5. **The boot was 22 min** — *not* the attention autotune (that's fast) but the GDN/FLA
+   `@triton.autotune` (`chunk_scaled_dot_kkt` &co). The thread-pool **parallel-compile livelocked
+   on TP=2** (two ranks × 8 threads thrash the shared `/root/.triton`, zero progress) — turned it
+   **off**; serial cache-hits cleanly. With the config frozen + `TRITON_CACHE_AUTOTUNING=1` and the
+   vLLM compile cache now mounted, a warm restart is **~90 s** (vs 22 min cold). That's the "use
+   the cache next start" guarantee, proven.
+
+**The crash hunt.** The EngineCore died on concurrent inference. A 4-phase diagnosis workflow
+(single → ramp → W4A8-off → nightly) found **no code bug**: it's **memory-budget overcommit** at
+`gpu-util 0.96` (zero headroom → any inference-time alloc OOMs under heavy/streaming load). Our
+W4A8 kernel is **not** at fault (the prior-crashing config passes the full 1→32 ramp + a 32×512
+burst, kernel engaged, ~902 tok/s gen). A real side-finding: **pure upstream `vllm-openai-rocm:
+nightly` can't even initialise TP=2 on gfx1201** — `ncclCommInitRank` → `HIP failure: invalid
+argument`. So there is *no* stock-upstream baseline for this model on this hardware; the
+collaborator's fork (PYNCCL backend + `disable_custom_all_reduce`) is what makes multi-GPU work
+on RDNA4 at all.
+
+**The numbers** (35B Qwen3.6-A3B-AWQ-4bit, TP=2 het-TP 64:56, 32 prompts × 128 out, gpu-util
+0.90, `test/bench_tp2.py`; `profiling/bench-results/results.jsonl`):
+
+| path | decode tok/s | total tok/s |
+|---|---|---|
+| stock, **eager** | 510.8 | 1371.6 |
+| stock, **cudagraphs** | **957.5** | **2571.0** |
+| W4A8, cudagraphs | 917.5 | 2463.6 |
+
+- **Cudagraphs are the win: +87 %** decode (957 vs 511) on the current stack — the whole point of
+  the graph-compat work, and why `enforce_eager` is now **profiling-only** (codified in
+  CONTRIBUTING; the stale `--enforce-eager` serving flags hid exactly this).
+- **W4A8 on the 35B is ~4 % *slower* than stock under graphs** — it touches only the MoE experts,
+  and graphs don't help MoE (consistent with the "W4A8 cudagraphs are a stock-only speedup"
+  finding). The kernel's value here is that it now *runs* under the graph path at all; the dense
+  win lives on other models.
+- **ZAYA1-8B CCA — the clear kernel win:** the fused HIP `cca_decode_qk` vs the eager ATen path,
+  single-stream decode, **36.1 vs 23.0 tok/s = +57 %** (256-tok gens, ±0 across 3 runs each).
+
+The old `298 / 1887` headline is retired: it was an older/eager config (current eager is
+510.8 / 1371.6). The shipped serve path is **957 / 2571 stock, 917 / 2464 W4A8** with cudagraphs.

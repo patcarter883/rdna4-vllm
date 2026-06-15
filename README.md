@@ -7,7 +7,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Status-Working-brightgreen" alt="Status" />
-  <img src="https://img.shields.io/badge/TP%3D2-298_dec_%2F_1887_total_tok%2Fs-red" alt="Throughput" />
+  <img src="https://img.shields.io/badge/TP%3D2_cudagraphs-957_dec_%2F_2571_total_tok%2Fs-red" alt="Throughput" />
   <img src="https://img.shields.io/badge/GPU-gfx1201_(RDNA4)-ED1C24?logo=amd&logoColor=white" alt="GPU" />
   <img src="https://img.shields.io/badge/ROCm-7.2.1-ED1C24?logo=amd&logoColor=white" alt="ROCm" />
   <img src="https://img.shields.io/badge/vLLM-0.22.69-4B2E83" alt="vLLM" />
@@ -71,7 +71,7 @@ One image, two `docker compose --profile` modes (see [docker-compose.yml](docker
 
 | Profile | GPUs | Model (default) | Notes |
 |---|---|---|---|
-| `serve` | 0,1 (`CU_NUM=56`) | Qwen3.6-35B-A3B-AWQ-4bit | TP=2; W4A8 on by default — set `USE_W4A8=0` for the stock **298 dec / 1887 total tok/s** baseline. Low batch is mandatory (below). |
+| `serve` | 0,1 (`CU_NUM=56`) | Qwen3.6-35B-A3B-AWQ-4bit | TP=2 het-TP, cudagraphs on: **957 dec / 2571 total tok/s** stock, **917 / 2464** with W4A8 (on by default; `USE_W4A8=0` for stock). `max-num-seqs=32`, `--no-async-scheduling` — don't raise `gpu-util`/`max-num-seqs` above the boot-profiled budget (16 GB is tight). |
 | `single` | one card | Qwen2.5-Coder-7B-AWQ | one 16 GB card, quick smoke / coherence checks (35B won't fit one card) |
 
 ```bash
@@ -172,20 +172,38 @@ Both stay out of the way of warm production boots, where autotune is skipped ent
 
 ```bash
 ./scripts/smoke.sh                       # /v1/models + one chat completion
-# Throughput — one command; ~298/1887 (stock) on a warm Triton cache:
+# Throughput — one command; ~957/2571 (stock, cudagraphs) on a warm cache:
 ./scripts/bench.sh                       # stamps git SHA, appends profiling/bench-results/results.jsonl
 USE_W4A8=1 ./scripts/bench.sh            # bench the W4A8 kernel path instead
+ENFORCE_EAGER=1 ./scripts/bench.sh       # eager (profiling only — not the shipped path)
 # equivalently, the raw compose invocation the wrapper runs:
 docker compose --profile bench run --rm bench
 ```
 
 The `bench` profile runs `test/bench_tp2.py` (offline LLM API) with the same TP=2 /
-het-TP env as `serve`, but does a warmup `generate()` (to JIT-compile decode/MoE
-kernels) then times a second one, so the number isn't compile-contaminated. The
-published headline (**298 dec / 1887 total tok/s**) is the **stock** path, so the
-profile defaults `USE_W4A8=0`. Each run appends a self-describing record (throughput
+het-TP env as `serve`, warmup-`generate()` then a timed one so the number isn't
+compile-contaminated. **`enforce_eager` is profiling-only** — every published number is
+the shipped **cudagraphs-on** path. Each run appends a self-describing record (throughput
 + full config + git SHA + timestamp) to `profiling/bench-results/results.jsonl`, so a
-published number always maps back to a commit.
+number always maps back to a commit.
+
+**Measured** (35B Qwen3.6-A3B-AWQ-4bit, TP=2 het-TP 64:56, 32 prompts × 128 out, gpu-util 0.90):
+
+| path | decode tok/s | total tok/s |
+|---|---|---|
+| stock, **cudagraphs** | **957.5** | **2571.0** |
+| W4A8, cudagraphs | 917.5 | 2463.6 |
+| stock, eager (profiling) | 510.8 | 1371.6 |
+
+- **Cudagraphs are the throughput win: +87 %** decode over eager (957 vs 511) on this stack.
+- On the 35B, **W4A8 is ~4 % under stock** under graphs — it quantizes only the MoE experts and
+  graphs don't help MoE; its dense-path win is on other models. (The graph-compat work's value
+  here is that W4A8 *runs* under cudagraphs at all — it was eager-only before.)
+- **ZAYA1-8B CCA** (the `zaya` profile): the fused HIP `cca_decode_qk` kernel does **36.1 vs
+  23.0 tok/s = +57 %** single-stream decode vs the eager ATen path (`ZAYA_CCA_HIP=0`).
+- Warm restart is **~90 s** (persisted Triton/autotune + vLLM compile caches) vs ~22 min cold.
+- Note: upstream `vllm-openai-rocm:nightly` can't initialise TP=2 on gfx1201 (RCCL
+  `ncclCommInitRank` → `HIP invalid argument`); the base fork's PYNCCL path is what enables it.
 
 ---
 
