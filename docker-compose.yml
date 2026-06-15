@@ -18,9 +18,10 @@ x-combined-common: &combined-common
     args:
       BASE_IMAGE: ${COMBINED_BASE_IMAGE:-tcclaviger/vllm22:dev}
       GPU_ARCHS: gfx1201
-      # Heterogeneous-TP proportional sharding. 0 = off (default). Set WITH_HET_TP=1 only after
-      # the re-targeted patch lands in patches/het_tp_vllm.patch (see patches/HET_TP_HANDOFF.md).
-      WITH_HET_TP: ${WITH_HET_TP:-0}
+      # Heterogeneous-TP proportional sharding (patches/het_tp_vllm.patch; see HET_TP_HANDOFF.md).
+      # ON by default — the published 298/1887 headline is the het-TP=2 baseline, so the canonical
+      # :combined image bakes it. Set WITH_HET_TP=0 for an even-TP build.
+      WITH_HET_TP: ${WITH_HET_TP:-1}
   image: vllm22-w4a8:combined
   restart: "no"            # never auto-restart — a wedged card should stay down for log inspection
   devices:
@@ -64,8 +65,8 @@ services:
       ROCR_VISIBLE_DEVICES: "0,1"
       HIP_VISIBLE_DEVICES: "0,1"
       CU_NUM: "56"                       # lower of the two cards (conservative even-TP fallback).
-      # Proportional het-TP: uncomment once the image is built with WITH_HET_TP=1. "64,56" =
-      # CU counts of the 9070 XT + 9070; the helper fail-safes to even if unset/unbuilt.
+      # Proportional het-TP weights = CU counts of the 9070 XT + 9070. Active because the image
+      # builds WITH_HET_TP=1 by default; the helper fail-safes to even if unset/unbuilt.
       VLLM_TP_CU_WEIGHTS: "64,56"
     command:                             # entrypoint prepends `vllm serve`
       - ${VLLM_MODEL_ID:-cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit}
@@ -74,10 +75,46 @@ services:
       - --tensor-parallel-size=2
       - --limit-mm-per-prompt={"image":0,"video":0}
       - --kv-cache-dtype=fp8_per_token_head
-      # W4A8 MoE apply OOMs at the 8192-token profiling batch on 16 GB cards — keep caps low.
+      # Keep --max-num-batched-tokens low: the init memory-profiling forward (stock activation
+      # memory) is what OOMs at large batch on 16 GB cards, not the W4A8 MoE apply (bounded by
+      # MOE_APPLY_CHUNK). max-model-len only sizes KV cache.
       - --max-model-len=${VLLM_MAX_MODEL_LEN:-4096}
       - --max-num-batched-tokens=${VLLM_MAX_BATCHED:-4096}
       - --gpu-memory-utilization=${VLLM_GPU_MEMORY_UTIL:-0.92}
+
+  # --- TP=2 throughput benchmark: reproduces the published 298 dec / 1887 total tok/s ---
+  # One-command repro of the headline figure. Same image/devices/het-TP env as `serve`, but
+  # runs test/bench_tp2.py (offline LLM API: warmup generate -> timed generate) instead of
+  # `vllm serve`. Defaults to the STOCK path (USE_W4A8=0) because the published headline is the
+  # stock baseline; set USE_W4A8=1 to bench the W4A8 kernel instead.
+  #   ./scripts/bench.sh                          # wrapper: stamps git SHA, tees results.jsonl
+  #   docker compose --profile bench run --rm bench
+  bench:
+    <<: *combined-common
+    profiles: ["bench"]
+    container_name: vllm22-w4a8-bench
+    environment:
+      <<: *combined-env
+      ROCR_VISIBLE_DEVICES: "0,1"
+      HIP_VISIBLE_DEVICES: "0,1"
+      CU_NUM: "56"
+      VLLM_TP_CU_WEIGHTS: "64,56"
+      VLLM_ROCM_USE_W4A8_FP8_WMMA: "${USE_W4A8:-0}"   # headline = stock; flip to 1 for the kernel
+      # max_model_len sizes KV cache; max_num_batched_tokens drives the init memory-profiling
+      # forward (the real init-OOM lever) and is decoupled here so a large context doesn't force a
+      # giant prefill forward. The W4A8 MoE apply scratch is separately bounded by MOE_APPLY_CHUNK.
+      MAX_MODEL_LEN: "${MAX_MODEL_LEN:-8192}"
+      MAX_NUM_BATCHED: "${MAX_NUM_BATCHED:-4096}"
+      BENCH_GIT_SHA: "${BENCH_GIT_SHA:-unknown}"       # stamped by scripts/bench.sh for traceability
+      BENCH_RESULTS_JSONL: "/workspace/bench-results/results.jsonl"
+    volumes:                                           # <<: doesn't merge lists — re-list the anchor's mounts
+      - ${HF_HOME:-./.hf-cache}:/root/.cache/huggingface
+      - ${VLLM_HOST_TRITON_CACHE:-./.triton-cache-combined}:/root/.triton
+      - ./test:/workspace/test:ro                      # the benchmark script
+      - ./profiling/bench-results:/workspace/bench-results   # persisted JSONL results (host-visible)
+    entrypoint: ["bash", "-lc"]                         # override base `vllm serve "$@"`; venv PATH for Triton JIT
+    command:
+      - "source /app/.venv/bin/activate && exec python /workspace/test/bench_tp2.py"
 
   # --- single GPU: small AWQ model for quick smoke / coherence checks ---
   single:

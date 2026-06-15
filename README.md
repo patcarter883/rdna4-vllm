@@ -151,13 +151,20 @@ If you need to confirm it's compiling and not wedged: the containers run with
 
 ```bash
 ./scripts/smoke.sh                       # /v1/models + one chat completion
-# Throughput (run inside the image — needs the gfx1201 vLLM/torch):
-docker compose --profile serve run --rm --entrypoint python3 \
-  serve /workspace/test/bench_tp2.py     # warmup + timed; ~298/1887 on a warm cache
+# Throughput — one command; ~298/1887 (stock) on a warm Triton cache:
+./scripts/bench.sh                       # stamps git SHA, appends profiling/bench-results/results.jsonl
+USE_W4A8=1 ./scripts/bench.sh            # bench the W4A8 kernel path instead
+# equivalently, the raw compose invocation the wrapper runs:
+docker compose --profile bench run --rm bench
 ```
 
-`test/bench_tp2.py` does a warmup `generate()` (to JIT-compile decode/MoE kernels)
-then times a second one, so the number isn't compile-contaminated.
+The `bench` profile runs `test/bench_tp2.py` (offline LLM API) with the same TP=2 /
+het-TP env as `serve`, but does a warmup `generate()` (to JIT-compile decode/MoE
+kernels) then times a second one, so the number isn't compile-contaminated. The
+published headline (**298 dec / 1887 total tok/s**) is the **stock** path, so the
+profile defaults `USE_W4A8=0`. Each run appends a self-describing record (throughput
++ full config + git SHA + timestamp) to `profiling/bench-results/results.jsonl`, so a
+published number always maps back to a commit.
 
 ---
 
