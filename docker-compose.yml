@@ -149,8 +149,9 @@ services:
       # max_model_len sizes KV cache; max_num_batched_tokens drives the init memory-profiling
       # forward (the real init-OOM lever) and is decoupled here so a large context doesn't force a
       # giant prefill forward. The W4A8 MoE apply scratch is separately bounded by MOE_APPLY_CHUNK.
-      MAX_MODEL_LEN: "${MAX_MODEL_LEN:-8192}"
+      MAX_MODEL_LEN: "${MAX_MODEL_LEN:-4096}"
       MAX_NUM_BATCHED: "${MAX_NUM_BATCHED:-4096}"
+      MAX_NUM_SEQS: "${MAX_NUM_SEQS:-32}"   # GDN/Mamba: <=~36 blocks on 16GB; cudagraph trims to this
       # Shipped path = graphs ON (enforce_eager is profiling-only, CONTRIBUTING). When graphs are on
       # the offline bench uses the same conservative RDNA4/ROCm capture set as the serving profiles.
       ENFORCE_EAGER: "${ENFORCE_EAGER:-0}"

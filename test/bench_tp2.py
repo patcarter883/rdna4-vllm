@@ -62,7 +62,10 @@ def main():
     enforce_eager = os.environ.get("ENFORCE_EAGER", "0") == "1"
     # When graphs are on, capture only the conservative RDNA4/ROCm set — the vLLM default
     # (51 sizes to 512) stalls/hangs capture on ROCm under FULL_AND_PIECEWISE (vLLM #19579/#39010).
-    cudagraph_sizes = json.loads(os.environ.get("CUDAGRAPH_SIZES", "[1,2,4,8,16,32,64,128]"))
+    cudagraph_sizes = json.loads(os.environ.get("CUDAGRAPH_SIZES", "[1,2,4,8,16,32,64]"))
+    # GDN/Mamba hybrid: one Mamba state block per decode seq, ~36 fit on 16 GB TP=2; cap concurrency
+    # at/below that or cudagraph capture aborts. vLLM trims capture sizes to <= max_num_seqs.
+    max_num_seqs = int(os.environ.get("MAX_NUM_SEQS", "32"))
 
     # A non-trivial shared prefix so prefill is meaningful (~hundreds of tokens).
     base = ("You are a careful systems engineer. Explain, step by step and with "
@@ -81,6 +84,7 @@ def main():
         gpu_memory_utilization=gpu_mem,
         max_model_len=max_len,
         max_num_batched_tokens=max_batched,
+        max_num_seqs=max_num_seqs,
         enable_chunked_prefill=True,
     )
     if not enforce_eager:   # graphs on → ship the conservative capture set, not vLLM's default
@@ -123,6 +127,7 @@ def main():
             "out_tokens": out_tokens,
             "max_model_len": max_len,
             "max_num_batched_tokens": max_batched,
+            "max_num_seqs": max_num_seqs,
             "gpu_mem_util": gpu_mem,
             "wall_s": round(dt, 3),
             "prefill_tok": prompt_toks,
