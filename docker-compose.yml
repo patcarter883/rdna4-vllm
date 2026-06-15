@@ -75,6 +75,16 @@ x-combined-common: &combined-common
     # once the shared-cache contention is fixed (flock+atomic, or build-time bake). The attention
     # autotuner pre-warm (process pool, VLLM_ATTN_AUTOTUNE_PARALLEL) stays default-ON — it's fine.
     VLLM_TRITON_PARALLEL_COMPILE: "${VLLM_TRITON_PARALLEL_COMPILE:-0}"
+    # Attention autotuner pre-warm (process pool) also OFF for now — on TP=2 each rank spawns its
+    # own pool, another contention source during startup. Fully serial startup while we isolate the
+    # boot-time cost. Re-enable (=1) once the shared-cache contention is fixed.
+    VLLM_ATTN_AUTOTUNE_PARALLEL: "${VLLM_ATTN_AUTOTUNE_PARALLEL:-0}"
+    # Persist Triton @triton.autotune RESULTS (the GDN/FLA chunk_* sweep that dominates the boot,
+    # ~22 min) to disk so a same-config restart skips re-benchmarking. cache_results then writes
+    # <kernel>.autotune.json into TRITON_CACHE_DIR (=/root/.triton, mounted). The cache_key includes
+    # env vars, so the FIRST boot after any env/config change re-tunes once, then subsequent boots
+    # hit it. This is the "use the cache next start" guarantee.
+    TRITON_CACHE_AUTOTUNING: "${TRITON_CACHE_AUTOTUNING:-1}"
 
 services:
   # --- TP=2 combined: tuned attention + W4A8, both Qwen3.6 cards (64+56 CU heterogeneous) ---
@@ -107,6 +117,10 @@ services:
       # this memory budget on 16 GB TP=2. Cap concurrency at/below that (vLLM trims cudagraph
       # capture sizes to <= max_num_seqs automatically). Raise with more VRAM / higher util.
       - --max-num-seqs=${VLLM_MAX_NUM_SEQS:-32}
+      # Serial scheduling: async scheduling (max_concurrent_batches=2 → step_with_batch_queue)
+      # desyncs the multiproc output buffer under concurrent load on this stack and kills the
+      # EngineCore (scheduler KeyError + multiproc_executor AssertionError). Force serial step().
+      - --no-async-scheduling
       - --gpu-memory-utilization=${VLLM_GPU_MEMORY_UTIL:-0.96}
       # Conservative cudagraph capture set for RDNA4/ROCm. The vLLM default (51 sizes up to 512)
       # under FULL_AND_PIECEWISE stalls/hangs capture on ROCm and wastes VRAM (vLLM #19579/#39010;
