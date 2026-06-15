@@ -3,8 +3,14 @@
 .git
 .github
 profiling/
+prof/
 *.log
 .claude/
+# Persistent caches are root-owned (created by container bind-mounts) and break build-context
+# scanning ("no permission to read"); huge and never belong in an image.
+.triton-cache*
+.vllm-cache*
+.hf-cache
 # build artifacts (the kernel is (re)built in-image; never ship stale host .so/build dirs)
 **/__pycache__/
 **/*.so
