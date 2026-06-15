@@ -145,6 +145,25 @@ If you need to confirm it's compiling and not wedged: the containers run with
 `SYS_PTRACE`, so `docker exec <cid> bash -lc "pip install -q py-spy; py-spy dump
 --pid 1 --nonblocking"` should show `make_amdgcn → autotuner → chunk_*`.
 
+**Parallel cold-compile (on by default).** That cold compile is normally *serial* —
+one kernel config at a time, one CPU core, GPU idle. The W4A8 plugin installs two
+best-effort accelerators that fan the compiles across cores (they only fire on a cold
+cache and are no-ops once it's warm; neither changes the autotuned result, only *when*
+each kernel is compiled):
+
+- **`VLLM_TRITON_PARALLEL_COMPILE`** (default `1`) — parallel-compiles every
+  `@triton.autotune` config in a thread pool before the serial timing pass. This covers
+  the GDN/SSD `ssd_*` autotune (~58 configs — the bulk of the cold boot). Set `0` to
+  disable. Workers: `VLLM_TRITON_PARALLEL_COMPILE_WORKERS` (default 8).
+- **`VLLM_ATTN_AUTOTUNE_PARALLEL`** (default `1`) — process-pool pre-warm of vLLM's
+  *custom* attention startup autotuner (which the Triton hook above can't reach). It
+  spawns short-lived GPU workers during startup; on a warm cache they cache-hit, adding
+  only small spawn overhead. Set `0` to disable. Workers:
+  `VLLM_ATTN_AUTOTUNE_PARALLEL_WORKERS` (default 6 — the measured sweet spot).
+
+Measured speedups on gfx1201: ~3.1× (Triton autotune) and ~2.8× (attention autotune).
+Both stay out of the way of warm production boots, where autotune is skipped entirely.
+
 ---
 
 ## Verifying / benchmarking
@@ -175,6 +194,31 @@ source /home/pat/code/vllm-rocm714-gfx1250/activate-build-env.sh
 cd w4a8_fp8_wmma && python setup.py build_ext --inplace && python test_correctness.py
 ```
 `w4a8_fp8_wmma/` is the single source of truth; edits there flow into the next image build.
+
+---
+
+## A second model: ZAYA1-8B (hybrid CCA + MoE)
+
+The same combined base also serves **Zyphra's ZAYA1-8B** — a hybrid model that alternates
+**CCA (Compressed Convolutional Attention)** with MoE layers. It's **baked into the same combined image** (`WITH_ZAYA`, on by default —
+additive, a no-op for the 35B path) and runs via the `zaya` profile in the main compose:
+
+```bash
+cp .env.template .env                     # set HF_HOME, ZAYA_MODELS_DIR, ZAYA_MODEL_ID
+docker compose --profile zaya up --build              # TP=1, one card, backend on :8001
+# Optional: Recursive Self-Aggregation (RSA) test-time-compute proxy on :8100 (no GPU):
+docker compose --profile zaya --profile rsa up
+```
+
+- **CCA as fused HIP kernels.** The eager CCA step is the graph-broken `vllm::cca` op
+  (~1.4M tiny ATen launches/decode); three HIP kernels (decode / prefill / mixed) collapse each
+  region into one launch. Bit-exact, and **+38% chat-decode / +49% RSA-decode tok/s** vs eager
+  measured **with cudagraphs on** — a real production win, because the launch storm is exactly
+  what graph capture can't fix (`docs/zaya/cca-kernel-perf.md`). Toggle with `ZAYA_CCA_HIP=0`.
+- **Scope:** single card / **TP=1** today (CCA has no tensor-parallel split — per-head RMSNorm +
+  grouped-mean state break under column-wise sharding). Experts are FP8, so the W4A8 kernel is off
+  for this path (`ZAYA_USE_W4A8=0`). Multi-card (DP + expert-parallel) is the next profile. See
+  `zaya/ZAYA_HANDOFF.md`. Build a leaner W4A8-only image with `WITH_ZAYA=0`.
 
 ---
 

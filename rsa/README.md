@@ -112,6 +112,29 @@ Request-level `temperature` and `max_tokens` override the rollout defaults.
 | `--rsa-max-concurrency` | 16 | concurrent backend requests |
 | `--tokenizer` | auto | HF tokenizer name/path for local tails (resolved from the backend's model `root` by default) |
 
+### Adaptive compute (opt-in)
+
+RSA's cost is dominated by **decode** (≈ N × T × trace-length generated tokens),
+so the cheapest wins generate *fewer* tokens. These knobs are **off by default**
+— defaults reproduce the ZAYA1-report config exactly — and attack the
+"self-consistency matched RSA at half the cost on easy problems" waste noted
+below. They compose; sweep them with `compare.py` to find the
+accuracy-preserving frontier before enabling in production.
+
+| flag | default | meaning |
+|---|---|---|
+| `--rsa-early-stop` | off | stop generating rounds once the population reaches consensus on a `\boxed{}` answer (skips later rounds entirely on converged problems) |
+| `--rsa-consensus-threshold` | 0.9 | fraction of **extractable** answers that must agree on the top answer to early-stop |
+| `--rsa-consensus-min-votes` | 2 | minimum extractable answers before an early stop can trigger (no "majority of one") |
+| `--rsa-agg-max-tokens` | = β | smaller completion budget for aggregation rounds (t ≥ 1) + the final selection call; aggregation refines rather than re-derives |
+| `--rsa-n-min` | off | round 0 generates `n_min` rollouts first and tops up to N only when they haven't already converged (adaptive population size; the top-up reuses the prefix-cached round-0 prompt) |
+
+Consensus is measured only over extractable boxed answers, so general /
+non-math queries never early-stop and fall through to the normal selection
+path. The response's `rsa` object reports `rounds` / `rounds_configured`,
+`population` / `population_configured`, and `stopped_early` so you can see the
+savings per request.
+
 ### Tail truncation
 
 Tails are token-exact and never start mid-thought:

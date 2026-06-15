@@ -27,6 +27,7 @@ already have a documented door.
 | heterogeneous-TP (64:56 sharding) | `patches/het_tp.py` + `patches/het_tp_vllm.patch` — see `patches/HET_TP_HANDOFF.md` |
 | the WNA16-MoE `tp_size` source fix | applied surgically in `Dockerfile.combined` (sed) |
 | the W4A8-FP8-WMMA kernel | **in-repo `w4a8_fp8_wmma/`** (the single source of truth; built in-image) |
+| ZAYA1-8B + CCA (the second model) | **`zaya/`** (overlay vLLM files + `cca_hip/` HIP kernel + `zaya_vllm_0.22.69.patch`); folded into `Dockerfile.combined` behind **`WITH_ZAYA`** (default on), run via the `zaya`/`rsa` profiles in `docker-compose.yml` — see `zaya/ZAYA_HANDOFF.md` |
 | the kernels/engine themselves (vllm / aiter / flash-attention) | **not here** — from the base image, see "Upstream" below |
 
 vLLM core, attention, aiter and flash-attention come from the **base image**

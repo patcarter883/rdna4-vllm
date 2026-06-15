@@ -543,6 +543,185 @@ is exactly how work lands in the wrong tree.
 
 ---
 
+## Act X — the kernels grow up: fusion, an autotune gate, and a VRAM win
+
+Act VIII left the W4A8 kernels in an honest but frustrating place: validated, faster in their
+regimes, yet **gated dormant** because stock's *fused* MoE apply and *register-direct* dense weights
+still won at small batch — and, worse, the dispatch gate returned `_NEVER` for any shape absent from
+the crossover caches, so on **any checkpoint we hadn't pre-profiled the kernel was dead weight and
+the served path ran stock-vs-stock**. This act is the kernels growing into the served pathway, on
+three fronts, every change either **bit-exact** or **gated OFF until measured**.
+
+**Fusion — stop paying HBM round-trips.** The two biggest wins were structural, not arithmetic:
+- *Dense act-quant fused into the v5/v10 prologue.* The separate `compute_act_fp8_and_scales` launch
+  and the `(M,K)` `x_fp8` HBM write-then-read-back are gone; both kernels take fp16 activations
+  directly and quantize to e4m3 inline during A-tile staging. The per-row scale is `max(|x|)/448`
+  over the full K row (exact under any thread tiling), so it's **bit-exact** to the old staged buffer.
+- *MoE `silu_and_mul` fused into gemm1's epilogue.* gemm1 now writes the post-activation `(P, inter)`
+  directly, dropping the `(P, 2·inter)` and `(P, inter)` HBM staging plus the silu launch — one block
+  computes both the gate and up N-tiles for an expert and writes `silu(gate)·up`, **`max|diff| == 0`**
+  vs the unfused path. (Targets prefill/mid; Act VIII already showed decode is gemm2-BW-bound, so the
+  GEMV decode path is deliberately left unfused.)
+
+**An autotune gate — the kernel now works on any checkpoint.** On a crossover-cache miss the gate now
+runs a quick ours-vs-Triton A/B for that exact shape (dense at load, MoE on first batch), selects the
+*safe* crossover with the existing winning-suffix / contiguous-interval rule, persists it, and is O(1)
+thereafter. Any autotune failure caches `null → stock`, so **the served pathway still can't regress
+vs stock** — Act VIII's safety property is preserved; only the "untuned checkpoint = dead weight" hole
+is closed.
+
+**A VRAM win that buys concurrency.** Single-layout is now the served default: we skip the `(K, N//8)`
+Triton-fallback weight copy that *doubled* dense weight VRAM (it had OOM'd the 27B on 16 GB cards) and
+hand the freed ~50% to KV cache. Reversible via `VLLM_ROCM_W4A8_LAYOUT=tuned` (rebuild the copy, keep
+the strictly-≥-stock small-M tuned-Triton path at 2× VRAM). The apply path now gates on the *actual
+presence* of fallback weights rather than the env, closing a latent `None`-deref the new default would
+otherwise have hit.
+
+**And the next levers, scoped honestly.** v6 (b128 double-K — two back-to-back WMMAs per LDS read,
+halving v5's load instructions) is wired into dispatch but **gated OFF** for the mid-M ~512-2048 band
+that still trails Triton; and a research doc (`RESEARCH_burst_repack.md`) maps the **MoE-decode
+126 GB/s wall** — gemm2 is genuinely bandwidth-bound (gemm1's 273 GB/s is the existence proof, and
+Act VIII's dense v13/v15 falsification does *not* transfer, because dense was GPU-starved), with an
+N-interleave burst-repack as the proposed fix. The Act VIII discipline holds: measure achieved
+bandwidth, name the lever, don't turn it on until a GPU window proves it.
+
+**The kicker — and it inverts the read above: every A/B this cycle was `enforce_eager`, and graph
+capture turns out to be a *stock-only* speedup.** With cudagraphs off, decode is CPU-launch-bound —
+both paths wait on Python launch overhead across 40 layers × 128 steps, a regime in which our kernel
+looked competitive, which is why the sweeps read favorably. But the production default is cudagraphs
+*on*, and two things are now clear there: (1) our W4A8 kernel runs **the same captured or not** — it
+is graph-invariant — while (2) graph capture makes the **stock** path substantially faster by
+collapsing its launch overhead. So the balance didn't move because our kernel regressed; it moved
+because stock got a speedup **we don't share**, and under cudagraphs the served W4A8 path lands
+**slower than stock**. The likely reason our path sees no graph benefit is that it's already
+**GPU-compute-bound** per call (the int4→fp8 expansion + MoE apply are the ~41%/~20% decode buckets
+the profile flagged), so eliminating launch latency buys it little — the exact opposite of stock's
+lighter, launch-bound kernels. The **structural** wins here still stand (bit-exactness, fewer HBM
+round-trips, ~half the dense weight VRAM); the **throughput case does not**, and "turn on cudagraphs"
+is not the fix that rescues it — it's the measurement that *exposed* it. Worse for the autotune gate:
+its crossovers were tuned from eager A/Bs against a slower-than-real stock baseline, so every
+threshold needs re-tuning against **stock-with-cudagraphs**. Full numbers next cycle.
+
+---
+
+## Act XI — het-TP, validated: the COMM bubble actually closes
+
+Act IX landed the heterogeneous-TP patch — split the FFN/MoE *intermediate* 64:56 (proportional to
+the 64-CU 9070 XT vs the 56-CU 9070) so the faster card stops spin-waiting at the all-reduce barrier
+— but gated it dormant, "pending a 2-GPU validation window." This act is that window, and it splits
+into the two questions any sharding change has to answer: is it still correct, and does it actually
+do anything.
+
+**Correct — byte-identical.** Greedy-equivalence het≡even is token-for-token identical on both the
+dense 7B (TP=2) and the 35B MoE (TP=2): the proportional split is math-preserving, as designed
+(`profiling/het-e2e/`).
+
+**Effective — the bubble shrinks ~75%.** A per-rank kineto A/B (`vllm22-w4a8:hettp`, het patch baked,
+W4A8 *off* — the imbalance is a TP-balance effect independent of the GEMM path) confirms the even
+split is genuinely lopsided: rank1's all-reduce runs ~400 ms longer than rank0's — the documented
+sync bubble. The 64:56 split collapses it: all-reduce imbalance **399.6 ms → 99.0 ms (~75% smaller)**,
+total device-time imbalance **405.6 ms → 35.8 ms** — the two ranks now reach the barrier in
+near-lockstep. Non-collective compute was already balanced (<2% spread across all four traces), so the
+bubble lived almost entirely in the collective wait, exactly where het collapses it. **The
+proportional sharding works as designed.**
+
+**But tok/s is flat (200.5 vs 200.6) — the expected catch.** The A/B ran `enforce_eager`, so decode
+is CPU-launch-bound: non-collective GPU compute is only ~2.9 s of the ~10.2 s wall, the GPU idling
+between Python launches across 40 layers × 128 steps. The het rebalancing is real but hidden under
+launch latency — the project's standing note made concrete: **het-TP pays off only after cudagraphs.**
+The next step is the same A/B with cudagraphs (drop `enforce_eager`), where GPU compute becomes the
+critical path and the ~400 ms even-split imbalance should convert toward the ~5% decode ceiling — and
+the residual ~99 ms hints the true ratio sits a hair past nominal 64:56 (worth tuning to the measured
+CU/throughput ratio).
+
+So het-TP graduates from "landed, gated dormant" to **validated and working**: correct, and
+demonstrably balancing the barrier — with the throughput conversion now a cudagraph A/B rather than
+an open question.
+
+---
+
+## Act XII — the second model, landed: ZAYA1 + CCA, coherent on the combined base
+
+Act VII opened the ZAYA1-8B hybrid-CCA front and parked it on a bring-up window; the previous cut of
+this act had it staged on a branch. It is now **merged into `main` and serving coherently** on the
+combined base (`tcclaviger/vllm22:dev`, vLLM 0.22.69) — the second model is no longer a port-in-waiting.
+
+- **Consolidation.** All ZAYA1 + CCA development moved under `zaya/` — the overlay vLLM files
+  (`zaya.py`, `cca.py`, configs, the `zaya_xml` tool parser, `cca_attn.py`), the CCA HIP csrc, and a
+  registration patch **re-derived for 0.22.69** (16/16 hunks clean). The old `zaya/vllm-therock` tree
+  is retired.
+- **First coherent serve cost a weight-loader port.** The blocker to coherent output on the combined
+  base was the MoE expert weights: the therock tree nested them under a `RoutedExperts` module, but
+  the base wires experts through its factory `FusedMoE`. Re-homing the loader onto that factory is
+  what produced the first coherent ZAYA serve on the combined image ("capital of France" → "Paris").
+- **CCA is now three fused kernels, all bit-exact.** The eager CCA step is the **graph-broken
+  `vllm::cca` op** — ~1.4M tiny pointwise ATen launches per decode run, latency-bound on wave32. Three
+  HIP kernels collapse each region into one launch: **decode** (`cca_decode_qk`, 142 µs → 8 µs/call),
+  **prefill** (`cca_prefill_qk`, 2.4–3× standalone), and **mixed** (prefill+decode in one forward,
+  disjoint conv-state slots). Validated bit-exact — qk rel ~6e-7, state bit-exact, `mixed == pure⊕pure`.
+
+**The perf result — and why it's the exact mirror of Act X.** A/B on an exclusive 56-CU 9070,
+ZAYA1-8B-fp8, TP=1, **cudagraphs ON** (not eager): the fused decode kernel is **+38.6% chat-decode /
++49.5% RSA-decode tok/s** over eager CCA. And — crucially after Act X's kicker — this win is **real
+under the production config**, not an eager artifact: because `vllm::cca` is graph-broken, cudagraphs
+*can't* capture the launch storm, so fusing it is the only lever and the gain survives graph capture.
+That is the inverse of the W4A8 dense/MoE kernels, which are capturable — so there graphs sped up
+*stock* and erased our edge. Same hardware, opposite verdict, for one structural reason: **capturable
+vs graph-broken.** (The prefill/mixed kernels are throughput-neutral on an exclusive card — prefill
+is a small share of these MoE-bound workloads — but bit-exact, and worth it for launch-storm /
+bandwidth relief under multi-tenant pressure and for killing the eager mixed-batch fallback.)
+
+**Defaults flipped on.** `ZAYA_CCA_HIP` and `ZAYA_CCA_HIP_PREFILL` now **default ON** (no regression,
+bit-exact, all-mode coverage) — the staged-and-gated-OFF status from the previous cut is gone.
+
+**Packaging — the Act IX lesson on purpose, then consolidated.** ZAYA first landed as a **derived
+image** (`Dockerfile.zaya` `FROM vllm22-w4a8:combined`) with a standalone compose, rather than a gate
+inside `Dockerfile.combined` — chosen to avoid editing a file being refactored in a parallel session;
+it added zero risk to the base image and let ZAYA land independently. Once that refactor settled, the
+derived image was **folded into the single combined image** behind a `WITH_ZAYA` build arg (default
+on, mirroring `WITH_HET_TP`): the two shared-file patch hunks — a generic torch.compile-safety guard
+in `fused_moe.py` and a `vllm::cca` `splitting_ops` entry — are no-ops for the 35B path, so **one
+image now serves both**, via the `zaya` profile in the single `docker-compose.yml` (the standalone
+`Dockerfile.zaya` / `docker-compose.zaya.yml` were retired). That compose also carries an optional
+**RSA proxy** (`Dockerfile.rsa`, `--profile rsa`): a no-GPU, OpenAI-compatible shim fronting the
+backend with Recursive Self-Aggregation (N=16/K=4/T=2) for test-time compute.
+
+**What's left:** multi-card ZAYA (CCA has no TP>1, so DP=2 + expert-parallel — model replicated per
+rank, MoE sharded) is the next profile, its exact topology to be confirmed on the combined base in a
+GPU window before it's committed, not staged blind.
+
+---
+
+## Act XIII — the public release: from three wheels to one image
+
+Act I shipped the stack as three from-source wheels (vllm, aiter, flash-attention) you fetched
+from a GitHub Release or rebuilt yourself; Act IX folded all of it into one combined image. This
+release (v0.1.0) makes that the *only* distribution: the prebuilt image is published to **GHCR**
+(`ghcr.io/patcarter883/rdna4-vllm`), auto-built and pushed by CI on every `v*` tag, and the user
+story collapses to **clone → `cp .env.template .env` → `docker compose up`**. There are no wheels
+to fetch or compile — vLLM 0.22.69, the tuned RDNA4 attention, aiter and flash-attention all arrive
+inside the base image; only the W4A8 kernel is built in-image. The from-source wheel recipe (the
+aiter enablement — `PREBUILD_KERNELS=0` for gfx1201 and all) isn't so much deleted as **archived**:
+pushed to `archive/aiter-wheel-distribution` on the remote in case we ever want to rebuild aiter
+from source again, and the two `scripts/*-wheels.sh` recipes come out of `main`.
+
+**A blocker the release would otherwise have shipped.** The tag-triggered CI built `file:
+./Dockerfile`, but the repo's build file is `Dockerfile.combined` (what compose, the README, and
+CLAUDE.md all name). A `v*` push would have *failed the GHCR build and produced no image* — a
+release that releases nothing. Caught in prep; fixed by pointing the workflow at `Dockerfile.combined`
+rather than renaming the file (one line vs. touching four docs). v0.1.0 is the first formally tagged
+release; the wheel era never carried a real tag.
+
+**And the coordination lesson again — but handled right this time.** Prep ran *concurrently* with a
+second agent merging the `feat/w4a8-*` branches into `main`; the tip moved under me three times
+mid-task (`4db75d1 → 22e448a → 6b0c8b5`) as merge after merge landed. Unlike the het-TP misfire in
+Act IX, the channel existed this time: a heads-up that the W4A8 agent owned `main` until it was done,
+so release prep stayed **read-only** (archive the branch, draft the notes, find the blocker) and the
+mutating steps — delete the scripts, fix the workflow, cut the tag — waited for the all-clear. The
+repo is still the only shared memory between sessions; the difference is that someone said so out loud.
+
+---
+
 ## The short list of things that cost the most time
 
 1. Assuming gfx1250 kernels would port to gfx1201. They don't — no TDM.
@@ -564,6 +743,14 @@ is exactly how work lands in the wrong tree.
    *halved* throughput because it overrides the AUTO crossover. Coordinate through the repo +
    `memory/` + a written handoff; never benchmark with FORCE; re-target patches per vLLM version
    (the MoE split moved files between 0.22-therock and 0.22.69) — Act IX.
+9. Benchmarking the served path under `enforce_eager`. Cudagraphs off makes decode
+   **CPU-launch-bound** — both paths wait on Python launch overhead — which **flatters our kernel**:
+   graph capture is a *stock-only* speedup (our W4A8 kernel is GPU-bound and runs the same captured or
+   not, while stock collapses its launch overhead), so eager A/Bs hid that stock-with-graphs pulls
+   *ahead*. Every W4A8 A/B this cycle was eager and read too favorably for it; the honest baseline is
+   **stock with cudagraphs on** (the production default), not eager-vs-eager. Het-TP is the mirror
+   case — its GPU rebalancing only *surfaces* with graphs (Acts X-XI). Sibling of the FORCE trap: both
+   make the benchmark measure the wrong thing.
 
 ## What actually works, today
 
@@ -579,15 +766,70 @@ large M) — so "meets or exceeds stock in all regimes" holds by construction. A
 two validated small-batch kernels (`moe_gemv_v7` decode GEMV, +2-3× over our prior MoE
 kernel; `v12` split-K dense, +2× over v5) that are gated dormant in AUTO because stock's
 *fused* MoE apply and *register-direct* dense weights still win at small batch — the named
-next levers to turn those fallbacks into wins.
+next levers to turn those fallbacks into wins. Act X then made the served path *engage on any
+checkpoint* (an autotune gate replaces the "untuned shape = dead weight" hole, still `null → stock`
+on failure) and shaved its memory traffic — act-quant fused into the dense prologue and `silu_and_mul`
+fused into the MoE gemm1 epilogue, both bit-exact — with single-layout the default to hand ~50% of
+dense weight VRAM back to KV cache.
+
+**That "≥ stock by construction" needs a hard correction.** Every W4A8 throughput number above — the
+force-engaged +53%/+11%, the small-batch crossovers, the Act X gate decisions — was measured
+**`enforce_eager` (cudagraphs off)**, where decode is launch-bound and our kernel looked competitive.
+But cudagraphs is the production default, and graph capture is a **stock-only** speedup: our kernel is
+graph-invariant (already GPU-bound per call), stock collapses its launch overhead, and under graphs
+the served W4A8 path lands **slower than stock**. The by-construction safety argument fails twice over
+— the crossover was tuned in the wrong regime, *and* its baseline (stock) itself speeds up once graphs
+are on. Honest verdict: *correctness end-to-end solid; throughput vs the real (cudagraphs) stock
+baseline, currently negative.* The thresholds need re-tuning against stock-with-cudagraphs, and this
+section gets rewritten around those numbers next cycle.
 
 And we now know where to *stop*: a per-op decode profile puts full attention at ~1.8% and the
 dominant buckets (MoE ~41%, dense fp16 ~20%) at ones we already understand — so the
-int4→fp8-WMMA kernel chapter closes on evidence. The ZAYA1 hybrid-CCA port is the open front,
-waiting on a gfx1201 bring-up window.
+int4→fp8-WMMA kernel chapter closes on evidence (the open lever is the gemm2 126 GB/s decode wall,
+mapped in `RESEARCH_burst_repack.md`). The ZAYA1 hybrid-CCA front is no longer a port-in-waiting:
+**merged to `main` and serving coherently** on the combined base, its CCA decode/prefill/mixed
+regions fused into HIP kernels that — because `vllm::cca` is graph-broken — give a **real,
+cudagraphs-on +38%/+49% decode** win (the mirror of the W4A8 graph story), now **folded into the
+single combined image** (`WITH_ZAYA`, default on) and run via the `zaya` profile, with an optional RSA
+test-time-compute proxy; multi-card DP+EP is the next profile (Act XII).
 
 And the two halves are now **one stack**: development has consolidated onto the **combined image**
 (the collaborator's tuned attention + our W4A8, built from canonical sources) — measured
-**+31% prefill** and **fp8-KV made free** on top of the kernel work — with heterogeneous-TP
-(64:56 proportional sharding) landed but gated dormant, a 2-GPU validation the next step. See
-Act IX.
+**+31% prefill** and **fp8-KV made free** on top of the kernel work (Act IX). Heterogeneous-TP
+(64:56 proportional sharding) is now **GPU-validated**: byte-identical to the even split and the
+all-reduce imbalance ~75% smaller (399.6 ms → 99.0 ms), with the wall-clock payoff awaiting a
+cudagraph A/B since the `enforce_eager` profile is launch-bound (Act XI). And as of v0.1.0 it ships
+as a **prebuilt GHCR image** built on every tag — no wheels to
+compile, just `docker compose up` (Act XIII).
+
+## Act XIV — the cudagraph A/B, finally measured: the win is stack-dependent
+
+The "awaiting a cudagraph A/B" promissory notes from Acts XI and the W4A8 throughput section
+got paid. Three images (kyuz0 TheRock 0.21, tcclaviger 0.22, our combined 0.22) × eager vs
+full-compile+cudagraph × batch {1,16,32,64}, `vllm bench latency` with every run's
+`enforce_eager`/capture state verified from its own log, Qwen3.5-4B-FP8-dynamic (a GDN hybrid),
+in=128/out=256. The headline answers the question that kept recurring — *why do we keep seeing
+"no difference" between eager and graphs?* — **because the answer depends entirely on the
+stack.** On the **0.22 stack** (tcclaviger and our combined) graphs are a large win —
+**+80% at bs1, +107% at bs16, +85% at bs32**, tapering to +6% at bs64 as it goes compute-bound;
+the gain is *biggest at low batch*, where eager is CPU-dispatch-bound. On **kyuz0's 0.21
+TheRock** build the same A/B is ~**0%** until bs64 (+30%) — the opposite batch dependence. So a
+"no difference" observation was a kyuz0-style stack (or eager-vs-eager); on our production
+lineage, graphs matter a lot, and the stale `--enforce-eager` serving flags hide exactly that.
+A clean side-result: **combined ≈ tcclaviger for FP8** across every batch — the W4A8 layer adds
+no regression to non-W4A8 models.
+
+The W4A8 kernel's own eager-vs-graphs story is more sobering. Pointed at a 4-bit model
+(Qwen3.5-4B-AWQ-BF16-INT4) the dense kernel **engages and runs in eager** (494.8/869.6/1285.7
+tok/s at bs16/32/64, `Using RocmW4A8Fp8WmmaLinearKernel` confirmed per layer) — after two
+surprises: it crashes on **bf16 activations** (`tl.dot: bf16 vs fp16`, `can_implement` wrongly
+says yes — run `--dtype float16`), and it **cannot run under the 0.22 full-compile + cudagraph
+path at all.** That last one is a three-layer wall: the custom op had **no `register_fake`**
+(added now, in `w4a8_fp8_wmma/__init__.py` — validated, clears the first crash), then the op
+isn't **pickleable** for Inductor's autograd cache (env-disabled the caches), then Inductor
+asserts on a **dynamic-shape symbolic graph input** (`sympy GreaterThan`). `register_fake` is
+necessary but not sufficient; making W4A8 graph-capable means either real Inductor-tracing work
+under BACKED dynamic shapes or registering the op as a `splitting_op` (run eager between graph
+pieces, like attention). This also **corrects** the earlier "W4A8 cudagraph capture confirmed"
+note — whatever mode that was, it was not 0.22 full-compile. Full data + runners live in
+`profiling/bench-eager-vs-graphs/` (`SUMMARY.md`).

@@ -71,6 +71,7 @@ class RSAResult:
     usage: UsageTotals
     selection_method: str  # "majority_vote" | "final_aggregation" | "sample"
     vote_detail: dict | None = None
+    stopped_early: bool = False  # True if consensus stopped rounds before T
 
 
 class BackendClient:
@@ -344,6 +345,7 @@ async def _run_round(
     *,
     model: str,
     params: RSAParams,
+    max_tokens: int,
     semaphore: asyncio.Semaphore,
     usage: UsageTotals,
     round_idx: int,
@@ -354,7 +356,7 @@ async def _run_round(
                 messages,
                 model=model,
                 temperature=params.temperature,
-                max_tokens=params.max_tokens,
+                max_tokens=max_tokens,
                 max_retries=params.max_retries,
             )
 
@@ -384,6 +386,7 @@ async def _run_round_shared(
     n: int,
     model: str,
     params: RSAParams,
+    max_tokens: int,
     usage: UsageTotals,
     round_idx: int,
 ) -> list[Candidate]:
@@ -397,7 +400,7 @@ async def _run_round_shared(
         n=n,
         model=model,
         temperature=params.temperature,
-        max_tokens=params.max_tokens,
+        max_tokens=max_tokens,
         max_retries=params.max_retries,
     )
     for c in population:
@@ -456,6 +459,54 @@ async def _verified_pool(
     return pool
 
 
+def _boxed(c: Candidate) -> str | None:
+    """The candidate's boxed answer, from content then full text."""
+    return extract.extract_boxed(c.content) or extract.extract_boxed(c.text)
+
+
+def _has_consensus(population: list[Candidate], params: RSAParams) -> bool:
+    """Whether the population's extractable answers have converged past the
+    threshold (independent of the ``early_stop`` switch).
+
+    Measured only over EXTRACTABLE boxed answers; general / non-boxed queries
+    (where fewer than ``consensus_min_votes`` answers extract) never converge
+    and fall through to the normal selection path.
+    """
+    _, agree, extractable = extract.consensus_ratio([_boxed(c) for c in population])
+    if extractable < params.consensus_min_votes:
+        return False
+    return agree / extractable >= params.consensus_threshold
+
+
+def _consensus_met(population: list[Candidate], params: RSAParams) -> bool:
+    """Whether to stop generating rounds: ``early_stop`` on AND consensus."""
+    return params.early_stop and _has_consensus(population, params)
+
+
+async def _expand(
+    client: BackendClient,
+    messages: list[dict],
+    *,
+    n: int,
+    model: str,
+    params: RSAParams,
+    semaphore: asyncio.Semaphore,
+    usage: UsageTotals,
+) -> list[Candidate]:
+    """Generate ``n`` round-0 rollouts of the original prompt — one shared
+    ``n``-call when ``expand_with_n``, else ``n`` fan-out requests."""
+    if params.expand_with_n:
+        return await _run_round_shared(
+            client, messages, n=n, model=model, params=params,
+            max_tokens=params.max_tokens, usage=usage, round_idx=0,
+        )
+    return await _run_round(
+        client, [messages] * n, model=model, params=params,
+        max_tokens=params.max_tokens, semaphore=semaphore, usage=usage,
+        round_idx=0,
+    )
+
+
 async def run_rsa(
     client: BackendClient,
     params: RSAParams,
@@ -478,19 +529,27 @@ async def run_rsa(
     # Expansion (round 0): all N rollouts share the same prompt, so use the
     # native n parameter — vLLM prefills once and samples N divergent traces in
     # one batch (vs N separate requests re-prefilling / relying on prefix cache).
-    if params.expand_with_n:
-        population = await _run_round_shared(
-            client, messages, n=params.n, model=model, params=params,
-            usage=usage, round_idx=0,
-        )
-    else:
-        population = await _run_round(
-            client, [messages] * params.n, model=model, params=params,
-            semaphore=semaphore, usage=usage, round_idx=0,
+    # With n_min set, generate n_min first and top up to N only if the smaller
+    # sample hasn't already converged (adaptive population size). The top-up
+    # reuses the same prompt, so its prefill is prefix-cached server-side.
+    n_min = params.n_min if (params.n_min and params.n_min < params.n) else None
+    population = await _expand(
+        client, messages, n=(n_min or params.n), model=model, params=params,
+        semaphore=semaphore, usage=usage,
+    )
+    if n_min is not None and not _has_consensus(population, params):
+        population = population + await _expand(
+            client, messages, n=params.n - n_min, model=model, params=params,
+            semaphore=semaphore, usage=usage,
         )
     rounds = [population]
 
-    for t in range(1, params.t):
+    # Aggregation rounds refine rather than re-derive, so they may use a smaller
+    # completion budget. Stop early once the population reaches consensus.
+    agg_budget = params.agg_max_tokens or params.max_tokens
+    stopped_early = _consensus_met(population, params)
+    t = 1
+    while t < params.t and not stopped_early:
         pool = await _verified_pool(population, params)
         tails = await _tails_for(client, pool, params, model)
         if params.aggregate == "shared":
@@ -503,7 +562,7 @@ async def run_rsa(
             )
             population = await _run_round_shared(
                 client, shared, n=params.n, model=model, params=params,
-                usage=usage, round_idx=t,
+                max_tokens=agg_budget, usage=usage, round_idx=t,
             )
         else:
             message_sets = []
@@ -516,17 +575,27 @@ async def run_rsa(
                 )
             population = await _run_round(
                 client, message_sets, model=model, params=params,
-                semaphore=semaphore, usage=usage, round_idx=t,
+                max_tokens=agg_budget, semaphore=semaphore, usage=usage,
+                round_idx=t,
             )
         rounds.append(population)
+        stopped_early = _consensus_met(population, params)
+        t += 1
 
     final_pool = await _verified_pool(population, params)
     final_text, method, vote_detail = await _select(
-        client, params, final_pool, query, request_system, model, rng, usage
+        client, params, final_pool, query, request_system, model, rng, usage,
+        max_tokens=agg_budget,
     )
+    early = len(rounds) < params.t
     logger.info(
-        "selection=%s, total: %d requests, %d prompt + %d completion tokens",
+        "selection=%s, rounds=%d/%d%s, population=%d, total: %d requests, "
+        "%d prompt + %d completion tokens",
         method,
+        len(rounds),
+        params.t,
+        " (early stop)" if early else "",
+        len(population),
         usage.n_requests,
         usage.prompt_tokens,
         usage.completion_tokens,
@@ -538,6 +607,7 @@ async def run_rsa(
         usage=usage,
         selection_method=method,
         vote_detail=vote_detail,
+        stopped_early=early,
     )
 
 
@@ -550,18 +620,16 @@ async def _select(
     model: str,
     rng: random.Random,
     usage: UsageTotals,
+    max_tokens: int,
 ) -> tuple[str, str, dict | None]:
     """Pick the final answer text from the final population."""
-
-    def boxed(c: Candidate) -> str | None:
-        return extract.extract_boxed(c.content) or extract.extract_boxed(c.text)
 
     if params.selection == "sample":
         return rng.choice(population).content, "sample", None
 
     # Normalize up front so empty answers (a literal "\boxed{}" echoed from
     # the prompt) don't count as extractable votes.
-    answers = [boxed(c) for c in population]
+    answers = [_boxed(c) for c in population]
     normalized = [
         extract.normalize_answer(a) if a is not None else None for a in answers
     ]
@@ -598,7 +666,7 @@ async def _select(
         msgs,
         model=model,
         temperature=0.3,
-        max_tokens=params.max_tokens,
+        max_tokens=max_tokens,
         max_retries=params.max_retries,
     )
     if final is None:

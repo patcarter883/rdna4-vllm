@@ -3,6 +3,40 @@ import torch  # MUST come before `from . import _C` so libtorch is dlopen'd firs
 from . import _C  # noqa: F401
 
 
+# --- FakeTensor / meta registration -----------------------------------------
+# Without a fake (abstract) impl, Dynamo can't trace these custom ops, so vLLM's
+# full torch.compile + cudagraph path aborts at startup with
+#   torch._dynamo.exc.Unsupported: Operator does not support running with fake
+#   tensors: w4a8_fp8_wmma.mmq_fp8_gemm.default
+# and the W4A8 layer can only be served --enforce-eager. The dense GEMM output is
+# data-independent: (M, N) fp16, M = x.shape[0], N = w_packed.shape[0] (the op
+# always returns fp16 regardless of activation dtype). v15/v16 take N explicitly.
+try:
+    from torch.library import register_fake as _register_fake
+except ImportError:  # torch < 2.4
+    _register_fake = None
+
+if _register_fake is not None:
+    def _register_w4a8_fakes() -> None:
+        @_register_fake("w4a8_fp8_wmma::mmq_fp8_gemm")
+        def _(x, w_packed, scales, w_zeros, version):
+            return x.new_empty((x.shape[0], w_packed.shape[0]), dtype=torch.float16)
+
+        @_register_fake("w4a8_fp8_wmma::mmq_fp8_gemm_v15")
+        def _(x, w_rep, scales, w_zeros, N):
+            return x.new_empty((x.shape[0], N), dtype=torch.float16)
+
+        @_register_fake("w4a8_fp8_wmma::mmq_fp8_gemm_v16")
+        def _(x, w_rep, scales, w_zeros, N):
+            return x.new_empty((x.shape[0], N), dtype=torch.float16)
+
+    try:
+        _register_w4a8_fakes()
+    except RuntimeError:
+        # already registered (re-import in the same process) — idempotent no-op
+        pass
+
+
 def mmq_fp8_gemm(
     x: torch.Tensor,
     w_packed: torch.Tensor,

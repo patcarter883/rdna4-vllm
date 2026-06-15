@@ -1,0 +1,6 @@
+W20260615 12:36:47.454478 140159341840192 agent.cpp:461] Attempt to enable hip visiblity for agent-1 which is not visible to HSA (ROCR)
+20 configs
+SERIAL : 6.7s  best=BLOCK_SIZE: 64, num_warps: 2, num_ctas: 1, num_stages: 1, maxnreg: None
+PARALLEL: 2.1s  best=BLOCK_SIZE: 64, num_warps: 2, num_ctas: 1, num_stages: 1, maxnreg: None
+SPEEDUP: 3.15x
+BEST-CONFIG MATCH: True

@@ -36,6 +36,7 @@ validated against (``_convert_awq_to_standard_format`` + the AutoGPTQ repack).
 import json
 import logging
 import os
+from typing import Optional
 
 import torch
 
@@ -614,6 +615,74 @@ def _run_grouped_moe(x, w1, w2, w1_s, w2_s, w1_zp, w2_zp,
 
 
 # --------------------------------------------------------------------------- #
+# torch.compile / cudagraph wrapper for the grouped MoE
+# --------------------------------------------------------------------------- #
+# Same fix as the dense path (vllm_adapter._w4a8_dense_apply): _run_grouped_moe has
+# raw pybind ops (no fake, unpickleable) AND symbolic-M control flow (use_gemv / block_m
+# / chunking), so tracing it directly under vLLM's full torch.compile + cudagraph aborts
+# (fake-tensor / pickle / sympy-GreaterThan). Wrapping the whole compute in ONE opaque
+# vLLM custom op makes it a fake-backed, pickle-clean, in-graph node: the M-branches run
+# eager inside it. The op is FUNCTIONAL (returns the (M,K) output); the internal in-place
+# scatter/copy are hidden, so no mutates_args. MoEActivation is a str-valued enum, passed
+# by value and reconstructed inside.
+def _w4a8_moe_apply(
+    x: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w1_s: torch.Tensor,
+    w2_s: torch.Tensor,
+    w1_zp: Optional[torch.Tensor],
+    w2_zp: Optional[torch.Tensor],
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    activation: str,
+    global_num_experts: int,
+    expert_map: Optional[torch.Tensor],
+    apply_router_weight_on_input: bool,
+    version: int,
+) -> torch.Tensor:
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    act = MoEActivation(activation)
+    return _run_grouped_moe(
+        x, w1, w2, w1_s, w2_s, w1_zp, w2_zp, topk_weights, topk_ids, act,
+        global_num_experts, expert_map, apply_router_weight_on_input, version,
+        out_dtype=x.dtype)
+
+
+def _w4a8_moe_apply_fake(
+    x: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w1_s: torch.Tensor,
+    w2_s: torch.Tensor,
+    w1_zp: Optional[torch.Tensor],
+    w2_zp: Optional[torch.Tensor],
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    activation: str,
+    global_num_experts: int,
+    expert_map: Optional[torch.Tensor],
+    apply_router_weight_on_input: bool,
+    version: int,
+) -> torch.Tensor:
+    # MoE preserves the hidden dim: output is (M, K) == x.shape, dtype = x.dtype.
+    return torch.empty_like(x)
+
+
+if not hasattr(torch.ops.vllm, "w4a8_moe_apply"):
+    try:
+        from vllm.utils.torch_utils import direct_register_custom_op
+    except ImportError:  # older vLLM layout
+        from vllm.utils import direct_register_custom_op
+    direct_register_custom_op(
+        op_name="w4a8_moe_apply",
+        op_func=_w4a8_moe_apply,
+        mutates_args=[],
+        fake_impl=_w4a8_moe_apply_fake,
+    )
+
+
+# --------------------------------------------------------------------------- #
 # modular-kernel experts class
 # --------------------------------------------------------------------------- #
 def _build_experts_class():
@@ -708,11 +777,16 @@ def _build_experts_class():
                   apply_router_weight_on_input):
             # Whole gated MoE from the one grouped op (shared impl). w*_zp may be
             # None for symmetric. self.w1_scale/w1_zp come from the quant_config.
-            out = _run_grouped_moe(
+            # Through the opaque vllm:: op so the symbolic-M ladder runs eager and
+            # the node stays in-graph under torch.compile + cudagraph (see
+            # _w4a8_moe_apply). output.copy_ also casts to output.dtype, so the op
+            # returns x.dtype. activation is a str-valued MoEActivation enum.
+            act = activation.value if hasattr(activation, "value") else activation
+            out = torch.ops.vllm.w4a8_moe_apply(
                 hidden_states, w1, w2, self.w1_scale, self.w2_scale,
-                self.w1_zp, self.w2_zp, topk_weights, topk_ids, activation,
+                self.w1_zp, self.w2_zp, topk_weights, topk_ids, act,
                 global_num_experts, expert_map, apply_router_weight_on_input,
-                _moe_version(), out_dtype=output.dtype)
+                _moe_version())
             output.copy_(out)
 
     return W4A8Fp8WmmaExperts
