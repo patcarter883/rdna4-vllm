@@ -95,7 +95,26 @@ client.chat.completions.create(
 client.chat.completions.create(..., extra_body={"rsa": False})
 ```
 
-Request-level `temperature` and `max_tokens` override the rollout defaults.
+**Flag ↔ key mapping.** The `rsa`-dict key for any field is its startup flag
+with the `--rsa-` prefix stripped and dashes turned into underscores. This
+holds for *every* flag in both tables above — e.g.:
+
+| startup flag | `rsa` dict key | example |
+|---|---|---|
+| `--rsa-n` | `"n"` | `{"rsa": {"n": 8}}` |
+| `--rsa-tail-tokens` | `"tail_tokens"` | `{"rsa": {"tail_tokens": 0}}` |
+| `--rsa-expand-with-n` | `"expand_with_n"` | `{"rsa": {"expand_with_n": false}}` |
+| `--rsa-early-stop` | `"early_stop"` | `{"rsa": {"early_stop": true}}` |
+| `--rsa-consensus-threshold` | `"consensus_threshold"` | `{"rsa": {"consensus_threshold": 0.8}}` |
+| `--rsa-agg-max-tokens` | `"agg_max_tokens"` | `{"rsa": {"agg_max_tokens": 2048}}` |
+| `--rsa-n-min` | `"n_min"` | `{"rsa": {"n_min": 4}}` |
+
+Values follow each flag's type (int, float, bool, or string choice). One
+field has no startup flag: `"enabled"` (`{"rsa": {"enabled": false}}` opts the
+request out, identical to `"rsa": false`).
+
+Request-level top-level `temperature` and `max_tokens` (normal OpenAI body
+fields, *outside* the `rsa` dict) also override the rollout defaults.
 
 ### Parameters
 
