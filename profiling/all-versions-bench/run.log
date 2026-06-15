@@ -1,0 +1,71 @@
+device= it=50 warmup=15
+
+## dense-4096x4096-g128  N=4096 K=4096 G=128
+   v5 vs triton mean-rel: 2.642e-02
+   v15(w_rep) vs v5 max-abs: 4.883e-04  (==0 -> prepack bit-correct)
+   M=1     triton=51.99  best_custom=('v11_gemv', 30.28)
+   M=2     triton=49.83  best_custom=('v11_gemv', 35.48)
+   M=4     triton=49.24  best_custom=('v16_f16wmma', 48.02)
+   M=8     triton=48.88  best_custom=('v16_f16wmma', 53.06)
+   M=16    triton=49.2  best_custom=('v17_w4a16', 60.53)
+   M=32    triton=49.89  best_custom=('v17_w4a16', 61.88)
+   M=64    triton=90.53  best_custom=('v10_ashuffle', 79.1)
+   M=128   triton=76.27  best_custom=('v10_ashuffle', 83.36)
+   M=256   triton=142.57  best_custom=('v10_ashuffle', 96.15)
+   M=512   triton=274.01  best_custom=('v10_ashuffle', 176.27)
+   M=1024  triton=538.47  best_custom=('v10_ashuffle', 347.72)
+   M=2048  triton=1437.71  best_custom=('v10_ashuffle', 692.59)
+   M=4096  triton=3026.3  best_custom=('v10_ashuffle', 1716.94)
+
+## dense-4096x4096-g32  N=4096 K=4096 G=32
+   v5 vs triton mean-rel: 2.654e-02
+   v15(w_rep) vs v5 max-abs: 9.766e-04  (==0 -> prepack bit-correct)
+   M=1     triton=58.88  best_custom=('v11_gemv', 30.41)
+   M=2     triton=58.64  best_custom=('v11_gemv', 35.02)
+   M=4     triton=58.14  best_custom=('v16_f16wmma', 52.85)
+   M=8     triton=59.38  best_custom=('v16_f16wmma', 57.5)
+   M=16    triton=60.26  best_custom=('v17_w4a16', 68.04)
+   M=32    triton=61.78  best_custom=('v17_w4a16', 70.08)
+   M=64    triton=85.73  best_custom=('v17_w4a16', 91.45)
+   M=128   triton=101.96  best_custom=('v10_ashuffle', 99.29)
+   M=256   triton=182.01  best_custom=('v10_ashuffle', 125.45)
+   M=512   triton=339.86  best_custom=('v10_ashuffle', 202.59)
+   M=1024  triton=598.52  best_custom=('v10_ashuffle', 388.24)
+   M=2048  triton=2242.59  best_custom=('v10_ashuffle', 756.44)
+   M=4096  triton=5193.12  best_custom=('v10_ashuffle', 1736.37)
+
+## ffn-up-11008x4096-g32  N=11008 K=4096 G=32
+   v5 vs triton mean-rel: 2.637e-02
+   v15(w_rep) vs v5 max-abs: 9.766e-04  (==0 -> prepack bit-correct)
+   M=1     triton=96.3  best_custom=('v11_gemv', 53.19)
+   M=2     triton=95.61  best_custom=('v11_gemv', 69.92)
+   M=4     triton=96.01  best_custom=('v15_marlin', 79.8)
+   M=8     triton=97.1  best_custom=('v17_w4a16', 85.82)
+   M=16    triton=97.88  best_custom=('v17_w4a16', 88.65)
+   M=32    triton=100.7  best_custom=('v17_w4a16', 125.24)
+   M=64    triton=114.93  best_custom=('v10_ashuffle', 216.16)
+   M=128   triton=227.81  best_custom=('v10_ashuffle', 227.8)
+   M=256   triton=405.82  best_custom=('v10_ashuffle', 289.56)
+   M=512   triton=764.09  best_custom=('v10_ashuffle', 529.09)
+   M=1024  triton=1713.68  best_custom=('v10_ashuffle', 1011.88)
+   M=2048  triton=5487.75  best_custom=('v10_ashuffle', 2156.58)
+   M=4096  triton=12810.2  best_custom=('v10_ashuffle', 4004.64)
+
+## largeK-5120x17408-g128  N=5120 K=17408 G=128
+   v5 vs triton mean-rel: 2.650e-02
+   v15(w_rep) vs v5 max-abs: 1.953e-03  (==0 -> prepack bit-correct)
+   M=1     triton=199.19  best_custom=('v11_gemv', 93.85)
+   M=2     triton=197.3  best_custom=('v11_gemv', 134.85)
+   M=4     triton=197.89  best_custom=('v16_f16wmma', 159.1)
+   M=8     triton=197.58  best_custom=('v16_f16wmma', 160.71)
+   M=16    triton=200.68  best_custom=('v16_f16wmma', 166.76)
+   M=32    triton=204.85  best_custom=('v15_marlin', 236.86)
+   M=64    triton=347.23  best_custom=('v17_w4a16', 405.75)
+   M=128   triton=382.29  best_custom=('v10_ashuffle', 601.85)
+   M=256   triton=763.05  best_custom=('v10_ashuffle', 653.93)
+   M=512   triton=1699.9  best_custom=('v10_ashuffle', 1052.89)
+   M=1024  triton=3177.62  best_custom=('v10_ashuffle', 2095.85)
+   M=2048  triton=6432.56  best_custom=('v10_ashuffle', 3920.32)
+   M=4096  triton=15285.34  best_custom=('v10_ashuffle', 7953.37)
+
+wrote /probe/results_all.json (464 rows)

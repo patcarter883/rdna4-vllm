@@ -1,0 +1,117 @@
+device=  it=50 warmup=20
+
+## dense-4096x4096-g128  N=4096 K=4096 G=128
+   repack(K,N//8)->(N,K//8) reproduces native packing: True
+   hip(shared-layout) bit-identical to hip(native): True  (max_abs=0.00e+00)
+   hip(native) vs triton mean-rel-err: 2.646e-02
+   repack tax: torch-strided=11161us (loose UB)  HBM-floor~=11.2us  [M-independent]
+   M=1     | triton e/g=40.88/46.09  v5 e=127.83  v10 e/g=77.58/82.46  -> triton
+   M=2     | triton e/g=39.94/43.94  v5 e=126.63  v10 e/g=77.16/82.72  -> triton
+   M=4     | triton e/g=39.64/43.98  v5 e=127.36  v10 e/g=79.16/83.67  -> triton
+   M=8     | triton e/g=40.2/44.54  v5 e=128.99  v10 e/g=79.67/85.27  -> triton
+   M=16    | triton e/g=40.62/45.04  v5 e=130.64  v10 e/g=79.97/85.31  -> triton
+   M=32    | triton e/g=41.04/49.66  v5 e=134.83  v10 e/g=80.71/85.47  -> triton
+   M=64    | triton e/g=80.11/84.95  v5 e=139.66  v10 e/g=80.3/85.41  -> triton
+   M=128   | triton e/g=75.63/80.71  v5 e=153.09  v10 e/g=85.04/90.19  -> triton
+   M=256   | triton e/g=145.61/154.76  v5 e=182.67  v10 e/g=97.94/105.76  -> v10
+   M=512   | triton e/g=278.95/277.73  v5 e=381.26  v10 e/g=177.1/182.65  -> v10
+   M=1024  | triton e/g=550.29/571.64  v5 e=720.55  v10 e/g=346.06/351.82  -> v10
+   M=2048  | triton e/g=1464.11/1467.33  v5 e=1624.06  v10 e/g=696.57/698.11  -> v10
+   M=4096  | triton e/g=2979.5/3050.89  v5 e=2938.05  v10 e/g=1757.77/1749.19  -> v10
+
+## ffn-up-11008x4096-g128  N=11008 K=4096 G=128
+   repack(K,N//8)->(N,K//8) reproduces native packing: True
+   hip(shared-layout) bit-identical to hip(native): True  (max_abs=0.00e+00)
+   hip(native) vs triton mean-rel-err: 2.646e-02
+   repack tax: torch-strided=8670us (loose UB)  HBM-floor~=30.1us  [M-independent]
+   M=1     | triton e/g=98.79/102.87  v5 e=350.45  v10 e/g=208.25/213.64  -> triton
+   M=2     | triton e/g=97.3/102.74  v5 e=360.0  v10 e/g=209.24/214.15  -> triton
+   M=4     | triton e/g=97.85/103.91  v5 e=349.56  v10 e/g=209.07/213.6  -> triton
+   M=8     | triton e/g=98.22/103.52  v5 e=355.1  v10 e/g=209.76/214.03  -> triton
+   M=16    | triton e/g=97.48/103.66  v5 e=375.87  v10 e/g=209.44/213.9  -> triton
+   M=32    | triton e/g=97.7/103.95  v5 e=362.94  v10 e/g=209.13/214.15  -> triton
+   M=64    | triton e/g=122.05/124.36  v5 e=376.93  v10 e/g=209.92/214.98  -> triton
+   M=128   | triton e/g=195.17/196.0  v5 e=413.79  v10 e/g=225.91/233.5  -> triton
+   M=256   | triton e/g=383.35/392.79  v5 e=486.44  v10 e/g=247.31/255.63  -> v10
+   M=512   | triton e/g=754.37/764.82  v5 e=916.81  v10 e/g=492.52/497.52  -> v10
+   M=1024  | triton e/g=1706.01/1699.23  v5 e=2002.93  v10 e/g=905.38/932.21  -> v10
+   M=2048  | triton e/g=3630.76/3650.59  v5 e=3634.53  v10 e/g=2177.91/2154.93  -> v10
+   M=4096  | triton e/g=7797.66/7809.35  v5 e=6976.57  v10 e/g=4061.3/4041.12  -> v10
+
+## ffn-down-4096x11008-g128  N=4096 K=11008 G=128
+   repack(K,N//8)->(N,K//8) reproduces native packing: True
+   hip(shared-layout) bit-identical to hip(native): True  (max_abs=0.00e+00)
+   hip(native) vs triton mean-rel-err: 2.643e-02
+   repack tax: torch-strided=61142us (loose UB)  HBM-floor~=30.1us  [M-independent]
+   M=1     | triton e/g=98.69/103.99  v5 e=330.8  v10 e/g=199.87/204.64  -> triton
+   M=2     | triton e/g=97.44/102.39  v5 e=330.51  v10 e/g=201.02/206.52  -> triton
+   M=4     | triton e/g=98.13/104.01  v5 e=332.16  v10 e/g=202.14/207.04  -> triton
+   M=8     | triton e/g=99.25/103.55  v5 e=332.93  v10 e/g=201.94/207.21  -> triton
+   M=16    | triton e/g=101.03/105.26  v5 e=337.91  v10 e/g=206.29/211.59  -> triton
+   M=32    | triton e/g=106.28/117.93  v5 e=344.73  v10 e/g=217.52/207.18  -> triton
+   M=64    | triton e/g=201.78/206.81  v5 e=363.11  v10 e/g=205.04/209.37  -> triton
+   M=128   | triton e/g=229.14/213.02  v5 e=403.96  v10 e/g=214.14/221.92  -> v10
+   M=256   | triton e/g=397.11/407.45  v5 e=485.47  v10 e/g=242.03/247.48  -> v10
+   M=512   | triton e/g=765.88/767.54  v5 e=942.15  v10 e/g=467.37/474.49  -> v10
+   M=1024  | triton e/g=1734.6/1739.74  v5 e=2097.02  v10 e/g=935.28/939.63  -> v10
+   M=2048  | triton e/g=3240.72/3249.82  v5 e=4023.93  v10 e/g=2214.21/2223.88  -> v10
+   M=4096  | triton e/g=7580.64/7501.86  v5 e=7802.41  v10 e/g=4187.65/4191.88  -> v10
+
+## ffn-up-14336x4096-g128  N=14336 K=4096 G=128
+   repack(K,N//8)->(N,K//8) reproduces native packing: True
+   hip(shared-layout) bit-identical to hip(native): True  (max_abs=0.00e+00)
+   hip(native) vs triton mean-rel-err: 2.656e-02
+   repack tax: torch-strided=19758us (loose UB)  HBM-floor~=39.1us  [M-independent]
+   M=1     | triton e/g=122.93/127.86  v5 e=407.43  v10 e/g=275.37/280.22  -> triton
+   M=2     | triton e/g=122.18/128.97  v5 e=407.04  v10 e/g=275.84/281.45  -> triton
+   M=4     | triton e/g=122.11/127.73  v5 e=407.02  v10 e/g=276.77/280.46  -> triton
+   M=8     | triton e/g=122.52/126.77  v5 e=409.17  v10 e/g=276.15/280.54  -> triton
+   M=16    | triton e/g=122.0/127.58  v5 e=416.25  v10 e/g=274.93/280.09  -> triton
+   M=32    | triton e/g=122.61/128.9  v5 e=431.36  v10 e/g=275.28/280.0  -> triton
+   M=64    | triton e/g=166.25/160.02  v5 e=457.65  v10 e/g=277.56/286.51  -> triton
+   M=128   | triton e/g=253.07/254.03  v5 e=507.07  v10 e/g=299.16/302.41  -> triton
+   M=256   | triton e/g=489.88/500.08  v5 e=620.52  v10 e/g=335.41/333.4  -> v10
+   M=512   | triton e/g=984.92/989.47  v5 e=1391.61  v10 e/g=586.11/596.43  -> v10
+   M=1024  | triton e/g=2166.81/2173.97  v5 e=2483.02  v10 e/g=1423.54/1449.98  -> v10
+   M=2048  | triton e/g=4755.32/4764.02  v5 e=4649.71  v10 e/g=2680.5/2669.88  -> v10
+   M=4096  | triton e/g=10165.16/10183.46  v5 e=9036.3  v10 e/g=5294.1/5235.28  -> v10
+
+## moe-gemm1-1792x2304-g32  N=1792 K=2304 G=32
+   repack(K,N//8)->(N,K//8) reproduces native packing: True
+   hip(shared-layout) bit-identical to hip(native): True  (max_abs=0.00e+00)
+   hip(native) vs triton mean-rel-err: 2.634e-02
+   repack tax: torch-strided=549us (loose UB)  HBM-floor~=2.8us  [M-independent]
+   M=1     | triton e/g=37.29/46.13  v5 e=117.17  v10 e/g=66.08/68.47  -> triton
+   M=2     | triton e/g=37.15/42.18  v5 e=117.24  v10 e/g=66.06/71.54  -> triton
+   M=4     | triton e/g=33.33/37.42  v5 e=102.17  v10 e/g=57.75/62.86  -> triton
+   M=8     | triton e/g=32.91/38.2  v5 e=102.56  v10 e/g=58.95/65.89  -> triton
+   M=16    | triton e/g=37.72/42.94  v5 e=118.86  v10 e/g=69.14/70.72  -> triton
+   M=32    | triton e/g=33.56/37.67  v5 e=104.01  v10 e/g=59.17/64.3  -> triton
+   M=64    | triton e/g=45.33/50.04  v5 e=103.58  v10 e/g=59.67/65.09  -> triton
+   M=128   | triton e/g=50.72/54.35  v5 e=128.11  v10 e/g=69.54/65.62  -> triton
+   M=256   | triton e/g=45.98/53.4  v5 e=131.62  v10 e/g=75.28/81.34  -> triton
+   M=512   | triton e/g=85.7/99.0  v5 e=175.94  v10 e/g=79.86/84.6  -> v10
+   M=1024  | triton e/g=150.37/149.99  v5 e=280.79  v10 e/g=116.32/125.3  -> v10
+   M=2048  | triton e/g=280.85/277.63  v5 e=506.97  v10 e/g=221.1/223.32  -> v10
+   M=4096  | triton e/g=683.68/693.72  v5 e=949.69  v10 e/g=399.86/406.76  -> v10
+
+## moe-gemm2-2304x896-g32  N=2304 K=896 G=32
+   repack(K,N//8)->(N,K//8) reproduces native packing: True
+   hip(shared-layout) bit-identical to hip(native): True  (max_abs=0.00e+00)
+   hip(native) vs triton mean-rel-err: 2.625e-02
+   repack tax: torch-strided=338us (loose UB)  HBM-floor~=1.4us  [M-independent]
+   M=1     | triton e/g=17.53/19.72  v5 e=48.14  v10 e/g=26.93/31.81  -> triton
+   M=2     | triton e/g=17.47/19.91  v5 e=48.61  v10 e/g=27.13/31.98  -> triton
+   M=4     | triton e/g=17.68/20.07  v5 e=49.11  v10 e/g=27.77/32.33  -> triton
+   M=8     | triton e/g=17.54/19.9  v5 e=50.2  v10 e/g=28.99/33.59  -> triton
+   M=16    | triton e/g=17.39/20.22  v5 e=50.19  v10 e/g=28.96/33.61  -> triton
+   M=32    | triton e/g=17.25/20.25  v5 e=51.08  v10 e/g=28.97/33.51  -> triton
+   M=64    | triton e/g=21.45/25.99  v5 e=51.35  v10 e/g=29.23/34.01  -> triton
+   M=128   | triton e/g=20.57/25.53  v5 e=54.54  v10 e/g=29.98/34.17  -> triton
+   M=256   | triton e/g=23.58/28.39  v5 e=65.86  v10 e/g=42.02/47.2  -> triton
+   M=512   | triton e/g=40.11/43.76  v5 e=133.64  v10 e/g=91.95/82.67  -> triton
+   M=1024  | triton e/g=75.08/76.22  v5 e=180.08  v10 e/g=79.85/84.19  -> triton
+   M=2048  | triton e/g=138.18/142.14  v5 e=266.36  v10 e/g=110.85/119.23  -> v10
+   M=4096  | triton e/g=280.26/278.48  v5 e=477.3  v10 e/g=212.84/213.98  -> v10
+
+wrote /probe/results.json  (78 rows)
