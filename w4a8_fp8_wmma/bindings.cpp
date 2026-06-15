@@ -367,23 +367,35 @@ at::Tensor mmq_fp8_moe_gather_reduce_forward(
 
 }  // namespace
 
+// pt2_compliant_tag: marks every op as safe for torch.compile / Dynamo full-graph
+// capture (vLLM 0.22.69's aot_compile is fullgraph-strict and otherwise raises
+// "unsupported operator: w4a8_fp8_wmma.*" the moment the kernel actually engages).
+// The matching fake/meta kernels (output-shape inference) live in __init__.py.
 TORCH_LIBRARY(w4a8_fp8_wmma, m) {
-    m.def("mmq_fp8_gemm(Tensor x, Tensor w_packed, Tensor scales, Tensor w_zeros, int version) -> Tensor");
-    m.def("mmq_fp8_gemm_v15(Tensor x, Tensor w_rep, Tensor scales, Tensor w_zeros, int N) -> Tensor");
-    m.def("mmq_fp8_gemm_v16(Tensor x, Tensor w_rep, Tensor scales, Tensor w_zeros, int N) -> Tensor");
-    m.def("mmq_w4a16_gemm_v17(Tensor x, Tensor w_rep, Tensor scales, Tensor w_zeros, int N) -> Tensor");
+    m.def("mmq_fp8_gemm(Tensor x, Tensor w_packed, Tensor scales, Tensor w_zeros, int version) -> Tensor",
+          {at::Tag::pt2_compliant_tag});
+    m.def("mmq_fp8_gemm_v15(Tensor x, Tensor w_rep, Tensor scales, Tensor w_zeros, int N) -> Tensor",
+          {at::Tag::pt2_compliant_tag});
+    m.def("mmq_fp8_gemm_v16(Tensor x, Tensor w_rep, Tensor scales, Tensor w_zeros, int N) -> Tensor",
+          {at::Tag::pt2_compliant_tag});
+    m.def("mmq_w4a16_gemm_v17(Tensor x, Tensor w_rep, Tensor scales, Tensor w_zeros, int N) -> Tensor",
+          {at::Tag::pt2_compliant_tag});
     m.def("mmq_fp8_moe_gemm(Tensor x, Tensor w_packed, Tensor scales, Tensor w_zeros, "
           "Tensor sorted_token_ids, Tensor expert_ids, Tensor num_tokens_post_padded, "
-          "int top_k, int block_m, int version) -> Tensor");
+          "int top_k, int block_m, int version) -> Tensor",
+          {at::Tag::pt2_compliant_tag});
     m.def("mmq_fp8_moe_gemm1_silu(Tensor x, Tensor w_packed, Tensor scales, Tensor w_zeros, "
           "Tensor sorted_token_ids, Tensor expert_ids, Tensor num_tokens_post_padded, "
-          "int top_k, int block_m, int version) -> Tensor");
+          "int top_k, int block_m, int version) -> Tensor",
+          {at::Tag::pt2_compliant_tag});
     m.def("mmq_fp8_moe_gemm_scatter(Tensor x, Tensor w_packed, Tensor scales, "
           "Tensor w_zeros, Tensor sorted_token_ids, Tensor expert_ids, "
           "Tensor num_tokens_post_padded, Tensor topk_weights, Tensor(a!) output, "
-          "int top_k, int block_m, int version) -> ()");
+          "int top_k, int block_m, int version) -> ()",
+          {at::Tag::pt2_compliant_tag});
     m.def("mmq_fp8_moe_gather_reduce(Tensor out2, Tensor sorted_token_ids, "
-          "Tensor topk_weights, Tensor num_tokens_post_padded, int top_k) -> Tensor");
+          "Tensor topk_weights, Tensor num_tokens_post_padded, int top_k) -> Tensor",
+          {at::Tag::pt2_compliant_tag});
 }
 
 TORCH_LIBRARY_IMPL(w4a8_fp8_wmma, CUDA, m) {
