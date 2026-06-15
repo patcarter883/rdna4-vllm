@@ -6,7 +6,7 @@
 # package or a GPU, only an OpenAI-compatible backend URL. See rsa/README.md.
 #
 # Build: docker build -f Dockerfile.rsa -t vllm22-zaya-rsa:combined .
-# Run:   via the `rsa` profile in docker-compose.zaya.yml (proxy on :8100).
+# Run:   via the `rsa` profile in docker-compose.yml (proxy on :8100).
 FROM python:3.12-slim
 
 WORKDIR /app
@@ -24,5 +24,5 @@ ENV PYTHONUNBUFFERED=1 \
     HF_HUB_OFFLINE=1
 EXPOSE 8100
 
-# Args (backend/port/--rsa-*) come from docker-compose.zaya.yml's command.
+# Args (backend/port/--rsa-*) come from docker-compose.yml's rsa-service command.
 ENTRYPOINT ["python", "-m", "rsa.server"]

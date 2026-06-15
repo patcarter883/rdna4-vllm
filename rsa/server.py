@@ -164,8 +164,11 @@ def _response_dict(result: RSAResult, model: str, params: RSAParams) -> dict:
             "total_tokens": result.usage.total_tokens,
         },
         "rsa": {
-            "rounds": params.t,
-            "population": params.n,
+            "rounds": len(result.rounds),
+            "rounds_configured": params.t,
+            "population": len(result.population),
+            "population_configured": params.n,
+            "stopped_early": result.stopped_early,
             "aggregation_size": params.k,
             "tail_tokens": params.tail_tokens,
             "selection": result.selection_method,

@@ -1,0 +1,35 @@
+W20260615 12:21:56.908461 140075090597696 agent.cpp:461] Attempt to enable hip visiblity for agent-1 which is not visible to HSA (ROCR)
+INFO 06-15 12:22:01 [attn_autotune.py:399] attn autotune: M=1 grid_base=8 pred_seg=256 -> seg=128 waves=4 (tile=16 warps=1) 0.1214 ms
+INFO 06-15 12:22:03 [attn_autotune.py:399] attn autotune: M=2 grid_base=16 pred_seg=256 -> seg=128 waves=3 (tile=16 warps=1) 0.1668 ms
+INFO 06-15 12:22:04 [attn_autotune.py:399] attn autotune: M=4 grid_base=40 pred_seg=128 -> seg=256 waves=4 (tile=16 warps=1) 0.0975 ms
+INFO 06-15 12:22:05 [attn_autotune.py:399] attn autotune: M=8 grid_base=80 pred_seg=64 -> seg=64 waves=4 (tile=16 warps=1) 0.1017 ms
+INFO 06-15 12:22:08 [attn_autotune.py:399] attn autotune: M=16 grid_base=160 pred_seg=32 -> seg=16 waves=1 (tile=16 warps=1) 0.1726 ms
+INFO 06-15 12:22:08 [attn_autotune.py:399] attn autotune: M=32 grid_base=320 pred_seg=16 -> seg=16 waves=4 (tile=16 warps=1) 0.2510 ms
+INFO 06-15 12:22:08 [attn_autotune.py:399] attn autotune: M=64 grid_base=640 pred_seg=16 -> seg=16 waves=3 (tile=16 warps=1) 0.4221 ms
+INFO 06-15 12:22:08 [attn_autotune.py:399] attn autotune: M=128 grid_base=1280 pred_seg=16 -> seg=32 waves=3 (tile=16 warps=1) 0.7405 ms
+INFO 06-15 12:22:08 [attn_autotune.py:399] attn autotune: M=256 grid_base=2560 pred_seg=16 -> seg=16 waves=4 (tile=16 warps=1) 1.6329 ms
+INFO 06-15 12:22:08 [attn_autotune.py:399] attn autotune: M=512 grid_base=5120 pred_seg=16 -> seg=16 waves=2 (tile=16 warps=1) 3.0118 ms
+INFO 06-15 12:22:40 [attn_autotune.py:273] prefill autotune (qlen=2048, kv=4096): tile_2d=32 warps=1 (pinned) stages=1 waves=1 -> 2.7996 ms
+INFO 06-15 12:22:40 [attn_autotune.py:317] attn autotune results dumped to /tmp/vllm_attn_autotune/autotune_AMD_Radeon_RX9070XT_kv8_q32_h128_bfloat16_kvbf16_ql1.json
+SERIAL autotune (cold): 41.8s
+W20260615 12:22:40.264494 139794361149248 agent.cpp:461] Attempt to enable hip visiblity for agent-1 which is not visible to HSA (ROCR)
+W20260615 12:22:40.270068 140196612200256 agent.cpp:461] Attempt to enable hip visiblity for agent-1 which is not visible to HSA (ROCR)
+W20260615 12:22:40.270897 140527230797632 agent.cpp:461] Attempt to enable hip visiblity for agent-1 which is not visible to HSA (ROCR)
+W20260615 12:22:40.280277 139805440640832 agent.cpp:461] Attempt to enable hip visiblity for agent-1 which is not visible to HSA (ROCR)
+W20260615 12:22:40.286528 140472693393216 agent.cpp:461] Attempt to enable hip visiblity for agent-1 which is not visible to HSA (ROCR)
+W20260615 12:22:40.307441 140131005093696 agent.cpp:461] Attempt to enable hip visiblity for agent-1 which is not visible to HSA (ROCR)
+W20260615 12:22:40.326898 139775803356992 agent.cpp:461] Attempt to enable hip visiblity for agent-1 which is not visible to HSA (ROCR)
+W20260615 12:22:40.329276 139624764131136 agent.cpp:461] Attempt to enable hip visiblity for agent-1 which is not visible to HSA (ROCR)
+INFO 06-15 12:22:54 [attn_autotune.py:399] attn autotune: M=1 grid_base=8 pred_seg=256 -> seg=128 waves=4 (tile=16 warps=1) 0.0695 ms
+INFO 06-15 12:22:54 [attn_autotune.py:399] attn autotune: M=2 grid_base=16 pred_seg=256 -> seg=128 waves=3 (tile=16 warps=1) 0.0719 ms
+INFO 06-15 12:22:54 [attn_autotune.py:399] attn autotune: M=4 grid_base=40 pred_seg=128 -> seg=128 waves=4 (tile=16 warps=1) 0.0847 ms
+INFO 06-15 12:22:54 [attn_autotune.py:399] attn autotune: M=8 grid_base=80 pred_seg=64 -> seg=32 waves=4 (tile=16 warps=1) 0.1015 ms
+INFO 06-15 12:22:54 [attn_autotune.py:399] attn autotune: M=16 grid_base=160 pred_seg=32 -> seg=16 waves=3 (tile=16 warps=1) 0.1489 ms
+INFO 06-15 12:22:54 [attn_autotune.py:399] attn autotune: M=32 grid_base=320 pred_seg=16 -> seg=32 waves=3 (tile=16 warps=1) 0.2241 ms
+INFO 06-15 12:22:54 [attn_autotune.py:399] attn autotune: M=64 grid_base=640 pred_seg=16 -> seg=16 waves=4 (tile=16 warps=1) 0.3778 ms
+INFO 06-15 12:22:54 [attn_autotune.py:399] attn autotune: M=128 grid_base=1280 pred_seg=16 -> seg=16 waves=3 (tile=16 warps=1) 0.7038 ms
+INFO 06-15 12:22:54 [attn_autotune.py:399] attn autotune: M=256 grid_base=2560 pred_seg=16 -> seg=16 waves=3 (tile=16 warps=1) 1.6340 ms
+INFO 06-15 12:22:54 [attn_autotune.py:399] attn autotune: M=512 grid_base=5120 pred_seg=16 -> seg=16 waves=4 (tile=16 warps=1) 3.0125 ms
+INFO 06-15 12:22:55 [attn_autotune.py:273] prefill autotune (qlen=2048, kv=4096): tile_2d=32 warps=1 (pinned) stages=1 waves=1 -> 2.4017 ms
+PARALLEL prewarm: 14.0s | prewarm+serial total: 15.1s
+SPEEDUP: 2.77x  (serial 41.8s -> 15.1s)

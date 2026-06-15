@@ -88,3 +88,17 @@ def majority_vote(
         if tally[a] == best_count:
             return a, tally
     return None  # unreachable
+
+
+def consensus_ratio(answers: list[str | None]) -> tuple[str | None, int, int]:
+    """Agreement on the top answer, for adaptive early-stopping.
+
+    Returns ``(winner, agree_count, extractable_count)`` using the same vote
+    and normalization as :func:`majority_vote` (so consensus and final
+    selection agree), or ``(None, 0, 0)`` when nothing is extractable.
+    """
+    vote = majority_vote(answers)
+    if vote is None:
+        return None, 0, 0
+    winner, tally = vote
+    return winner, tally[winner], sum(tally.values())

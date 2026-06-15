@@ -58,6 +58,49 @@ class RSAParams(BaseModel):
     request_timeout: float = Field(default=1800.0, gt=0)
     max_retries: int = Field(default=1, ge=0)
 
+    # --- Adaptive compute (all default to the current fixed-budget behavior) ---
+    early_stop: bool = Field(
+        default=False,
+        description=(
+            "stop generating rounds once the population reaches consensus on a "
+            "boxed answer (saves the dominant decode-token cost on easy problems)"
+        ),
+    )
+    consensus_threshold: float = Field(
+        default=0.9,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "fraction of EXTRACTABLE answers that must agree on the top answer "
+            "for early_stop to trigger"
+        ),
+    )
+    consensus_min_votes: int = Field(
+        default=2,
+        ge=1,
+        description=(
+            "minimum number of extractable answers required before consensus can "
+            "trigger an early stop (guards against a 'majority of one')"
+        ),
+    )
+    agg_max_tokens: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "completion budget for aggregation rounds (t>=1) and the final "
+            "selection call; None = use max_tokens. Aggregation refines rather "
+            "than re-derives, so it usually needs fewer tokens than round 0"
+        ),
+    )
+    n_min: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "if set (and < n), round 0 generates n_min rollouts first and only "
+            "tops up to n when consensus is not yet met (adaptive population size)"
+        ),
+    )
+
 
 def merge_params(defaults: RSAParams, rsa_value) -> RSAParams | None:
     """Merge a request's ``rsa`` extra-body value over server defaults.
@@ -142,6 +185,36 @@ def add_rsa_args(parser: argparse.ArgumentParser) -> None:
     g.add_argument("--rsa-max-concurrency", type=int, default=d.max_concurrency)
     g.add_argument("--rsa-request-timeout", type=float, default=d.request_timeout)
     g.add_argument("--rsa-max-retries", type=int, default=d.max_retries)
+    g.add_argument(
+        "--rsa-early-stop",
+        action=argparse.BooleanOptionalAction,
+        default=d.early_stop,
+        help="stop rounds once the population reaches consensus on a boxed answer",
+    )
+    g.add_argument(
+        "--rsa-consensus-threshold",
+        type=float,
+        default=d.consensus_threshold,
+        help="fraction of extractable answers that must agree to early-stop",
+    )
+    g.add_argument(
+        "--rsa-consensus-min-votes",
+        type=int,
+        default=d.consensus_min_votes,
+        help="min extractable answers before an early stop can trigger",
+    )
+    g.add_argument(
+        "--rsa-agg-max-tokens",
+        type=int,
+        default=d.agg_max_tokens,
+        help="completion budget for aggregation rounds + final selection (default: --rsa-max-tokens)",
+    )
+    g.add_argument(
+        "--rsa-n-min",
+        type=int,
+        default=d.n_min,
+        help="round 0 generates n_min first, topping up to N only if consensus is unmet",
+    )
 
 
 def params_from_args(args: argparse.Namespace) -> RSAParams:
@@ -159,4 +232,9 @@ def params_from_args(args: argparse.Namespace) -> RSAParams:
         max_concurrency=args.rsa_max_concurrency,
         request_timeout=args.rsa_request_timeout,
         max_retries=args.rsa_max_retries,
+        early_stop=args.rsa_early_stop,
+        consensus_threshold=args.rsa_consensus_threshold,
+        consensus_min_votes=args.rsa_consensus_min_votes,
+        agg_max_tokens=args.rsa_agg_max_tokens,
+        n_min=args.rsa_n_min,
     )

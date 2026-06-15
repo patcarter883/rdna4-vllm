@@ -15,6 +15,7 @@ register() in register.py inserts this at the front of _POSSIBLE_KERNELS[ROCM].
 """
 import json
 import os
+from typing import Optional
 
 import torch
 
@@ -47,35 +48,12 @@ def _force_mode() -> str:
     return "auto"
 
 
-def _v6_band() -> tuple[int, int] | None:
-    """Optional mid-M band routed to kernel v6 (b128 double-K loads).
-
-    v6 issues TWO back-to-back WMMAs per b128 (16-fp8) LDS read, halving the LDS
-    load-instruction count vs v5's b64-per-subtile. It loads BIT-IDENTICAL
-    operands to v5 (a permuted LDS layout, see the v6 kernel header) so it is
-    bit-exact vs v5 — only the instruction mix changes. It is the ROADMAP Task-4
-    lever for the mid-M band (~512-2048) where the served path currently trails
-    Triton (DIARY Act VI/VIII, 0.66-0.9x). v6 reuses v5's V2_BM=256/V2_BN=64 tile
-    and needs group_size % 32 == 0 (k_sub even for the dual-subtile pairing).
-
-    OFF by default: returns None unless BOTH band bounds are set, so the served
-    dispatch is byte-identical to before until v6 is benchmarked on the target GPU
-    (the pathway never regresses unmeasured). To engage, after measuring v6's
-    crossover (bench_v6.py / bench_dense_vs_triton.py):
-      VLLM_ROCM_W4A8_V6_MIN_M=<lo> VLLM_ROCM_W4A8_V6_MAX_M=<hi>
-    routes M in [lo, hi] (with gs%32==0) to v6 instead of the v10/v5 it would
-    otherwise pick. The band is closed [lo, hi]; set hi huge for an open suffix."""
-    lo = os.environ.get("VLLM_ROCM_W4A8_V6_MIN_M")
-    hi = os.environ.get("VLLM_ROCM_W4A8_V6_MAX_M")
-    if lo is None or hi is None:
-        return None
-    try:
-        lo_i, hi_i = int(lo), int(hi)
-    except ValueError:
-        return None
-    if hi_i < lo_i:
-        return None
-    return (lo_i, hi_i)
+# _v6_band() (the VLLM_ROCM_W4A8_V6_MIN_M/_MAX_M gate that routed a mid-M band to
+# kernel v6) was REMOVED 2026-06-15. The unified all-versions bench retired v6: it is
+# bit-exact to v5 but slower than v5 at every measured (shape, M) cell and never
+# approaches v10, so the gate could only ever pick a loser. The mid-M band it targeted
+# is owned outright by v10. v6 is now research-only (not dispatched). See
+# profiling/all-versions-bench/FINDINGS.md and VERSIONS.md.
 
 
 def _layout_mode() -> str:
@@ -89,29 +67,32 @@ def _layout_mode() -> str:
     cards a ~10GB-weights model (e.g. Qwen3.6-27B at TP=2) OOMs at load building it,
     and that VRAM is otherwise KV cache -> concurrency/throughput.
 
-    Modes (VLLM_ROCM_W4A8_LAYOUT, default 'single'):
-      'single'  — single-layout (NEW DEFAULT): build NO second copy. Frees ~50% of
-                  dense weight VRAM for KV cache. All M route through our v11/v10/v5
-                  (apply_weights makes the ladder gap-free). Trades the dense M=16-64
-                  small-band, where the gfx1201-tuned Triton wins ~1.2-1.4x at g=128
-                  (and is parity at g<=64), for the VRAM — i.e. parity-or-slightly-
-                  below stock ONLY in that narrow band, >= stock everywhere else.
-      'tuned'   — build the (K, N//8) copy and route small-M (M<=32 & g>64) to the
-                  gfx1201-tuned Triton, mid-M to stock Triton. The strictly->=-stock
-                  pathway in EVERY regime (PIECE2_V*); costs 2x dense weight VRAM.
-      'full'    — alias of 'tuned' (kept for clarity / future stock-only variants).
+    Modes (VLLM_ROCM_W4A8_LAYOUT, default 'tuned' as of 2026-06-15):
+      'tuned'   — DEFAULT: build the (K, N//8) copy and re-admit Triton for the
+                  small-M band (M<=32 & g>64 -> gfx1201-tuned Triton; mid-M -> stock
+                  Triton). The strictly->=-stock pathway in EVERY regime. Re-admitted
+                  as default because the unified all-versions bench showed single-mode
+                  serves small-M via forced-v10 (gs in {32,128}), ~2.4x behind Triton
+                  at M<=16 on production FFN shapes. COST: a SECOND full dense-weight
+                  copy that EXACTLY DOUBLES dense weight VRAM and can OOM ~10GB-weight
+                  models at load on 16GB cards (e.g. Qwen3.6-27B at TP=2) -- that VRAM
+                  is otherwise KV cache. VRAM-constrained deploys: set =single.
+      'single'  — single-layout: build NO second copy. Frees ~50% of dense weight
+                  VRAM for KV cache. All M route through our v11/v10/v5 (the ladder
+                  is gap-free; small-M = forced-v10 for gs in {32,128}, ~2.4x behind
+                  Triton there). Use when dense weights would OOM or KV cache is tight.
+      'full'    — alias of 'tuned'.
 
-    Reversible: set VLLM_ROCM_W4A8_LAYOUT=tuned to restore the strictly->=-stock
-    small-M behavior at the 2x-VRAM cost. The legacy VLLM_ROCM_W4A8_NO_TRITON_
-    FALLBACK is still honored (1 -> 'single', 0 -> 'tuned') so existing deploys
-    that pinned the old default behavior keep it."""
+    Reversible: set VLLM_ROCM_W4A8_LAYOUT=single to drop the second copy and get the
+    VRAM back (today's pre-2026-06-15 default behavior). The legacy
+    VLLM_ROCM_W4A8_NO_TRITON_FALLBACK is still honored (1 -> 'single', 0 -> 'tuned')."""
     legacy = os.environ.get("VLLM_ROCM_W4A8_NO_TRITON_FALLBACK")
     if legacy is not None:
         return "single" if legacy == "1" else "tuned"
-    v = os.environ.get("VLLM_ROCM_W4A8_LAYOUT", "single").strip().lower()
-    if v in ("tuned", "full"):
-        return "tuned"
-    return "single"
+    v = os.environ.get("VLLM_ROCM_W4A8_LAYOUT", "tuned").strip().lower()
+    if v == "single":
+        return "single"
+    return "tuned"
 
 
 def _no_triton_fallback() -> bool:
@@ -268,6 +249,130 @@ def _on_gfx12x() -> bool:
         return on_gfx12x()
     except Exception:
         return False
+
+
+# --- the dense apply as a single, traceable custom op -------------------------
+# The per-M kernel-selection ladder below is plain Python control flow on the
+# (under torch.compile, SYMBOLIC) batch dim M. Tracing it directly leaks a
+# `sympy ... GreaterThan` guard into the Inductor graph (blocker #3) and the raw
+# pybind op is neither fake-able (#1) nor pickleable for the compile cache (#2).
+# Wrapping the whole compute in ONE vLLM custom op fixes all three at once: Dynamo
+# treats it as an opaque, fake-backed, pickle-clean node, so the ladder runs EAGER
+# inside the op (concrete M, no symbolic guard) while the node stays IN-GRAPH
+# (captured by cudagraph, NOT split — no per-linear fragmentation). Universal: no
+# caller-side compile config, works for any model/shape/serving mode.
+def _w4a8_dense_apply(
+    x2d: torch.Tensor,
+    w_q: torch.Tensor,
+    w_s: torch.Tensor,
+    w_zp: Optional[torch.Tensor],
+    tri_bq: Optional[torch.Tensor],
+    tri_s: Optional[torch.Tensor],
+    tri_zp: Optional[torch.Tensor],
+    N: int,
+    K: int,
+    group_size: int,
+    zero_points: bool,
+    weight_type_bias: int,
+    cached_min_m: int,
+) -> torch.Tensor:
+    """Version-ladder dispatch for one dense W4A8 linear. Operates on 2D (M,K)
+    activations, returns (M,N) fp16. Body identical to the former apply_weights
+    ladder; see _force_mode/_layout_mode for the env gates. Returns fp16 always so the
+    registered fake's dtype is exact regardless of which sub-kernel runs."""
+    M = x2d.size(0)
+    # Activation-dtype-agnostic: W4A8 computes in fp16. The FP8-WMMA path stages
+    # activations to fp8 regardless (the fp16 intermediate is exact-equivalent for
+    # it), and the Triton W4A16 fallback's tl.dot needs matching activation/weight
+    # dtypes. Downcast bf16 (and any non-fp16) here -- removes the prior
+    # `tl.dot: Got bf16 and fp16` crash and the --dtype float16 requirement, so bf16
+    # models (the modern default) run without per-deploy flags.
+    if x2d.dtype != torch.float16:
+        x2d = x2d.to(torch.float16)
+    gs = group_size
+    v10_ok = gs in (32, 128)
+    v11_ok = (K % 1024 == 0) and (gs % 32 == 0) and (M <= 16)
+    decode_max = int(os.environ.get("VLLM_ROCM_W4A8_DECODE_MAX_M", "2"))
+    v10_min = int(os.environ.get("VLLM_ROCM_W4A8_V10_MIN_M", "256"))
+    cached = cached_min_m
+    prefill_min = min(cached, v10_min) if v10_ok else cached
+
+    use_v11 = v11_ok and M <= decode_max
+    use_v10 = (not use_v11) and v10_ok and M >= prefill_min
+    use_v5 = (not use_v11) and (not use_v10) and M >= cached
+
+    have_fallback = tri_bq is not None
+    force = _force_mode()
+    if force == "off" and have_fallback:
+        use_v11 = use_v10 = use_v5 = False
+    elif (force == "on" or not have_fallback) and not (use_v11 or use_v10 or use_v5):
+        if v10_ok:
+            use_v10 = True
+        else:
+            use_v5 = True
+
+    # v6 (b128 double-K) RETIRED 2026-06-15: the unified all-versions bench
+    # (profiling/all-versions-bench/) showed v6 loses to v5 at every measured
+    # (shape, M) cell and never approaches v10 — the b128 double-K LDS trick does
+    # not pay on gfx1201. Its _v6_band gate is removed; v6 is research-only now.
+
+    if use_v11 or use_v10 or use_v5:
+        x16 = x2d  # already fp16 (downcast at top -> activation-dtype-agnostic)
+        if zero_points and w_zp is not None:
+            zp_in = w_zp
+        else:
+            zp_in = torch.empty(0, dtype=torch.int32, device=x2d.device)
+        ver = 11 if use_v11 else (10 if use_v10 else 5)
+        out = torch.ops.w4a8_fp8_wmma.mmq_fp8_gemm(x16, w_q, w_s, zp_in, ver)
+    else:
+        if M <= 32 and gs > 64:
+            from w4a8_fp8_wmma.triton_w4a16_gfx1201 import (
+                triton_w4a16_gemm_gfx1201 as _tri,
+            )
+        else:
+            from vllm.model_executor.kernels.linear.mixed_precision.triton_w4a16 import (  # noqa: E501
+                triton_w4a16_gemm as _tri,
+            )
+        out = _tri(x2d, tri_bq, tri_s, tri_zp, group_size, weight_type_bias)
+
+    # Normalize to fp16 so the registered fake's dtype matches every path. The
+    # caller (apply_weights) casts back to the activation dtype.
+    if out.dtype != torch.float16:
+        out = out.to(torch.float16)
+    return out
+
+
+def _w4a8_dense_apply_fake(
+    x2d: torch.Tensor,
+    w_q: torch.Tensor,
+    w_s: torch.Tensor,
+    w_zp: Optional[torch.Tensor],
+    tri_bq: Optional[torch.Tensor],
+    tri_s: Optional[torch.Tensor],
+    tri_zp: Optional[torch.Tensor],
+    N: int,
+    K: int,
+    group_size: int,
+    zero_points: bool,
+    weight_type_bias: int,
+    cached_min_m: int,
+) -> torch.Tensor:
+    # Data-independent: (M, N) fp16. M may be symbolic under torch.compile.
+    return x2d.new_empty((x2d.shape[0], N), dtype=torch.float16)
+
+
+# Register once to the vLLM op library (namespace `vllm::`), CUDA dispatch + fake.
+if not hasattr(torch.ops.vllm, "w4a8_dense_apply"):
+    try:
+        from vllm.utils.torch_utils import direct_register_custom_op
+    except ImportError:  # older vLLM layout
+        from vllm.utils import direct_register_custom_op
+    direct_register_custom_op(
+        op_name="w4a8_dense_apply",
+        op_func=_w4a8_dense_apply,
+        mutates_args=[],
+        fake_impl=_w4a8_dense_apply_fake,
+    )
 
 
 class RocmW4A8Fp8WmmaLinearKernel(MPLinearKernel):
@@ -446,111 +551,28 @@ class RocmW4A8Fp8WmmaLinearKernel(MPLinearKernel):
         x_2d = x.reshape(-1, x.shape[-1])
         if not x_2d.is_contiguous():
             x_2d = x_2d.contiguous()
-        M = x_2d.size(0)
         orig_dtype = x_2d.dtype
-
         gs = c.group_size if c.group_size != -1 else K
-        # Kernel selection by M (all bit-exact; each wins its regime):
-        #   decode (M<=DECODE_MAX): v11 streaming GEMV   -> beats Triton ~1.4-1.9x
-        #   prefill (M>=prefill_min): v10 A-shuffle WMMA -> beats fp16/Triton
-        #   mid-M band (opt-in): v6 b128 double-K WMMA   -> ROADMAP Task 4 lever
-        #   middle / unsupported shapes: Triton W4A16 fallback (safe).
-        # NB seam (actquant-fusion task): the op stages activations to fp8 ONCE in
-        # the host launcher (compute_act_fp8_and_scales_kernel) and ALL versions
-        # (v6 included) consume the same x_fp8/act_scales -- this adapter only picks
-        # the weight-side kernel + load width, never the activation staging.
-        # v10 needs group_size in {32,128} (compile-time); v11 needs K%1024==0,
-        # group_size%32==0, and M*K<=65536 (activations fit LDS).
-        v10_ok = gs in (32, 128)
-        # v11 is now K-TILED (kernel stages only (M,BK) in LDS) -> no M*K cap; correct
-        # for any K%1024==0 at M<=16 (validated bit-exact vs v5, incl. K=17408 decode).
-        # BUT v11 is a GEMV: GPU microbench (N=5120,K=17408) shows it only WINS at M=1
-        # (162us vs triton 283 / v10 440); it scales ~110+50*M us and loses to Triton
-        # by M>=4. So gate v11 to tiny M; mid-M decode stays on Triton (fallback) and
-        # large M on v10. (default 2; was wrongly 16. Real crossover is shape-dependent.)
-        v11_ok = (K % 1024 == 0) and (gs % 32 == 0) and (M <= 16)
-        decode_max = int(os.environ.get("VLLM_ROCM_W4A8_DECODE_MAX_M", "2"))
-        # v10 reliably beats fp16/Triton from ~M=256 even untuned; engage there
-        # (or earlier if the AOT crossover cache proved a lower threshold).
-        v10_min = int(os.environ.get("VLLM_ROCM_W4A8_V10_MIN_M", "256"))
-        cached = getattr(layer, "_w4a8_min_m", _NEVER)
-        prefill_min = min(cached, v10_min) if v10_ok else cached
 
-        use_v11 = v11_ok and M <= decode_max
-        use_v10 = (not use_v11) and v10_ok and M >= prefill_min
-        use_v5 = (not use_v11) and (not use_v10) and M >= cached  # gs not 32/128
+        w_q, _w_s_native, w_zp, _ = self._get_weight_params(layer)
+        w_s = layer._w4a8_fp8_w_s
+        wt_bias = c.weight_type.bias if c.weight_type.has_bias() else 0
+        cached_min_m = int(getattr(layer, "_w4a8_min_m", _NEVER))
 
-        # Single-layout (default): no (K,N//8) fallback weights exist, so the Triton
-        # else-branch below would deref None -> ALWAYS route through our kernel here,
-        # gap-free (v10 covers any M for gs in {32,128}; else v5), overriding even a
-        # FORCE=off (which has no stock-Triton weights to fall back to in this mode).
-        have_fallback = getattr(layer, "_w4a8_tri_bq", None) is not None
-        # Tuning-gate override (VLLM_ROCM_W4A8_FORCE):
-        #   off -> always stock Triton (needs the fallback weights, which were built
-        #          since FORCE!=on AND mode='tuned' at load); on / single-layout ->
-        #          always our kernel, gap-free.
-        force = _force_mode()
-        if force == "off" and have_fallback:
-            use_v11 = use_v10 = use_v5 = False
-        elif (force == "on" or not have_fallback) and not (use_v11 or use_v10 or use_v5):
-            if v10_ok:
-                use_v10 = True
-            else:
-                use_v5 = True
-
-        # v6 mid-M band (b128 double-K). OFF unless VLLM_ROCM_W4A8_V6_{MIN,MAX}_M
-        # are BOTH set (see _v6_band). When engaged for M in [lo,hi] with gs%32==0,
-        # route to v6 IN PLACE OF the kernel the ladder already chose -- v6 is
-        # bit-exact vs v5/v10 (identical operands; only LDS load width differs), so
-        # this never changes numerics. It only re-targets a WMMA M-range that was
-        # already going to our kernel (so force=='off' still stays on Triton, and an
-        # M that would fall back to Triton is NOT yanked onto v6 -- the band tunes
-        # ours-vs-ours, not ours-vs-Triton, which the crossover cache already gates).
-        use_v6 = False
-        v6_band = _v6_band()
-        if (v6_band is not None and (gs % 32 == 0)
-                and (use_v10 or use_v5)
-                and v6_band[0] <= M <= v6_band[1]):
-            use_v6 = True
-            use_v10 = use_v5 = False
-
-        if use_v11 or use_v10 or use_v6 or use_v5:
-            w_q, _w_s_native, w_zp, _ = self._get_weight_params(layer)
-            w_s = layer._w4a8_fp8_w_s
-            x16 = x_2d if x_2d.dtype == torch.float16 else x_2d.to(torch.float16)
-            if c.zero_points and w_zp is not None:
-                zp_in = w_zp
-            else:
-                zp_in = torch.empty(0, dtype=torch.int32, device=x.device)
-            ver = 11 if use_v11 else (10 if use_v10 else (6 if use_v6 else 5))
-            out = torch.ops.w4a8_fp8_wmma.mmq_fp8_gemm(x16, w_q, w_s, zp_in, ver)
-            if orig_dtype != torch.float16:
-                out = out.to(orig_dtype)
-        else:
-            # Triton W4A16 fallback (mid-M, or shapes v10/v11 can't take). At small M
-            # the stock vLLM Triton runs a gfx1151-tuned config (BLOCK_K clamped to 64)
-            # that is suboptimal on gfx1201 (64 CU) -- exactly the dense M=16-32 band
-            # where our fp8-WMMA HIP kernels are at the raw WMMA/HBM limit (~20 variants
-            # confirm). For M<=32 we route to a gfx1201-tuned Triton (BLOCK_K = full
-            # group) that is 1.2-1.4x faster than the stock config at g=128 and >= it
-            # elsewhere, so the served pathway EXCEEDS stock in that last regime too.
-            # Above M=32 the stock config is already best, so use it unchanged.
-            tri_zp = getattr(layer, "_w4a8_tri_zp", None)
-            zp_bias = c.weight_type.bias if c.weight_type.has_bias() else 0
-            # gfx1201-tuned Triton ONLY where it strictly beats stock: small M (<=32)
-            # AND group_size > 64 (the stock clamps BLOCK_K to 64, so for g=128 it runs
-            # the half-group tile -> 1.2-1.4x slower than BLOCK_K=full-group here). For
-            # g<=64 the tuned config IS the stock config, so use stock directly (no
-            # separate path). M>32: stock's tile is already best. Net: fallback >= stock.
-            if M <= 32 and gs > 64:
-                from w4a8_fp8_wmma.triton_w4a16_gfx1201 import (
-                    triton_w4a16_gemm_gfx1201 as _tri,
-                )
-            else:
-                from vllm.model_executor.kernels.linear.mixed_precision.triton_w4a16 import (  # noqa: E501
-                    triton_w4a16_gemm as _tri,
-                )
-            out = _tri(x_2d, layer._w4a8_tri_bq, layer._w4a8_tri_s, tri_zp, gs, zp_bias)
+        # The per-M kernel ladder + Triton fallback now live INSIDE the
+        # `vllm::w4a8_dense_apply` custom op (defined above this class), so the
+        # symbolic-M control flow runs eager in an opaque, fake-backed node instead
+        # of leaking `sympy` guards into the Inductor graph -- the node stays
+        # in-graph for cudagraph capture (no per-linear split). Numerics are
+        # identical to the former inline ladder.
+        out = torch.ops.vllm.w4a8_dense_apply(
+            x_2d, w_q, w_s,
+            w_zp if (c.zero_points and w_zp is not None) else None,
+            getattr(layer, "_w4a8_tri_bq", None),
+            getattr(layer, "_w4a8_tri_s", None),
+            getattr(layer, "_w4a8_tri_zp", None),
+            N, K, gs, bool(c.zero_points), int(wt_bias), cached_min_m,
+        )
 
         if out.dtype != orig_dtype:
             out = out.to(orig_dtype)

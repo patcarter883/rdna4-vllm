@@ -92,4 +92,33 @@ ENV VLLM_ROCM_USE_W4A8_FP8_WMMA=1 \
     VLLM_ROCM_W4A8_FP8_WMMA_MOE=1 \
     VLLM_ROCM_W4A8_FP8_WMMA_MOE_VERSION=6
 
+# --- 4. (optional) ZAYA1-8B + CCA support — the second model, folded in ---
+# Was a derived image (Dockerfile.zaya); now a gated step so ONE combined image serves both the
+# 35B W4A8 path and ZAYA1-8B. Three additive pieces (mirroring W4A8/het-TP): the overlay
+# model/config/parser/backend files, the fused CCA decode/prefill/mixed HIP kernel (cross-compiled
+# in-image — no GPU), and ~9 registration hooks (zaya_vllm_0.22.69.patch). The only two hunks that
+# touch shared files are no-ops for the 35B path: a generic torch.compile-safety guard in
+# fused_moe.py and a `vllm::cca` splitting_ops entry (that op never exists for non-ZAYA models).
+# Default ON so the single image serves ZAYA out of the box; build --build-arg WITH_ZAYA=0 for a
+# W4A8-only image. Toggle the fused kernel at runtime (no rebuild): ZAYA_CCA_HIP=0 -> eager CCA.
+ARG WITH_ZAYA=1
+ENV ZAYA_CCA_HIP=1
+COPY zaya/ /tmp/zaya/
+RUN set -eu; \
+    if [ "$WITH_ZAYA" = "1" ]; then \
+      . /app/.venv/bin/activate; \
+      export PATH="/opt/rocm-7.2.1/lib/llvm/bin:/opt/rocm-7.2.1/bin:${PATH}"; \
+      VV=/app/vllm/vllm; \
+      cp -r /tmp/zaya/overlay/vllm/. "$VV"/; \
+      cp -r /tmp/zaya/cca_hip "$VV"/model_executor/layers/mamba/; \
+      cd "$VV"/model_executor/layers/mamba/cca_hip; \
+        rm -rf build *.egg-info; find . -name '*.so' -delete; find . -name '*_hip.*' -delete; \
+        GPU_ARCHS=gfx1201 python setup.py build_ext --inplace; \
+        python -c "import torch, glob; torch.ops.load_library(glob.glob('zaya_cca_C*.so')[0]); print('[combined] CCA kernel build + load OK')"; \
+      cd /app/vllm; patch -p1 < /tmp/zaya/zaya_vllm_0.22.69.patch; \
+      python -c 'import ast; roots=["/app/vllm/vllm/model_executor/models/zaya.py", "/app/vllm/vllm/model_executor/layers/mamba/cca.py", "/app/vllm/vllm/model_executor/layers/mamba/mamba_utils.py", "/app/vllm/vllm/config/model.py", "/app/vllm/vllm/model_executor/layers/fused_moe/fused_moe.py"]; [ast.parse(open(f).read()) for f in roots]; print("[combined] ZAYA overlay + patched files parse OK")'; \
+      echo "[combined] ZAYA1-8B + CCA applied"; \
+    else echo "[combined] ZAYA slot present but disabled (build --build-arg WITH_ZAYA=1 to enable)"; fi; \
+    rm -rf /tmp/zaya
+
 # Entry point inherited from the base (its tuned-attention vLLM launcher: `vllm serve "$@"`).

@@ -21,7 +21,10 @@ w4a8_fp8_wmma/**/*.o
 profiling/triton-cache/
 profiling/**/cells/
 profiling/**/*.pt.trace.json.gz
-
+profiling/
 
 .triton-cache-combined/
 .triton-cache-old/
+.triton-cache-combined-sweep/
+.triton-cache*
+.vllm-cache*

@@ -93,11 +93,13 @@ class FakeBackend:
     def __init__(self, texts):
         self.texts = list(texts)
         self.calls = []  # message lists, in request order
+        self.budgets = []  # max_tokens seen per request, in order
         self._lock = asyncio.Lock()
 
     async def complete(self, messages, **kwargs):
         async with self._lock:
             self.calls.append(messages)
+            self.budgets.append(kwargs.get("max_tokens"))
             text = self.texts.pop(0) if self.texts else r"fallback \boxed{0}"
         return Candidate(
             text="thinking...\n" + text,
@@ -106,6 +108,11 @@ class FakeBackend:
             prompt_tokens=10,
             completion_tokens=20,
         )
+
+    async def complete_n(self, messages, *, n, **kwargs):
+        # The real backend prefills once and samples n; the fake delegates to
+        # complete n times so tests can inspect each rollout's prompt/budget.
+        return [await self.complete(messages, **kwargs) for _ in range(n)]
 
     async def tail(self, text, tail_tokens, model):
         if tail_tokens and len(text) > tail_tokens:
@@ -314,6 +321,106 @@ def test_verifier_excludes_broken_candidates_from_aggregation():
         assert "broken" not in call[-1]["content"]
 
 
+# --------------------------------------------------------------- adaptive
+
+
+def test_early_stop_off_by_default_runs_full_t():
+    # Unanimous answers but early_stop defaults off: still runs all T rounds.
+    n, t = 3, 3
+    texts = [rf"s{i} \boxed{{42}}" for i in range(n * t)]
+    fake = FakeBackend(texts)
+    params = RSAParams(n=n, k=2, t=t, tail_tokens=0, max_tokens=100)
+    messages = [{"role": "user", "content": "6*7? \\boxed{}"}]
+    result = asyncio.run(run_rsa(fake, params, messages, "model", rng=random.Random(0)))
+    assert len(result.rounds) == t
+    assert result.stopped_early is False
+    assert result.usage.n_requests == n * t
+
+
+def test_early_stop_on_consensus():
+    # Round 0 unanimous -> consensus -> stop after round 0 (no aggregation).
+    n, t = 4, 3
+    texts = [rf"s{i} \boxed{{42}}" for i in range(n)]
+    fake = FakeBackend(texts)
+    params = RSAParams(
+        n=n, k=2, t=t, tail_tokens=0, max_tokens=100,
+        early_stop=True, consensus_threshold=0.9,
+    )
+    messages = [{"role": "user", "content": "6*7? \\boxed{}"}]
+    result = asyncio.run(run_rsa(fake, params, messages, "model", rng=random.Random(0)))
+    assert len(result.rounds) == 1
+    assert result.stopped_early is True
+    assert result.usage.n_requests == n  # only round 0 generated
+
+
+def test_no_early_stop_below_threshold():
+    # Round 0 splits 2/2 -> ratio 0.5 < 0.9 -> runs the aggregation round.
+    n, t = 4, 2
+    round0 = [r"a \boxed{42}", r"b \boxed{42}", r"c \boxed{7}", r"d \boxed{7}"]
+    round1 = [rf"agg{i} \boxed{{42}}" for i in range(n)]
+    fake = FakeBackend(round0 + round1)
+    params = RSAParams(
+        n=n, k=2, t=t, tail_tokens=0, max_tokens=100,
+        early_stop=True, consensus_threshold=0.9,
+    )
+    messages = [{"role": "user", "content": "6*7? \\boxed{}"}]
+    result = asyncio.run(run_rsa(fake, params, messages, "model", rng=random.Random(0)))
+    assert len(result.rounds) == t
+    assert result.stopped_early is False
+
+
+def test_consensus_needs_min_votes():
+    # Only 1 extractable answer (others non-boxed): below consensus_min_votes,
+    # so no early stop on a "majority of one".
+    n, t = 3, 2
+    round0 = [r"only one \boxed{42}", "no box here", "prose only"]
+    round1 = [rf"agg{i} \boxed{{42}}" for i in range(n)]
+    fake = FakeBackend(round0 + round1)
+    params = RSAParams(n=n, k=2, t=t, tail_tokens=0, max_tokens=100, early_stop=True)
+    messages = [{"role": "user", "content": "6*7? \\boxed{}"}]
+    result = asyncio.run(run_rsa(fake, params, messages, "model", rng=random.Random(0)))
+    assert len(result.rounds) == t
+
+
+def test_agg_budget_applies_to_aggregation_only():
+    # Round 0 uses the full budget; aggregation rounds use agg_max_tokens.
+    n, t = 3, 2
+    texts = [rf"s{i} \boxed{{1}}" for i in range(n * t)]
+    fake = FakeBackend(texts)
+    params = RSAParams(
+        n=n, k=2, t=t, tail_tokens=0, max_tokens=500, agg_max_tokens=50,
+    )
+    messages = [{"role": "user", "content": "1*1? \\boxed{}"}]
+    asyncio.run(run_rsa(fake, params, messages, "model", rng=random.Random(0)))
+    assert fake.budgets[:n] == [500] * n
+    assert fake.budgets[n : n * t] == [50] * n
+
+
+def test_staged_expansion_tops_up_without_consensus():
+    # n_min=2 round-0 rollouts disagree -> top up to the full n=4.
+    n, n_min, t = 4, 2, 1
+    round0 = [r"a \boxed{1}", r"b \boxed{2}", r"c \boxed{3}", r"d \boxed{4}"]
+    fake = FakeBackend(round0)
+    params = RSAParams(n=n, k=2, t=t, tail_tokens=0, max_tokens=100, n_min=n_min)
+    messages = [{"role": "user", "content": "q? \\boxed{}"}]
+    result = asyncio.run(run_rsa(fake, params, messages, "model", rng=random.Random(0)))
+    assert len(result.population) == n
+    assert len(result.rounds[0]) == n
+    assert result.usage.n_requests == n  # n_min + top-up
+
+
+def test_staged_expansion_stops_at_n_min_on_consensus():
+    # n_min rollouts already agree -> no top-up (independent of early_stop).
+    n, n_min, t = 4, 2, 1
+    round0 = [r"a \boxed{42}", r"b \boxed{42}"]
+    fake = FakeBackend(round0)
+    params = RSAParams(n=n, k=2, t=t, tail_tokens=0, max_tokens=100, n_min=n_min)
+    messages = [{"role": "user", "content": "q? \\boxed{}"}]
+    result = asyncio.run(run_rsa(fake, params, messages, "model", rng=random.Random(0)))
+    assert len(result.population) == n_min
+    assert result.usage.n_requests == n_min
+
+
 # ---------------------------------------------------------------- server
 
 
@@ -425,4 +532,22 @@ def test_server_streaming_pseudo_stream():
     assert text == r"a \boxed{5}"
     assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
     assert chunks[-1]["usage"]["total_tokens"] == 60
+    client.__exit__(None, None, None)
+
+
+def test_server_reports_adaptive_metadata():
+    client = _make_client()  # defaults: n=2, k=2, t=1
+    r = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "model",
+            "messages": [{"role": "user", "content": "2+3? \\boxed{}"}],
+        },
+    )
+    body = r.json()
+    assert body["rsa"]["rounds"] == 1
+    assert body["rsa"]["rounds_configured"] == 1
+    assert body["rsa"]["population"] == 2
+    assert body["rsa"]["population_configured"] == 2
+    assert body["rsa"]["stopped_early"] is False
     client.__exit__(None, None, None)

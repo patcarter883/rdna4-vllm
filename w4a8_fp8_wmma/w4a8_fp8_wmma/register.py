@@ -86,4 +86,35 @@ def register(verbose: bool = True) -> bool:
         if verbose:
             print(f"[w4a8_fp8_wmma] GPTQ MoE hook not installed: {e}")
 
+    # --- cold-boot accelerators (parallel kernel compilation) ----------------
+    # These only fire on a COLD Triton cache (dev containers, kernel/.so rebuilds);
+    # warm production boots skip autotune entirely, so they are no-ops there. Both
+    # are best-effort + fall back to the unchanged serial path on any failure, and
+    # never change the tuning RESULT (they only parallelize the compile step).
+    #
+    # (1) Generic Triton @triton.autotune parallel-compile — DEFAULT ON. Thread
+    #     pool (shares the CUDA context, no spawn/HIP-init cost). Accelerates the
+    #     GDN/SSD ssd_* autotune (~58 configs = the bulk of the 15-30min FLA-GDN
+    #     cold boot) and any other triton.autotune kernel. Validated 3.15x,
+    #     best-config unchanged. Disable: VLLM_TRITON_PARALLEL_COMPILE=0.
+    try:
+        from w4a8_fp8_wmma.triton_autotune_parallel import install as _tap_install
+        _tap_install()
+    except Exception as e:  # pragma: no cover - defensive
+        if verbose:
+            print(f"[w4a8_fp8_wmma] triton parallel-compile not installed: {e}")
+
+    # (2) vLLM attention startup autotuner parallel pre-warm — DEFAULT ON
+    #     (VLLM_ATTN_AUTOTUNE_PARALLEL=0 to disable). Process pool (spawns short-lived
+    #     GPU workers during startup); ~2.77x on the ~42s cold attention autotune.
+    #     On a warm cache the workers cache-hit, adding only small spawn overhead.
+    #     Covers vLLM's CUSTOM attention autotuner, which (1) can't touch (it's not a
+    #     triton.autotune kernel).
+    try:
+        from w4a8_fp8_wmma.attn_autotune_parallel import install as _aap_install
+        _aap_install()
+    except Exception as e:  # pragma: no cover - defensive
+        if verbose:
+            print(f"[w4a8_fp8_wmma] attn parallel autotune not installed: {e}")
+
     return True
