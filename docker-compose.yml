@@ -48,6 +48,11 @@ x-combined-common: &combined-common
     # pays the FLA-GDN autotune compile (~15-30 min) PLUS the base's attention startup autotune.
     # This makes it one-time. Survives --rm.
     - ${VLLM_HOST_TRITON_CACHE:-./.triton-cache-combined}:/root/.triton
+    # Persistent vLLM torch.compile / AOT-inductor cache. Separate from the Triton cache and NOT
+    # host-persisted by default → torch.compile re-ran (~44s) every boot. Mounting it makes that
+    # one-time too (keyed by compilation config, so it re-misses if you change cudagraph sizes /
+    # kv-cache-dtype / the W4A8 toggle — expected).
+    - ${VLLM_HOST_COMPILE_CACHE:-./.vllm-cache-combined}:/root/.cache/vllm
     # Repo test/ harness (read-only) so the benchmark in README "Verifying / benchmarking" resolves:
     #   docker compose --profile serve run --rm --entrypoint python3 serve /workspace/test/bench_tp2.py
     - ./test:/workspace/test:ro
@@ -64,6 +69,12 @@ x-combined-common: &combined-common
     # MOE_VERSION=6 are already baked into the image. Bisect knobs (MOE=0, FORCE, LAYOUT,
     # V6_MIN_M/_MAX_M) are documented in the README, not set here.
     VLLM_ROCM_USE_W4A8_FP8_WMMA: "${USE_W4A8:-1}"
+    # Cold-boot compile accelerators. Thread-pool Triton @autotune parallel-compile is OFF for now:
+    # on TP=2 the two ranks' pools (up to 8x2) thrash the shared /root/.triton on RDNA4 → the GDN
+    # autotune livelocked (zero progress for 20+ min). Re-enable with VLLM_TRITON_PARALLEL_COMPILE=1
+    # once the shared-cache contention is fixed (flock+atomic, or build-time bake). The attention
+    # autotuner pre-warm (process pool, VLLM_ATTN_AUTOTUNE_PARALLEL) stays default-ON — it's fine.
+    VLLM_TRITON_PARALLEL_COMPILE: "${VLLM_TRITON_PARALLEL_COMPILE:-0}"
 
 services:
   # --- TP=2 combined: tuned attention + W4A8, both Qwen3.6 cards (64+56 CU heterogeneous) ---
@@ -86,18 +97,22 @@ services:
       - --port=8000
       - --tensor-parallel-size=2
       - --limit-mm-per-prompt={"image":0,"video":0}
-      - --kv-cache-dtype=fp8_per_token_head
+      - --kv-cache-dtype=fp8
       # Keep --max-num-batched-tokens low: the init memory-profiling forward (stock activation
       # memory) is what OOMs at large batch on 16 GB cards, not the W4A8 MoE apply (bounded by
       # MOE_APPLY_CHUNK). max-model-len only sizes KV cache.
       - --max-model-len=${VLLM_MAX_MODEL_LEN:-4096}
       - --max-num-batched-tokens=${VLLM_MAX_BATCHED:-4096}
-      - --gpu-memory-utilization=${VLLM_GPU_MEMORY_UTIL:-0.92}
+      # GDN/Mamba hybrid: each decode seq needs one Mamba state-cache block, and only ~36 fit at
+      # this memory budget on 16 GB TP=2. Cap concurrency at/below that (vLLM trims cudagraph
+      # capture sizes to <= max_num_seqs automatically). Raise with more VRAM / higher util.
+      - --max-num-seqs=${VLLM_MAX_NUM_SEQS:-32}
+      - --gpu-memory-utilization=${VLLM_GPU_MEMORY_UTIL:-0.96}
       # Conservative cudagraph capture set for RDNA4/ROCm. The vLLM default (51 sizes up to 512)
       # under FULL_AND_PIECEWISE stalls/hangs capture on ROCm and wastes VRAM (vLLM #19579/#39010;
       # AMD/verl tuning guidance) — and these 16 GB cards serve low-batch anyway. Capture only the
       # batch sizes we actually hit. Override with VLLM_CUDAGRAPH_SIZES.
-      - --compilation-config=${VLLM_CUDAGRAPH_SIZES:-{"cudagraph_capture_sizes":[1,2,4,8,16,32,64,128]}}
+      - --compilation-config=${VLLM_CUDAGRAPH_SIZES:-{"cudagraph_capture_sizes":[1,2,4,8,16,32,64]}}
 
   # --- TP=2 throughput benchmark: reproduces the published 298 dec / 1887 total tok/s ---
   # One-command repro of the headline figure. Same image/devices/het-TP env as `serve`, but
@@ -125,12 +140,13 @@ services:
       # Shipped path = graphs ON (enforce_eager is profiling-only, CONTRIBUTING). When graphs are on
       # the offline bench uses the same conservative RDNA4/ROCm capture set as the serving profiles.
       ENFORCE_EAGER: "${ENFORCE_EAGER:-0}"
-      CUDAGRAPH_SIZES: "${CUDAGRAPH_SIZES:-[1,2,4,8,16,32,64,128]}"
+      CUDAGRAPH_SIZES: "${CUDAGRAPH_SIZES:-[1,2,4,8,16,32,64]}"
       BENCH_GIT_SHA: "${BENCH_GIT_SHA:-unknown}"       # stamped by scripts/bench.sh for traceability
       BENCH_RESULTS_JSONL: "/workspace/bench-results/results.jsonl"
     volumes:                                           # <<: doesn't merge lists — re-list the anchor's mounts
       - ${HF_HOME:-./.hf-cache}:/root/.cache/huggingface
       - ${VLLM_HOST_TRITON_CACHE:-./.triton-cache-combined}:/root/.triton
+      - ${VLLM_HOST_COMPILE_CACHE:-./.vllm-cache-combined}:/root/.cache/vllm
       - ./test:/workspace/test:ro                      # the benchmark script
       - ./profiling/bench-results:/workspace/bench-results   # persisted JSONL results (host-visible)
     entrypoint: ["bash", "-lc"]                         # override base `vllm serve "$@"`; venv PATH for Triton JIT
@@ -154,7 +170,7 @@ services:
       - --max-model-len=4096
       - --gpu-memory-utilization=0.90
       # Conservative RDNA4/ROCm cudagraph capture set (see serve; avoids ROCm capture stall + VRAM).
-      - --compilation-config=${VLLM_CUDAGRAPH_SIZES:-{"cudagraph_capture_sizes":[1,2,4,8,16,32,64,128]}}
+      - --compilation-config=${VLLM_CUDAGRAPH_SIZES:-{"cudagraph_capture_sizes":[1,2,4,8,16,32,64]}}
 
   # --- ZAYA1-8B + CCA: hybrid CCA + FP8-MoE second model on the SAME combined image ---
   # The image bakes ZAYA support (Dockerfile.combined WITH_ZAYA=1). CCA has no TP>1, so this is
@@ -201,7 +217,7 @@ services:
       - --tool-call-parser=zaya_xml
       - --gpu-memory-utilization=${ZAYA_GPU_MEMORY_UTIL:-0.90}
       # Conservative RDNA4/ROCm cudagraph capture set (see serve; avoids ROCm capture stall + VRAM).
-      - --compilation-config=${VLLM_CUDAGRAPH_SIZES:-{"cudagraph_capture_sizes":[1,2,4,8,16,32,64,128]}}
+      - --compilation-config=${VLLM_CUDAGRAPH_SIZES:-{"cudagraph_capture_sizes":[1,2,4,8,16,32,64]}}
     healthcheck:                         # so the rsa proxy can wait for a serving backend
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=3).status==200 else 1)"]
       interval: 15s
