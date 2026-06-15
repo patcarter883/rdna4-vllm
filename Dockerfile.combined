@@ -24,7 +24,16 @@
 # Mount a persistent Triton cache — both Qwen3.6 variants are GDN hybrids and pay the FLA-GDN
 # cold compile + the base's attention startup autotune; cache makes it one-time.
 
-ARG BASE_IMAGE=tcclaviger/vllm22:dev
+# Base image is PINNED BY DIGEST, not by the moving `:dev` tag. The collaborator's
+# `tcclaviger/vllm22:dev` is a mutable tag that can shift under us — and RFP458, the tuned
+# attention, and the whole `/app/vllm` tree our patches target all live in this base, so a
+# silent tag move would bitrot every patch and can break the W4A8 ABI (torch bump) with no
+# detection. The digest below was the `:dev` snapshot as of 2026-06-14.
+#   Bump procedure: `docker pull tcclaviger/vllm22:dev` then
+#   `docker inspect tcclaviger/vllm22:dev --format '{{index .RepoDigests 0}}'`, paste the new
+#   `name@sha256:...` here, and re-run the in-image import check (CONTRIBUTING.md) before relying on it.
+# Override with `--build-arg BASE_IMAGE=...` (or COMBINED_BASE_IMAGE in .env) to test a newer base.
+ARG BASE_IMAGE=tcclaviger/vllm22@sha256:e2e5ffcdee14670e183843bfd16d673c6ac7202b91bb3e2b982b324431c170f3
 FROM ${BASE_IMAGE}
 
 ARG GPU_ARCHS=gfx1201

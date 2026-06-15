@@ -1,16 +1,15 @@
-# Build (and optionally push) the gfx1201 vLLM image.
+# Build (and optionally push) the gfx1201 vLLM combined image.
 #
-# IMPORTANT — runner choice. The base image rocm/vllm-dev:nightly-therock714 is
-# ~47 GB. A stock GitHub-hosted ubuntu runner has ~14 GB free and ~25 GB more
-# after aggressive cleanup (~39 GB total) — that is NOT reliably enough to pull
-# the base AND assemble the image. The intended runner is a SELF-HOSTED one on a
-# gfx1201 host (it has the disk, usually already caches the base layer, and can
-# run the real GPU smoke test). Give that runner a single label (e.g. `gfx1201`)
-# and pass it as the `runner` input. The default ubuntu-latest path is best-effort
-# and may run out of disk on the W4A8 build.
+# IMPORTANT — runner choice. The base image tcclaviger/vllm22:dev is ~28 GB (pinned by
+# digest in Dockerfile.combined). A stock GitHub-hosted ubuntu runner has ~14 GB free and
+# ~25 GB more after aggressive cleanup (~39 GB total) — marginal for pulling the base AND
+# assembling the image. The intended runner is a SELF-HOSTED one on a gfx1201 host (it has
+# the disk, usually already caches the base layer, and can run the real GPU smoke test).
+# Give that runner a single label (e.g. `gfx1201`) and pass it as the `runner` input. The
+# default ubuntu-latest path is best-effort and may run out of disk on the W4A8 build.
 #
-# The build does NOT need a GPU — hipcc cross-compiles the W4A8 kernel to gfx1201
-# ISA without a device present. Only the optional gpu-smoke job needs hardware.
+# The build does NOT need a GPU — hipcc cross-compiles the W4A8 kernel to gfx1201 ISA
+# without a device present. Only the optional gpu-smoke job needs hardware.
 
 name: build-image
 
@@ -21,11 +20,11 @@ on:
         description: "Runner label (single label; use a self-hosted gfx1201 label for a reliable build)"
         type: string
         default: "ubuntu-latest"
-      with_w4a8:
-        description: "Build the W4A8-FP8-WMMA MoE kernel into the image"
+      with_het_tp:
+        description: "Apply heterogeneous-TP 64:56 sharding (needs a real patches/het_tp_vllm.patch)"
         type: choice
-        options: ["1", "0"]
-        default: "1"
+        options: ["0", "1"]
+        default: "0"
       push:
         description: "Push the image to GHCR"
         type: boolean
@@ -45,6 +44,27 @@ env:
   IMAGE: ghcr.io/${{ github.repository }}   # ghcr.io/patcarter883/rdna4-vllm
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # Non-GPU lint/sanity. Runs on every push + PR; no hardware, no base-image pull.
+  # Catches the cheap regressions (broken compose, a patch helper that no longer
+  # self-tests, an unparseable patched file) before anyone burns a GPU window.
+  # ---------------------------------------------------------------------------
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: docker compose config is valid
+        run: docker compose config -q
+      - name: het_tp helper CPU self-tests
+        run: pip install -q torch --index-url https://download.pytorch.org/whl/cpu && python patches/het_tp.py
+      - name: patched Python files parse
+        run: python -c "import ast,glob,sys; [ast.parse(open(f).read(), f) for f in glob.glob('patches/*.py')]; print('ast ok')"
+      - name: shell scripts parse
+        run: bash -n scripts/*.sh
+
   build:
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     steps:
@@ -85,12 +105,12 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile
+          file: ./Dockerfile.combined
           push: ${{ github.event_name == 'push' || inputs.push }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            WITH_W4A8=${{ github.event_name == 'workflow_dispatch' && inputs.with_w4a8 || '1' }}
+            WITH_HET_TP=${{ github.event_name == 'workflow_dispatch' && inputs.with_het_tp || '0' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -117,7 +137,7 @@ jobs:
             --device=/dev/kfd --device=/dev/dri --group-add video \
             --security-opt seccomp=unconfined --ipc=host --shm-size=16g \
             -e ROCR_VISIBLE_DEVICES=0 -e HF_HUB_OFFLINE=1 \
-            -e PATH=/opt/rocm/lib/llvm/bin:/usr/local/bin:/usr/bin:/bin \
+            -e PATH=/opt/rocm-7.2.1/lib/llvm/bin:/app/.venv/bin:/usr/local/bin:/usr/bin:/bin \
             -v "${HF_HOME:-$HOME/.cache/huggingface}:/root/.cache/huggingface" \
             -v "${RUNNER_TEMP}/triton-cache:/root/.triton" \
             -p 8000:8000 "$IMG" \

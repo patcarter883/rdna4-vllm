@@ -1,0 +1,32 @@
+--- a/vllm/model_executor/layers/quantization/moe_wna16.py	2026-06-14 16:21:28.977550348 +1000
++++ b/vllm/model_executor/layers/quantization/moe_wna16.py	2026-06-14 16:21:29.102552932 +1000
+@@ -446,6 +446,11 @@
+ 
+             device = get_tp_group().device
+             tp_rank = get_tensor_model_parallel_rank()
++            # RoutedExperts (the current MoE container) exposes TP only via
++            # moe_config.tp_size; the legacy FusedMoE.tp_size attribute is gone.
++            tp_size = getattr(layer, "tp_size", None)
++            if tp_size is None:
++                tp_size = layer.moe_config.tp_size
+             loaded_weight = loaded_weight.to(device)
+             shard_size = layer.intermediate_size_per_partition
+ 
+@@ -484,7 +489,7 @@
+                 )
+ 
+             if "w13_qzeros" in weight_name:
+-                tensor = loaded_weight.view(layer.tp_size, -1, loaded_weight.size(1))[
++                tensor = loaded_weight.view(tp_size, -1, loaded_weight.size(1))[
+                     tp_rank
+                 ]
+                 if shard_id == "w1":
+@@ -494,7 +499,7 @@
+                 return True if return_success else None
+             elif "w2_qzeros" in weight_name:
+                 param.data[expert_id] = loaded_weight.view(
+-                    loaded_weight.size(0), layer.tp_size, -1
++                    loaded_weight.size(0), tp_size, -1
+                 )[:, tp_rank]
+                 return True if return_success else None
+             else:

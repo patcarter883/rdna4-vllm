@@ -16,7 +16,9 @@ x-combined-common: &combined-common
     # The W4A8 kernel is in-repo at w4a8_fp8_wmma/ (single source of truth); Dockerfile.combined
     # COPYs it from the build context and rebuilds it in-image for gfx1201.
     args:
-      BASE_IMAGE: ${COMBINED_BASE_IMAGE:-tcclaviger/vllm22:dev}
+      # Pinned by digest (not the moving `:dev` tag) — see Dockerfile.combined's header for the
+      # rationale + bump procedure. Override with COMBINED_BASE_IMAGE in .env to test a newer base.
+      BASE_IMAGE: ${COMBINED_BASE_IMAGE:-tcclaviger/vllm22@sha256:e2e5ffcdee14670e183843bfd16d673c6ac7202b91bb3e2b982b324431c170f3}
       GPU_ARCHS: gfx1201
       # Heterogeneous-TP proportional sharding (64:56). ON by default -- GPU-validated:
       # byte-identical to the even split, all-reduce imbalance ~75% smaller (see DIARY Act XI
@@ -45,6 +47,9 @@ x-combined-common: &combined-common
     # pays the FLA-GDN autotune compile (~15-30 min) PLUS the base's attention startup autotune.
     # This makes it one-time. Survives --rm.
     - ${VLLM_HOST_TRITON_CACHE:-./.triton-cache-combined}:/root/.triton
+    # Repo test/ harness (read-only) so the benchmark in README "Verifying / benchmarking" resolves:
+    #   docker compose --profile serve run --rm --entrypoint python3 serve /workspace/test/bench_tp2.py
+    - ./test:/workspace/test:ro
   environment: &combined-env
     HF_HUB_OFFLINE: "1"
     GPU_ARCHS: gfx1201
