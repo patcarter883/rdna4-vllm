@@ -202,14 +202,14 @@ services:
       - ${ZAYA_MODELS_DIR:-~/models}:/models:ro
       - ${VLLM_HOST_TRITON_CACHE:-./.triton-cache-combined}:/root/.triton   # same toolchain → shared cache
     ports:
-      - "${ZAYA_HOST_PORT:-8001}:8000"
+      - "${ZAYA_HOST_PORT:-8000}:8000"
     environment:
       <<: *combined-env
       # Single-GPU (TP=1): ROCR picks the physical card + re-indexes it to 0, so HIP must be 0.
-      ROCR_VISIBLE_DEVICES: "${ZAYA_GPU:-0}"
-      HIP_VISIBLE_DEVICES: "0"
+      ROCR_VISIBLE_DEVICES: "0,1"
+      HIP_VISIBLE_DEVICES: "0,1"
       # ZAYA experts are FP8; the W4A8 AWQ/GPTQ kernel doesn't engage this path — leave it off.
-      VLLM_ROCM_USE_W4A8_FP8_WMMA: "${ZAYA_USE_W4A8:-0}"
+      VLLM_ROCM_USE_W4A8_FP8_WMMA: "${ZAYA_USE_W4A8:-1}"
       # Fused CCA kernels (decode + prefill/mixed). Default ON: GPU-validated coherent, bit-exact,
       # +38-49% decode tok/s vs eager with cudagraphs on (docs/zaya/cca-kernel-perf.md). 0 -> eager.
       ZAYA_CCA_HIP: "${ZAYA_CCA_HIP:-1}"
@@ -218,6 +218,8 @@ services:
     command:                              # entrypoint prepends `vllm serve`
       - ${ZAYA_MODEL_ID:-/models/ZAYA1-8B-fp8}
       - --served-model-name=model
+      - -ep
+      - -dp=2
       - --host=0.0.0.0
       - --port=8000
       - --trust-remote-code
@@ -230,7 +232,7 @@ services:
       - --reasoning-parser=qwen3
       - --enable-auto-tool-choice
       - --tool-call-parser=zaya_xml
-      - --gpu-memory-utilization=${ZAYA_GPU_MEMORY_UTIL:-0.90}
+      - --gpu-memory-utilization=${ZAYA_GPU_MEMORY_UTIL:-0.96}
       # Conservative RDNA4/ROCm cudagraph capture set (see serve; avoids ROCm capture stall + VRAM).
       - --compilation-config=${VLLM_CUDAGRAPH_SIZES:-{"cudagraph_capture_sizes":[1,2,4,8,16,32,64]}}
     healthcheck:                         # so the rsa proxy can wait for a serving backend
@@ -247,7 +249,7 @@ services:
       context: .
       dockerfile: Dockerfile.rsa
     image: vllm22-zaya-rsa:combined
-    profiles: ["rsa"]
+    profiles: ["zaya"]
     container_name: vllm22-zaya-rsa
     restart: "no"
     depends_on:
