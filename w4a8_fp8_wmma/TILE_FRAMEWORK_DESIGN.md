@@ -184,6 +184,34 @@ the grouped-MoE contract. Exact construction to reuse (do NOT re-derive — reci
   across the M-tile) yields a *tiled* SWMMAC — the handoff's "untuned `swmmac_gemm_k`" concern, fixed
   within this worktree's scope (do not edit their kernel).
 
+#### SWMMAC sibling — VALIDATED (2026-06-18): self-consistency PASS, bit-exact at production block_m
+**`bench_swmmac_grouped.hip` PASS** (1-card lease): grouped-SWMMAC vs scalar grouped reference on the
+same 2:4-zeroed weights —
+- gemm1 N=1024 K=2048 bm=64: **mean_rel 0, max_rel 0 (bit-exact)**, 0/524288 bad
+- gemm2 N=2048 K=512 bm=64: **mean_rel 0, max_rel 0 (bit-exact)**, 0/1048576 bad
+- gemm1 bm=32: mean_rel 1.78e-4 (fp16 output rounding only), 0/262144 bad → PASS
+
+So the operand/index/routing construction is **numerically correct** at the production block_m=64.
+(First pass used O(1) synthetic scales → the K-long fp8 sum overflowed the fp16 output to `inf` for
+one rng draw; realistic small scales — as real per-token/per-channel W4A8 scales bound the result —
+fixed it. Not a kernel bug.) The fp8/per-channel grouped SWMMAC GEMM is done and validated.
+
+#### (history) written, compile-verified, construction-reviewed, validation queued
+- `moe_gemm_swmmac.h` — `moe_gemm_swmmac_kernel<SCATTER,NWARP>`: the fp8/per-channel first rung,
+  mirroring `swmmac_op.hip`'s validated dataflow wrapped in the grouped-MoE spine (per-expert
+  Wc/idx slabs, routed activation gather, act-scale + fp16/scatter epilogue). **Compile-verified
+  for gfx1201** — emits `v_swmmac_f32_16x16x32_fp8_fp8` (no LDS-expand path).
+- `bench_swmmac_grouped.hip` — self-consistency test: synth per-expert 2:4 weights → repack to
+  (Wc, idx) per §3 → grouped-SWMMAC vs a scalar grouped reference on the same zeroed weights (both
+  HW e4m3 + fp32). **Built.** GPU run **queued behind `moetune`** (shared-box contention held both
+  cards); will report PASS/FAIL when a card frees.
+- **Construction self-review PASSED** (line-by-line vs the recipe + `swmmac_op`): Wc byte layout,
+  idx nibble placement, dense-B offsets, and the SWMMAC `v0·B[p0]+v1·B[p1]` ↔ reference
+  `Wz[p0]·X[p0]+Wz[p1]·X[p1]` correspondence all check out. High confidence pending the GPU number.
+- NOT yet committed — the GPU self-consistency PASS is the gate before committing the sibling.
+- Next after PASS: the **int4-sparse + per-group-scale** variant (the production 35B path), and a
+  grouped-SWMMAC-vs-WMMA-dense microbench speedup number.
+
 ### 2.4 Acceptance test for the refactor (perf-neutrality, GPU)
 The consolidation must be **bit-exact and perf-neutral** vs today's hand-tuned launches:
 - For each live shape (gemm1 K=2048→2*inter, gemm2 K=inter→hidden, g32), instantiate the
