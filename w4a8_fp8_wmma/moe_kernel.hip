@@ -43,6 +43,7 @@
 #include <hip/hip_fp16.h>
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
+#include "moe_gemm_tiled.h"   // consolidated TileConfig path (VLLM_W4A8_MOE_TILED A/B)
 
 namespace w4a8_fp8_moe {
 
@@ -1089,6 +1090,26 @@ static void run_moe_gemm(
         dim3 grid((N + bn - 1) / bn, P / block_m);
         const size_t smem5 = (size_t)(block_m + bn) * (group_size + LDS_PAD);
         const size_t smem6 = (size_t)bn * (group_size + LDS_PAD) * gt6;  // B only, gtile groups
+        // Consolidated TileConfig path (moe_gemm_tiled.h, WmmaFp8 policy): bit-exact +
+        // perf-neutral vs v5/v6 (TILE_FRAMEWORK_DESIGN.md §2.4, microbench-validated). Opt-in
+        // A/B toggle; default path below is unchanged. Step 2 adds the SwmmacFp8 backend here.
+        if (std::getenv("VLLM_W4A8_MOE_TILED")) {
+            using w4a8_tile::WmmaFp8;
+            if (version == 6) {
+                #define TV6(BN_T) w4a8_tile::moe_gemm_tiled_v6_kernel<WmmaFp8, SCATTER, BN_T><<<grid, block, smem6, stream>>>( \
+                    xf, asc, wq, wsc, wz, sti, eid, ntp, out, T, N, K, group_size, \
+                    top_k, block_m, num_valid_tokens, output_scatter, topk_weights, out_top_k, gt6)
+                if (bn == 128) TV6(128); else TV6(MV5_BN);
+                #undef TV6
+            } else {
+                #define TV5(BN_T) w4a8_tile::moe_gemm_tiled_kernel<WmmaFp8, SCATTER, BN_T><<<grid, block, smem5, stream>>>( \
+                    xf, asc, wq, wsc, wz, sti, eid, ntp, out, T, N, K, group_size, \
+                    top_k, block_m, num_valid_tokens, output_scatter, topk_weights, out_top_k)
+                if (bn == 128) TV5(128); else TV5(MV5_BN);
+                #undef TV5
+            }
+            return;
+        }
         if (version == 6) {
             #define V6_LAUNCH(BN_T, SM) moe_gemm_v6_kernel<SCATTER, BN_T><<<grid, block, SM, stream>>>( \
                 xf, asc, wq, wsc, wz, sti, eid, ntp, out, T, N, K, group_size, \

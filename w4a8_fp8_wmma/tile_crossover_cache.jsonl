@@ -1,0 +1,8 @@
+{"tag":"gemm1","N":1024,"K":2048,"group":32,"block_m":64,"P":64,"best":{"version":6,"BN":64,"gtile":8},"ms":0.05923}
+{"tag":"gemm2","N":2048,"K":512,"group":32,"block_m":64,"P":64,"best":{"version":6,"BN":64,"gtile":8},"ms":0.01917}
+{"tag":"gemm1","N":1024,"K":2048,"group":32,"block_m":64,"P":256,"best":{"version":6,"BN":64,"gtile":8},"ms":0.06336}
+{"tag":"gemm2","N":2048,"K":512,"group":32,"block_m":64,"P":256,"best":{"version":6,"BN":64,"gtile":8},"ms":0.02326}
+{"tag":"gemm1","N":1024,"K":2048,"group":32,"block_m":64,"P":512,"best":{"version":6,"BN":64,"gtile":8},"ms":0.07771}
+{"tag":"gemm2","N":2048,"K":512,"group":32,"block_m":64,"P":512,"best":{"version":6,"BN":64,"gtile":4},"ms":0.03111}
+{"tag":"gemm1","N":1024,"K":2048,"group":32,"block_m":64,"P":2048,"best":{"version":6,"BN":64,"gtile":4},"ms":0.19160}
+{"tag":"gemm2","N":2048,"K":512,"group":32,"block_m":64,"P":2048,"best":{"version":6,"BN":64,"gtile":4},"ms":0.09407}

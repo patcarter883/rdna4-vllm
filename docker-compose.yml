@@ -168,6 +168,67 @@ services:
     command:
       - "source /app/.venv/bin/activate && exec python /workspace/test/bench_tp2.py"
 
+  # --- TP=2 offline bench for the consolidated kernels: same as `bench` but on the :tiled image
+  #     with W4A8 engaged; toggle VLLM_W4A8_MOE_TILED 0 (originals) vs 1 (consolidated) for the A/B.
+  #       scripts/gpu-lease.sh -n 2 --name benchtiled -- \
+  #         docker compose --profile benchtiled run --rm -e VLLM_W4A8_MOE_TILED=1 benchtiled
+  benchtiled:
+    <<: *combined-common
+    profiles: ["benchtiled"]
+    image: vllm22-w4a8:tiled
+    container_name: vllm22-w4a8-benchtiled
+    environment:
+      <<: *combined-env
+      ROCR_VISIBLE_DEVICES: "${LEASE_ROCR_DEVICES:-0,1}"
+      HIP_VISIBLE_DEVICES: "${LEASE_HIP_DEVICES:-0,1}"
+      CU_NUM: "56"
+      VLLM_TP_CU_WEIGHTS: "64,56"
+      VLLM_ROCM_USE_W4A8_FP8_WMMA: "1"                  # engage the W4A8 MoE kernel (the path under test)
+      VLLM_W4A8_MOE_TILED: "${VLLM_W4A8_MOE_TILED:-0}"  # 0 = original v5/v6 ; 1 = consolidated tiled
+      MODEL: "${MODEL:-cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit}"
+      N_PROMPTS: "${N_PROMPTS:-32}"
+      OUT_TOKENS: "${OUT_TOKENS:-128}"
+      GPU_MEM_UTIL: "${GPU_MEM_UTIL:-0.90}"
+      MAX_MODEL_LEN: "${MAX_MODEL_LEN:-4096}"
+      MAX_NUM_BATCHED: "${MAX_NUM_BATCHED:-4096}"
+      MAX_NUM_SEQS: "${MAX_NUM_SEQS:-32}"
+      ENFORCE_EAGER: "${ENFORCE_EAGER:-0}"
+      CUDAGRAPH_SIZES: "${CUDAGRAPH_SIZES:-[1,2,4,8,16,32,64]}"
+      BENCH_RESULTS_JSONL: "/workspace/bench-results/results.jsonl"
+    volumes:                                            # <<: doesn't merge lists — re-list
+      - ${HF_HOME:-./.hf-cache}:/root/.cache/huggingface
+      - ${VLLM_HOST_TRITON_CACHE:-./.triton-cache-combined}:/root/.triton
+      - ${VLLM_HOST_COMPILE_CACHE:-./.vllm-cache-combined}:/root/.cache/vllm
+      - ./test:/workspace/test:ro
+      - ./profiling/bench-results:/workspace/bench-results
+    entrypoint: ["bash", "-lc"]
+    command:
+      - "source /app/.venv/bin/activate && exec python /workspace/test/bench_tp2.py"
+
+  # --- 1-GPU MoE correctness test for the consolidated TileConfig kernels (feat/w4a8-tile-autotune).
+  #     Runs test_moe_correctness.py (v5/v6 vs fp8 reference) in the :tiled image with the
+  #     VLLM_W4A8_MOE_TILED dispatch on, confirming the consolidated path is correct through the
+  #     real torch op. Launch under a 1-card lease:
+  #       scripts/gpu-lease.sh -n 1 --name moetest -- docker compose --profile moetest run --rm moetest
+  moetest:
+    <<: *combined-common
+    profiles: ["moetest"]
+    image: vllm22-w4a8:tiled
+    container_name: vllm22-w4a8-moetest
+    environment:
+      <<: *combined-env
+      ROCR_VISIBLE_DEVICES: "${LEASE_ROCR_DEVICES:-0}"
+      HIP_VISIBLE_DEVICES: "${LEASE_HIP_DEVICES:-0}"
+      VLLM_W4A8_MOE_TILED: "${VLLM_W4A8_MOE_TILED:-1}"   # =1 -> consolidated kernels; unset -> originals
+    volumes:                                             # <<: doesn't merge lists — re-list
+      - ${VLLM_HOST_TRITON_CACHE:-./.triton-cache-combined}:/root/.triton
+      # mount ONLY the test file (not the source pkg dir) so `import w4a8_fp8_wmma` resolves to the
+      # INSTALLED venv package (with _C.so), not the source tree (no compiled _C → circular import).
+      - ./w4a8_fp8_wmma/test_moe_correctness.py:/workspace/test_moe_correctness.py:ro
+    entrypoint: ["bash", "-lc"]
+    command:
+      - "source /app/.venv/bin/activate && cd /workspace && exec python test_moe_correctness.py"
+
   # --- single GPU: small AWQ model for quick smoke / coherence checks ---
   single:
     <<: *combined-common
