@@ -58,7 +58,12 @@ scripts/gpu-lease.sh -n 1 --detach --name zaya     -- docker compose --profile z
 ```
 
 Rules:
-- **`-n` = cards you need:** TP=2 serve/bench/zaya → `-n 2`; a single-card model/probe → `-n 1`.
+- **`-n` = HOW MANY cards, NOT which card.** It is a count: `-n 1` = one card, `-n 2` = both. TP=2
+  serve/bench/zaya → `-n 2`; a single-card model/probe → `-n 1` (the default). **There is no
+  "pin a specific GPU" flag and you never need one** — the arbiter auto-assigns the lowest free
+  card and injects `ROCR/HIP_VISIBLE_DEVICES` for you. Do NOT pass `-n 2` thinking it selects
+  "card #2": that leases BOTH cards and starves every other agent. Want a single card? `-n 1`,
+  always — let the arbiter choose which one.
 - **`--detach` for any `up -d`** (the holder binds the lease to container lifetime). Foreground jobs
   (`run --rm`, a script that blocks) need no flag — the lease releases when they exit.
 - **Let it block (the default).** Waiting *is* the coordination — don't poll `rocm-smi` and don't

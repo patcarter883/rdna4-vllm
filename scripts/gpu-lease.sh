@@ -12,7 +12,10 @@
 # USAGE
 #   gpu-lease [-n N] [--wait|--nowait|--timeout S] [--detach] [--name LABEL] -- CMD...
 #
-#     -n N            number of GPUs to lease: 1 (default) or 2.
+#     -n N            HOW MANY cards to lease — a COUNT, not a device id: 1 (default) or 2.
+#                     `-n 1` leases one card; `-n 2` leases BOTH. There is no "pick card X" flag and
+#                     you never need one: the arbiter auto-assigns the lowest free card(s) and sets
+#                     ROCR/HIP_VISIBLE_DEVICES. Do NOT pass `-n 2` meaning "card #2" — that grabs both.
 #     --wait          block until N cards are free (DEFAULT).
 #     --nowait        fail immediately (exit 75) if N cards aren't free right now.
 #     --timeout S     block up to S seconds, then fail (exit 75).
