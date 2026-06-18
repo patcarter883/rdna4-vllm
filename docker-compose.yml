@@ -101,6 +101,7 @@ services:
       # builds with WITH_HET_TP=1 by default; the helper fail-safes to even if a WITH_HET_TP=0
       # image is run instead. Tune to your cards' CU ratio for a different pair.
       VLLM_TP_CU_WEIGHTS: "64,56"
+    restart: unless-stopped
     command:                             # entrypoint prepends `vllm serve`
       - ${VLLM_MODEL_ID:-cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit}
       - --host=0.0.0.0
@@ -111,12 +112,12 @@ services:
       # Keep --max-num-batched-tokens low: the init memory-profiling forward (stock activation
       # memory) is what OOMs at large batch on 16 GB cards, not the W4A8 MoE apply (bounded by
       # MOE_APPLY_CHUNK). max-model-len only sizes KV cache.
-      - --max-model-len=${VLLM_MAX_MODEL_LEN:-4096}
+      - --max-model-len=${VLLM_MAX_MODEL_LEN:-50000}
       - --max-num-batched-tokens=${VLLM_MAX_BATCHED:-4096}
       # GDN/Mamba hybrid: each decode seq needs one Mamba state-cache block, and only ~36 fit at
       # this memory budget on 16 GB TP=2. Cap concurrency at/below that (vLLM trims cudagraph
       # capture sizes to <= max_num_seqs automatically). Raise with more VRAM / higher util.
-      - --max-num-seqs=${VLLM_MAX_NUM_SEQS:-32}
+      - --max-num-seqs=${VLLM_MAX_NUM_SEQS:-8}
       # Serial scheduling: async scheduling (max_concurrent_batches=2 → step_with_batch_queue)
       # desyncs the multiproc output buffer under concurrent load on this stack and kills the
       # EngineCore (scheduler KeyError + multiproc_executor AssertionError). Force serial step().
