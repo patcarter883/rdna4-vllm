@@ -31,6 +31,46 @@ chaos:
 - Read-only analysis, profiling runs, and container builds are fine from the shared checkout; it's
   *source edits* that must live in your own worktree.
 
+## GPU sharing protocol (MANDATORY — no human booking manager)
+
+The box has **two** discrete gfx1201 compute cards: **GPU 0** (RX 9070 XT, 16 GB) and **GPU 1**
+(RX 9070, 16 GB). ROCm device **2** is the Ryzen iGPU (gfx1036) — it drives the display and is
+**never** a compute target. Multiple agents share these two cards.
+
+**Do NOT ask a human "can I have the GPU?" and do NOT just check `rocm-smi` and hope. EVERY GPU
+workload — `docker compose` serve/bench, a raw `python`/pytorch probe, anything that touches a
+card — MUST be launched through `scripts/gpu-lease.sh`.** It is an `flock`-based arbiter: the lock
+is held by the launched process and dies with it, so a crash/Ctrl-C auto-frees the cards with no
+stale "reserved" state and no janitor. This *is* the booking manager — there is no human in the
+loop.
+
+```
+# Foreground job (bench, probe, smoke test) on whichever card is free; blocks until one is:
+scripts/gpu-lease.sh -n 1 -- docker compose --profile bench run --rm bench
+scripts/gpu-lease.sh -n 1 -- bash -c 'source /app/.venv/bin/activate && python my_probe.py'
+
+# Long-lived detached server; blocks until enough cards are free, then returns immediately and
+# keeps the lease alive until the CONTAINER stops (not until this command returns):
+scripts/gpu-lease.sh -n 2 --detach --name serve35b -- docker compose --profile serve up -d --build
+scripts/gpu-lease.sh -n 1 --detach --name zaya     -- docker compose --profile zaya  up -d
+
+# See who holds what (truth = flock state, self-healing):   scripts/gpu-status.sh
+```
+
+Rules:
+- **`-n` = cards you need:** TP=2 serve/bench/zaya → `-n 2`; a single-card model/probe → `-n 1`.
+- **`--detach` for any `up -d`** (the holder binds the lease to container lifetime). Foreground jobs
+  (`run --rm`, a script that blocks) need no flag — the lease releases when they exit.
+- **Let it block (the default).** Waiting *is* the coordination — don't poll `rocm-smi` and don't
+  fall back to asking. Use `--nowait` only when you genuinely want to skip if the box is busy, and
+  `--timeout S` for a bounded wait.
+- gpu-lease injects `ROCR/HIP_VISIBLE_DEVICES`, a unique `COMPOSE_PROJECT_NAME`/`LEASE_NAME`, and a
+  per-card host port (8000 + lowest card) — so two leased compose jobs never collide on device,
+  container name, or port. The compose services read these with their current values as defaults,
+  so a non-leased `docker compose` call is unchanged. **Don't hand-set `HIP_VISIBLE_DEVICES`/ports
+  for a leased run — gpu-lease owns them.**
+- CPU-only work (builds, static analysis, editing) needs no lease.
+
 ## Container testing protocol (MANDATORY)
 
 ### 1. Always test against the *latest* image — never a stale tag
@@ -82,8 +122,8 @@ silently misbehave. Use a new cache dir (or wipe the per-image one) when:
   `--entrypoint bash IMG -lc 'source /app/.venv/bin/activate && exec python <script>'`
   so the venv PATH is set for Triton's JIT — not `--entrypoint python`.
 - Mount HF cache: `-v /home/pat/.cache/huggingface:/root/.cache/huggingface -e HF_HUB_OFFLINE=1`.
-- Shared **2× gfx1201** box: check `rocm-smi` and coordinate a GPU window before any GPU
-  workload (CPU/build work is fine anytime).
+- Shared **2× gfx1201** box: **never ask a human for a GPU window** — acquire cards through
+  `scripts/gpu-lease.sh`. See the **GPU sharing protocol** section below (MANDATORY).
 
 Reference runners that already follow all of the above: `patches/run_het_e2e_combined.sh`
 (equivalence), `profiling/run_het_profile.sh` (profiling), `profiling/run_compare.sh`.
