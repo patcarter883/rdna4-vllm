@@ -28,3 +28,5 @@ profiling/
 .triton-cache-combined-sweep/
 .triton-cache*
 .vllm-cache*
+# gpu-lease runtime lock/label files (ephemeral; see scripts/gpu-lease.sh)
+.gpu-locks/

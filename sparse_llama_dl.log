@@ -1,0 +1,3 @@
+Hint: A new version of huggingface_hub (1.19.0) is available! You are using version 1.13.0.
+To update, run: hf update
+path=/home/pat/.cache/huggingface/hub/models--RedHatAI--Sparse-Llama-3.1-8B-2of4/snapshots/c28c229cb0b8b8dab0e3419f489046fddd1eb8d2
