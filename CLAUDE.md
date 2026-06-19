@@ -132,3 +132,32 @@ silently misbehave. Use a new cache dir (or wipe the per-image one) when:
 
 Reference runners that already follow all of the above: `patches/run_het_e2e_combined.sh`
 (equivalence), `profiling/run_het_profile.sh` (profiling), `profiling/run_compare.sh`.
+
+## Trace analysis: TraceLens (MANDATORY after trace collection)
+
+After any profiling run that produces `*.pt.trace.json.gz` files, **run TraceLens before
+drawing conclusions from the raw traces.**  The existing `profiling/analyze_torch_trace.py`
+does flat kernel bucketing — TraceLens adds hierarchical Python→GPU linkage, per-kernel
+TFLOPS/TB/s roofline, and (for TP≥2) straggler analysis that the flat script cannot.
+
+```bash
+# Analyse a trace directory — host-side, no GPU required, do NOT wrap in gpu-lease.sh:
+profiling/run_tracelens.sh <trace_dir>
+
+# Override output location:
+profiling/run_tracelens.sh --out /some/other/dir <trace_dir>
+```
+
+Output goes to `profiling/tracelens/<trace_dir_basename>/`:
+- `rank<N>/gpu_timeline.csv` — computation / comm / memcpy / idle breakdown
+- `rank<N>/ops_summary_by_category.csv` — time by op class (GEMM, elementwise, attention …)
+- `rank<N>/kernel_summary.csv` — per-kernel time + parent CPU op
+- `rank<N>/unified_perf_summary.csv` — TFLOPS/s and TB/s per op (roofline)
+- `multi/straggler_summary.csv` — per-rank wait time and arrived-last% (TP≥2 only)
+
+**Prerequisites (host-side, one-time):**
+```bash
+uv tool install "git+https://github.com/AMD-AGI/TraceLens.git"
+```
+TraceLens is installed as a `uv` tool and is available on PATH after that. It does not
+belong in the container — post-processing only.
