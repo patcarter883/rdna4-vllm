@@ -67,17 +67,23 @@ static void run(const char* tag, int N, int K, int group_size, int top_k, int bl
     size_t smem = (size_t)(block_m+BN)*(group_size+8);
     auto launchW = [&](){ moe_gemm_tiled_kernel<WmmaFp8,false,BN><<<gridW,blockW,smem>>>(
         dX,das,dwp,dws,dwz,dsti,deid,dntp,doW,T,N,K,group_size,top_k,block_m,num_valid,nullptr,nullptr,0); };
-    // SWMMAC-int4 grouped
+    // SWMMAC-int4 grouped (non-tiled: weight re-read per warp from DRAM)
     const int NWARP = block_m/16; dim3 gridS(N/16, P/block_m); dim3 blockS(NWARP*32);
     #define LS(NW) moe_gemm_swmmac_int4_kernel<false,NW><<<gridS,blockS>>>( \
         dX,das,dWci4,didx,dws,dwz,dsti,deid,dntp,doS,T,N,K,group_size,top_k,block_m,num_valid,nullptr,nullptr,0)
     auto launchS = [&](){ if (NWARP==1) LS(1); else if (NWARP==2) LS(2); else LS(4); };
+    // SWMMAC-int4 grouped TILED (weight staged once in LDS, reused across the M-tile)
+    const size_t smemT = swmmac_int4_tiled_smem_bytes(K);
+    #define LT(NW) moe_gemm_swmmac_int4_tiled_kernel<false,NW><<<gridS,blockS,smemT>>>( \
+        dX,das,dWci4,didx,dws,dwz,dsti,deid,dntp,doS,T,N,K,group_size,top_k,block_m,num_valid,nullptr,nullptr,0)
+    auto launchT = [&](){ if (NWARP==1) LT(1); else if (NWARP==2) LT(2); else LT(4); };
 
-    double tW = bench(launchW, iters), tS = bench(launchS, iters);
+    double tW = bench(launchW, iters), tS = bench(launchS, iters), tT = bench(launchT, iters);
     HC(hipGetLastError());
-    printf("[%-12s] N=%-5d K=%-5d g=%d bm=%d P=%-5d | WMMA-dense(4b) %7.4f ms | SWMMAC-int4(3b) %7.4f ms | %.2fx\n",
-           tag, N, K, group_size, block_m, P, tW, tS, tW / tS);
+    printf("[%-12s] N=%-5d K=%-5d g=%d bm=%d P=%-5d | WMMA(4b) %7.4f | SWMMAC(3b) %7.4f (%.2fx) | SWMMAC-TILED %7.4f (%.2fx vs WMMA, %.2fx vs untiled)\n",
+           tag, N, K, group_size, block_m, P, tW, tS, tW/tS, tT, tW/tT, tS/tT);
     #undef LS
+    #undef LT
     hipFree(dX);hipFree(das);hipFree(dws);hipFree(dwz);hipFree(dwp);hipFree(dWci4);hipFree(didx);
     hipFree(dsti);hipFree(deid);hipFree(dntp);hipFree(doW);hipFree(doS);
 }

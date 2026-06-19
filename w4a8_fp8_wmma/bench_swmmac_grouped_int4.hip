@@ -129,6 +129,7 @@ static void run(const char* tag, int N, int K, int group_size, int top_k, int bl
     HC(hipMalloc(&dsti, P*4));           HC(hipMemcpy(dsti, sti.data(), P*4, hipMemcpyHostToDevice));
     HC(hipMalloc(&deid, eid.size()*4));  HC(hipMemcpy(deid, eid.data(), eid.size()*4, hipMemcpyHostToDevice));
     HC(hipMalloc(&dntp, 4));             HC(hipMemcpy(dntp, &ntp, 4, hipMemcpyHostToDevice));
+    __half *dYs16t; HC(hipMalloc(&dYs16t, (size_t)P*N*2));   // tiled-kernel output
     HC(hipMalloc(&dYr, (size_t)P*N*4));  HC(hipMalloc(&dYs16, (size_t)P*N*2));
 
     // device-fill the zeroed dense weight (same int4->fp8 conversion as the kernel)
@@ -147,20 +148,40 @@ static void run(const char* tag, int N, int K, int group_size, int top_k, int bl
     if (NWARP==1) LAUNCH(1); else if (NWARP==2) LAUNCH(2); else LAUNCH(4);
     #undef LAUNCH
     HC(hipDeviceSynchronize()); HC(hipGetLastError());
+    // TILED SWMMAC-int4 kernel (LDS weight staging) -> fp16. Must match the reference (and thus the
+    // non-tiled kernel) bit-exactly: same operands/index/scale/accumulation, only weight read site.
+    const size_t smem_t = swmmac_int4_tiled_smem_bytes(K);
+    #define LAUNCHT(NW) moe_gemm_swmmac_int4_tiled_kernel<false, NW><<<grid, block, smem_t>>>( \
+        dX, dsx, dWci4, didx, dws, dwz, dsti, deid, dntp, dYs16t, \
+        T, N, K, group_size, top_k, block_m, num_valid, nullptr, nullptr, 0)
+    if (NWARP==1) LAUNCHT(1); else if (NWARP==2) LAUNCHT(2); else LAUNCHT(4);
+    #undef LAUNCHT
+    HC(hipDeviceSynchronize()); HC(hipGetLastError());
 
-    std::vector<float> Yr((size_t)P*N); std::vector<__half> Ys((size_t)P*N);
+    std::vector<float> Yr((size_t)P*N); std::vector<__half> Ys((size_t)P*N), Yst((size_t)P*N);
     HC(hipMemcpy(Yr.data(), dYr, (size_t)P*N*4, hipMemcpyDeviceToHost));
     HC(hipMemcpy(Ys.data(), dYs16, (size_t)P*N*2, hipMemcpyDeviceToHost));
+    HC(hipMemcpy(Yst.data(), dYs16t, (size_t)P*N*2, hipMemcpyDeviceToHost));
     double max_rel = 0, sum_rel = 0; long cnt = 0, bad = 0;
+    double max_rel_t = 0; long bad_t = 0, mismatch_st = 0;   // tiled vs ref, and tiled-vs-nontiled
     for (int m = 0; m < P; ++m) { if (sti[m] >= num_valid) continue;
         for (int n = 0; n < N; ++n) {
             float r = Yr[(size_t)m*N+n], s = __half2float(Ys[(size_t)m*N+n]);
+            float st = __half2float(Yst[(size_t)m*N+n]);
             float rel = fabsf(r - s) / (fabsf(r) + 1e-4f);
-            max_rel = fmax(max_rel, rel); sum_rel += rel; ++cnt; if (rel > 0.05f) ++bad; } }
+            float rel_t = fabsf(r - st) / (fabsf(r) + 1e-4f);
+            max_rel = fmax(max_rel, rel); sum_rel += rel; ++cnt; if (rel > 0.05f) ++bad;
+            max_rel_t = fmax(max_rel_t, rel_t); if (rel_t > 0.05f) ++bad_t;
+            // bit-exact gate: tiled must equal non-tiled (same fp16 bits) — pure LDS-vs-DRAM read site
+            if (__half2float(Ys[(size_t)m*N+n]) != st) ++mismatch_st; } }
     printf("[%s] N=%d K=%d g=%d bm=%d P=%d  mean_rel=%.2e max_rel=%.2e bad(>5%%)=%ld/%ld -> %s\n",
            tag, N, K, group_size, block_m, P, sum_rel/cnt, max_rel, bad, cnt, bad==0 ? "PASS" : "FAIL");
+    printf("[%s-TILED] max_rel=%.2e bad(>5%%)=%ld/%ld  vs-nontiled fp16-mismatch=%ld -> %s\n",
+           tag, max_rel_t, bad_t, cnt, mismatch_st,
+           (bad_t==0 && mismatch_st==0) ? "PASS (bit-exact)" : "FAIL");
     hipFree(dX);hipFree(dWcode);hipFree(dWci4);hipFree(dWz);hipFree(didx);hipFree(dzpf);hipFree(dwz);
     hipFree(dws);hipFree(dsx);hipFree(dsti);hipFree(deid);hipFree(dntp);hipFree(dYr);hipFree(dYs16);
+    hipFree(dYs16t);
 }
 
 int main() {
