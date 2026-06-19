@@ -144,8 +144,10 @@ sweeps `TileConfig`s and writes the per-shape winner to a cache (folding the exi
    editing `feat/swmmac-microbench`'s `swmmac_op.hip` (that is another concern's committed kernel —
    do not touch it, per CLAUDE.md). Building it on the v5/v6 LDS-tiling backbone yields a *tiled*
    SWMMAC incidentally (the handoff's "untuned `swmmac_gemm_k`" concern, addressed within our scope).
-3. **int4-sparse grouped variant** (~3 bit/wt) — `bench_swmmac_int4.hip` shows 1.17–1.55× over dense
-   W4A8; the decode-bandwidth win, *if/when* a pruned MoE checkpoint exists.
+3. ✅ **int4-sparse + per-group-scale grouped variant** (~3 bit/wt) — the **production 35B rung**.
+   `bench_swmmac_int4.hip` shows 1.17–1.55× over dense W4A8 (the decode-bandwidth win); the grouped
+   kernel is now written + self-consistency-validated (see §2.7). The served win still waits on a
+   pruned MoE checkpoint existing.
 
 #### Validation ceiling for the SWMMAC sibling (IMPORTANT, honest scope)
 **No served grouped-MoE-SWMMAC result is possible** — there is no 2:4-pruned MoE checkpoint (only
@@ -195,6 +197,159 @@ So the operand/index/routing construction is **numerically correct** at the prod
 (First pass used O(1) synthetic scales → the K-long fp8 sum overflowed the fp16 output to `inf` for
 one rng draw; realistic small scales — as real per-token/per-channel W4A8 scales bound the result —
 fixed it. Not a kernel bug.) The fp8/per-channel grouped SWMMAC GEMM is done and validated.
+
+#### §2.7 int4-sparse + per-group-scale grouped variant — VALIDATED (2026-06-19): self-consistency PASS
+**The production 35B rung.** `moe_gemm_swmmac_int4.h` (`moe_gemm_swmmac_int4_kernel<SCATTER,NWARP>`)
+extends the fp8 sibling with the two pieces the real 35B MoE needs, sharing the *entire* SWMMAC
+dataflow + grouped-MoE spine otherwise:
+- weight = **2:4-compressed INT4** (E, N, K/4 bytes), unpacked to e4m3 with a per-(channel,group)
+  **zero-point** (asymmetric `w_zeros`, or symmetric zp=8 when null) — int4 unpack mirrors the
+  validated `bench_swmmac_int4.hip::sparse_int4`; ~3 bit/wt (vs the fp8 rung's ~5).
+- per-**group** weight scale (E, N, K/group_size) folded **in-register per group**, exactly like the
+  WMMA tiled spine (`moe_gemm_tiled.h`), replacing the fp8 rung's single per-channel epilogue scale.
+  `group_size` is a multiple of 32 (one SWMMAC K-tile); the 35B g32 → one tile == one group.
+
+**Compile + ISA verified** for gfx1201: emits `v_swmmac_f32_16x16x32_fp8_fp8` (×3 NWARP instances) +
+`v_cvt_pk_fp8_f32` (the int4→fp8 unpack), **0 `ds_read`/`ds_write`** (weight straight from DRAM, the
+defining no-LDS-expand SWMMAC property).
+
+**`bench_swmmac_grouped_int4.hip` PASS** (1-card lease, 2026-06-19): synth per-(expert,channel,group)
+int4 codes + per-group zp + per-group scale, 2:4-prune along K, device-fill the zeroed dense weight
+`Wz = e4m3(code−zp)` with the **same** `int4_signed_to_e4m3` the kernel uses (so the two paths' fp8
+weight bytes are bit-identical by construction), then grouped-SWMMAC-int4 vs a per-group-scaled dense
+reference —
+- gemm1 N=1024 K=2048 g32 bm=64: mean_rel 1.75e-4, **max_rel 4.85e-4**, 0/524288 bad → PASS
+- gemm2 N=2048 K=512  g32 bm=64: mean_rel 1.77e-4, max_rel 4.86e-4, 0/1048576 bad → PASS
+- gemm1 g32 bm=32:               mean_rel 1.76e-4, max_rel 4.85e-4, 0/262144 bad → PASS
+- gemm1 **g64** bm=64 (group spans 2 SWMMAC tiles): mean_rel 1.71e-4, max_rel 4.83e-4, 0/524288 → PASS
+
+`max_rel ≈ 4.85e-4` is **exactly one fp16 ULP** (2⁻¹¹) — pure output quantisation (kernel stores fp16,
+reference fp32). A wrong int4-unpack / zp / scale-fold / index / routing would be *grossly* off, not at
+the fp16 floor; so the int4-sparse + per-group-scale + asymmetric-zp construction is **numerically
+correct** at the production block_m=64, including multi-tile groups (g64). (A self-review bug — zp
+synthesised per-tile while the kernel applies it per-group — was caught + fixed before the GPU run; it
+would have falsely failed only the g64 case.) Validation ceiling reached: no served result is possible
+(no pruned MoE checkpoint; 35B AWQ experts are structureless under 4:2).
+
+**Unexercised paths (NOT claimed validated):** the self-consistency bench drives only `SCATTER=false`
+and the asymmetric-zp path (`w_zeros != null`). `SCATTER=true` (the atomic-scatter epilogue) and the
+symmetric `w_zeros==null` → zp=8 fallback are verbatim-from-the-fp8-spine / trivial-constant and are
+*not* independently tested here — same coverage as the fp8 rung. (The optional bit-exact badge — compare
+`__float2half(reference)` vs the fp16 kernel output instead of fp32 vs fp16 — would turn the 1-ULP
+mean_rel into mean_rel 0; not done, immaterial to the correctness conclusion.)
+
+#### §2.7b Speedup A/B — grouped-SWMMAC-int4 vs grouped-WMMA-dense (2026-06-19, the §2.5 ceiling's 2nd half)
+`bench_swmmac_int4_vs_wmma_grouped.hip` (1-card lease, timing-only, synthetic inputs): grouped-SWMMAC-
+int4 (~3 bit/wt) vs `moe_gemm_tiled_kernel<WmmaFp8>` (the consolidated grouped WMMA-dense W4A8 GEMM,
+4 bit/wt), BN=64 bm=64, 35B shapes, g32, swept over P:
+
+| P (padded rows) | gemm1 (N1024 K2048) | gemm2 (N2048 K512) |
+|---|---|---|
+| 64   | **17.7×** | 12.0× |
+| 256  | 8.9×  | 7.2× |
+| 512  | 7.4×  | 2.2× |
+| 2048 | **0.91×** | 1.14× |
+
+**Read this honestly — the small-P numbers are NOT the real decode win:**
+- At small M the baseline `moe_gemm_tiled` (v5/v6 WMMA) is weight-staging-bound — it dequantises the
+  *entire* N×K int4 weight into LDS for very few rows. That is exactly why production **dispatches the
+  v7 GEMV at decode, not this WMMA tiled kernel** (TILE_FRAMEWORK_DESIGN §2.6 note). So the 12–18× is
+  "SWMMAC-int4 vs a kernel nobody runs at that M" and **overstates the decode win**. The honest decode
+  number needs a SWMMAC-int4-vs-**v7-GEMV** A/B (not yet done — the real follow-on).
+- The **apples-to-apples** number is **prefill, P=2048: 0.91–1.14× ≈ parity**, where WMMA-tiled *is* the
+  production path. Notably SWMMAC-int4 does **not** beat it despite ~half the weight bytes + 2:4-sparse
+  MMA: each block's `block_m/16` warps redundantly re-read the same weight rows from DRAM (this first
+  rung has **no LDS weight-reuse**), so the sparsity/byte win is eaten by redundant traffic. Building the
+  SWMMAC GEMM on the v5/v6 LDS-tiling backbone (stage the sparse weight once, reuse across the M-tile —
+  the "tiled SWMMAC" item in §2.5) is the lever that should turn prefill parity into a real win.
+
+**Conclusion (phase 3b):** the int4-sparse + per-group-scale grouped SWMMAC kernel is **written, ISA-
+verified, and self-consistency-correct** (the §2.5 ceiling's 1st half, fully met). The speedup half is
+**measured but not yet a clean win**: parity at prefill (redundant-weight-read bound), and a large but
+baseline-inflated small-M number that needs a v7-GEMV A/B to state honestly. **Next levers:** (1) tiled
+SWMMAC (LDS weight-reuse) to convert prefill parity → win; (2) the v7-GEMV decode A/B; (3) fold the
+SWMMAC backend into `run_moe_gemm`'s `VLLM_W4A8_MOE_TILED`-style env branch for a torch-level path.
+
+#### §2.7c Levers (1) tiled SWMMAC + (2) the honest v7-GEMV decode A/B (2026-06-19)
+Both `§2.7b` follow-ons, run 1-card lease, timing-only, synthetic inputs, bit-exactness re-checked.
+
+**(1) Tiled SWMMAC — `moe_gemm_swmmac_int4_tiled_kernel<SCATTER,NWARP>`** (in `moe_gemm_swmmac_int4.h`).
+Stages this block's 16-row weight tile (`Wc_i4` 16×K/4 + `idx` 16×K/32) into LDS **once at entry**
+(padded int stride to break the 16-way bank conflict — an unpadded K/16-int stride is a multiple of 32
+for these shapes), one `__syncthreads`, then all `NWARP` warps read weight from LDS instead of
+re-reading the same rows from DRAM. **Bit-exact vs the non-tiled kernel** (`bench_swmmac_grouped_int4.hip`
+extended: fp16-mismatch=0 across gemm1/gemm2, bm32/64, g64 multi-tile). Speedup A/B
+(`bench_swmmac_int4_vs_wmma_grouped.hip`, bm=64, **×untiled** / ×WMMA-dense):
+
+| P    | gemm1 ×untiled | gemm1 ×WMMA | gemm2 ×untiled | gemm2 ×WMMA |
+|------|---------------|-------------|----------------|-------------|
+| 64   | 0.92× | 8.8×  | 0.97× | 8.4× |
+| 256  | **1.49×** | 13.6× | 1.05× | 4.8× |
+| 512  | 0.94× | 6.9×  | 1.08× | 2.4× |
+| 2048 | ~0.94–1.01× | 0.85–0.91× | **1.10×** | **1.25×** |
+
+**Honest read:** LDS weight-reuse helps **only where weight-read is the bottleneck** — gemm2 (short
+K=512, weight-BW-bound, the documented decode wall) gains a consistent 1.05–1.10× ×untiled, lifting the
+prefill P=2048 case **1.14×→1.25× vs WMMA-dense**; mid-P gemm1 (P=256) gets 1.49×. But the headline
+**large-prefill gemm1 P=2048 stays at parity** — weight-reuse is *not* its bottleneck (long-K, activation/
+issue-bound at large M), so the "turn prefill parity into a win" hope **only lands for gemm2, not gemm1**.
+Tiny P=64 slightly regresses (staging cost, L2 already absorbs the redundancy). Did **not** profile the
+gemm1-prefill bottleneck further (advisor: it's a different bottleneck, not LDS — stop tuning LDS).
+
+**(2) Honest decode A/B vs v7-GEMV** — `bench_swmmac_int4_vs_v7_decode.hip` (v7 copied verbatim from
+`moe_kernel.hip`, launched in its **production** auto-config nw/bk/cols/MMAX; **realistic moe_align
+routing** = few real tokens padded to block_m, so v7 actually compacts — the old bench's `num_valid==P`
+hid that). bm=16, ×v7 (>1.0 = SWMMAC beats v7, the production decode path):
+
+| T (real toks) | gemm1 SWMMAC | gemm1 tiled | gemm2 SWMMAC | gemm2 tiled |
+|----|-----------|-----------|-----------|-----------|
+| 1  | **0.39×** | 0.13× | 1.28× | 0.86× |
+| 4  | 1.01× | 0.31× | 2.59× | 1.75× |
+| 8  | 1.86× | 0.51× | 4.51× | 3.06× |
+| 16 | 4.18× | 1.50× | 11.1× | 7.9× |
+| 32 | 9.21× | 2.18× | 6.46× | 16.0× |
+| 64 | 9.18× | 2.10× | 10.2× | 15.7× |
+
+**Honest decode conclusion (corrects §2.7b's inflated 12–18×):**
+- At **pure decode T=1, v7 WINS gemm1** (SWMMAC 0.39× = v7 2.5× faster) and ~ties gemm2 (SWMMAC 1.28×).
+  So SWMMAC does **not** dominate decode — against the kernel production actually runs, it *loses* the
+  long-K GEMM at single-stream decode. The old 12–18× was vs WMMA-tiled, "a kernel nobody runs at that M."
+- **v7 falls off a cliff with T** (true scalar GEMV: 0.03→1.79 ms gemm1, superlinear). The crossover is
+  **2D (which-GEMM × T), not one threshold** — K sets it: short-K **gemm2 favors SWMMAC almost everywhere,
+  including T=1 (1.28×)**; long-K **gemm1 favors v7 until ≈T=4–8**, SWMMAC past it. → ideal dispatch:
+  **v7 for gemm1 at T≤~4; SWMMAC for gemm2 always and for gemm1 at T≥8**.
+- **Tiled SWMMAC is the WRONG choice at decode (bm=16 → NWARP=1, no within-block reuse): strictly worse
+  than untiled at small T** (0.13× gemm1 T=1). It only earns its keep at bm≥32 (the §2.7c-(1) regime). The
+  bm=16 T=32/64 gemm2 spike (16×) is a cross-block-locality effect, not the within-block reuse it was built
+  for — do not over-read it.
+
+**Validation scope of the tiled kernel:** the `SCATTER=false` (non-scatter) path is bit-exact at
+NWARP=1/2/4. The **`SCATTER=true` path (gemm2 atomic-scatter epilogue) is NOT yet correctness-checked** —
+1+2 are timing/non-scatter complete, but any future torch wiring that routes the scatter epilogue through
+the tiled kernel must validate that path first.
+
+**Net (§2.5 ceiling fully characterised):** SWMMAC-int4 is a real win for **batched-decode/small-prefill
+gemm2 and mid-M gemm1**; v7 still owns **single-stream decode gemm1**; tiled adds a further 1.1–1.25× **only
+for the weight-BW-bound (gemm2 / bm≥32) shapes**. No regime is a universal win, and there is **no served
+consumer** (2:4 breaks 35B PPL, no compressed checkpoint — see §2.7b).
+
+#### §2.7d Torch wiring (§2.5 item 3) — DEFERRED, with the structural reason
+**Decision: do NOT build the `VLLM_W4A8_MOE_SWMMAC` env-branch in `run_moe_gemm`.** Not "later" —
+**structurally blocked**, for two compounding reasons:
+1. **The hardware instruction is 2:4, and 2:4 is PPL-hopeless on the 35B** (`[[slidesparse-ppl-gate-green]]`:
+   2:4 ≈ +25% PPL; the PPL-viable ratios 6:8/4:6 do **not** map to the `v_swmmac…fp8` 2:4 op). So there is
+   no weight source *and the research path to one is blocked at the hardware level*, not merely deferred.
+2. **`run_moe_gemm` receives dense `(E,N,K/8)` weights, not compressed `(Wc_i4, idx)`.** A `VLLM_W4A8_MOE_
+   SWMMAC` branch there can **never fire** without plumbing compressed tensors through bindings + the python
+   adapter — i.e. the exact no-consumer infra the project already declined (`[[layout-share-probe-result]]`).
+   A dispatch branch that cannot receive its inputs is **dead code advertising a capability that doesn't
+   exist** — worse than absent. The §2.7b/c **benches already are** the exercised dispatch.
+
+**Durable artifact instead of code:** the §2.7c 2D crossover (gemm2 → SWMMAC always; gemm1 → v7 at T≤4,
+SWMMAC at T≥8; tiled only at bm≥32 / weight-BW-bound shapes) **is** what a future dispatch *would* encode,
+recorded here for when a 2:4-pruned + finetuned checkpoint exists. Build the env-branch (dispatch + bench
+only, no bindings/adapter, scatter path validated first) **only on explicit request to keep the plumbing
+warm** — otherwise it is parked here.
 
 #### (history) written, compile-verified, construction-reviewed, validation queued
 - `moe_gemm_swmmac.h` — `moe_gemm_swmmac_kernel<SCATTER,NWARP>`: the fp8/per-channel first rung,
