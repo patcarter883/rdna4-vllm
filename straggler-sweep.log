@@ -1,0 +1,511 @@
+gpu-lease: waiting for 2 free GPU(s)…
+gpu-lease: leased card(s) [0,1] as 'straggler'  (HIP=0,1, port=8000, project=lease-straggler)
+=== [even] cuw=''  W4A8=1  dev=0,1 ===
+[w4a8_fp8_wmma] registered at _POSSIBLE_KERNELS[ROCM][0]: ['RocmW4A8Fp8WmmaLinearKernel', 'TritonW4A16LinearKernel', 'ConchLinearKernel', 'ExllamaLinearKernel']
+[w4a8_fp8_wmma] AWQ MoE hook installed (gfx12x): supported AWQ-4bit asym experts -> grouped FP8-WMMA; GPTQ/CT via own hooks
+[w4a8_fp8_wmma] CT MoE hook installed (gfx12x): symmetric int4 experts -> grouped FP8-WMMA; AWQ/GPTQ/Marlin untouched
+[w4a8_fp8_wmma] WNA16 MoE hook installed (gfx12x): int4 AWQ/GPTQ fallback experts -> grouped FP8-WMMA; Marlin untouched
+[w4a8_fp8_wmma] GPTQ MoE hook installed (gfx12x): symmetric int4 experts -> grouped FP8-WMMA; AWQ/CT/Marlin untouched
+WARNING 06-19 10:49:55 [envs.py:2060] Unknown vLLM environment variable detected: VLLM_ROCM_W4A8_FP8_WMMA_MOE
+WARNING 06-19 10:49:55 [envs.py:2060] Unknown vLLM environment variable detected: VLLM_ROCM_USE_W4A8_FP8_WMMA
+WARNING 06-19 10:49:55 [envs.py:2060] Unknown vLLM environment variable detected: VLLM_ROCM_W4A8_FP8_WMMA_MOE_VERSION
+WARNING 06-19 10:50:00 [model.py:2098] Casting torch.bfloat16 to torch.float16.
+WARNING 06-19 10:50:00 [quark_ocp_mx.py:142] AITER is not found or QuarkOCP_MX is not supported on the current platform. QuarkOCP_MX quantization will not be available.
+WARNING 06-19 10:50:00 [vllm.py:1033] Enforce eager set, disabling torch.compile and CUDAGraphs. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none
+WARNING 06-19 10:50:00 [vllm.py:1075] Inductor compilation was disabled by user settings, optimizations settings that are only active during inductor compilation will be ignored.
+`Qwen2VLImageProcessorFast` is deprecated. The `Fast` suffix for image processors has been removed; use `Qwen2VLImageProcessor` instead.
+WARNING 06-19 10:50:02 [system_utils.py:157] We must use the `spawn` multiprocessing start method. Overriding VLLM_WORKER_MULTIPROC_METHOD to 'spawn'. See https://docs.vllm.ai/en/latest/usage/troubleshooting.html#python-multiprocessing for more information. Reasons: CUDA is initialized
+(EngineCore pid=135) [w4a8_fp8_wmma] registered at _POSSIBLE_KERNELS[ROCM][0]: ['RocmW4A8Fp8WmmaLinearKernel', 'TritonW4A16LinearKernel', 'ConchLinearKernel', 'ExllamaLinearKernel']
+(EngineCore pid=135) [w4a8_fp8_wmma] AWQ MoE hook installed (gfx12x): supported AWQ-4bit asym experts -> grouped FP8-WMMA; GPTQ/CT via own hooks
+(EngineCore pid=135) [w4a8_fp8_wmma] CT MoE hook installed (gfx12x): symmetric int4 experts -> grouped FP8-WMMA; AWQ/GPTQ/Marlin untouched
+(EngineCore pid=135) [w4a8_fp8_wmma] WNA16 MoE hook installed (gfx12x): int4 AWQ/GPTQ fallback experts -> grouped FP8-WMMA; Marlin untouched
+(EngineCore pid=135) [w4a8_fp8_wmma] GPTQ MoE hook installed (gfx12x): symmetric int4 experts -> grouped FP8-WMMA; AWQ/CT/Marlin untouched
+(EngineCore pid=135) WARNING 06-19 10:50:07 [multiproc_executor.py:1033] Reducing Torch parallelism from 16 threads to 1 to avoid unnecessary CPU contention. Set OMP_NUM_THREADS in the external environment to tune this value as needed.
+`Qwen2VLImageProcessorFast` is deprecated. The `Fast` suffix for image processors has been removed; use `Qwen2VLImageProcessor` instead.
+`Qwen2VLImageProcessorFast` is deprecated. The `Fast` suffix for image processors has been removed; use `Qwen2VLImageProcessor` instead.
+[w4a8_fp8_wmma] registered at _POSSIBLE_KERNELS[ROCM][0]: ['RocmW4A8Fp8WmmaLinearKernel', 'TritonW4A16LinearKernel', 'ConchLinearKernel', 'ExllamaLinearKernel']
+[w4a8_fp8_wmma] AWQ MoE hook installed (gfx12x): supported AWQ-4bit asym experts -> grouped FP8-WMMA; GPTQ/CT via own hooks
+[w4a8_fp8_wmma] CT MoE hook installed (gfx12x): symmetric int4 experts -> grouped FP8-WMMA; AWQ/GPTQ/Marlin untouched
+[w4a8_fp8_wmma] WNA16 MoE hook installed (gfx12x): int4 AWQ/GPTQ fallback experts -> grouped FP8-WMMA; Marlin untouched
+[w4a8_fp8_wmma] GPTQ MoE hook installed (gfx12x): symmetric int4 experts -> grouped FP8-WMMA; AWQ/CT/Marlin untouched
+[w4a8_fp8_wmma] registered at _POSSIBLE_KERNELS[ROCM][0]: ['RocmW4A8Fp8WmmaLinearKernel', 'TritonW4A16LinearKernel', 'ConchLinearKernel', 'ExllamaLinearKernel']
+[w4a8_fp8_wmma] AWQ MoE hook installed (gfx12x): supported AWQ-4bit asym experts -> grouped FP8-WMMA; GPTQ/CT via own hooks
+[w4a8_fp8_wmma] CT MoE hook installed (gfx12x): symmetric int4 experts -> grouped FP8-WMMA; AWQ/GPTQ/Marlin untouched
+[w4a8_fp8_wmma] WNA16 MoE hook installed (gfx12x): int4 AWQ/GPTQ fallback experts -> grouped FP8-WMMA; Marlin untouched
+[w4a8_fp8_wmma] GPTQ MoE hook installed (gfx12x): symmetric int4 experts -> grouped FP8-WMMA; AWQ/CT/Marlin untouched
+(Worker_TP0 pid=190) WARNING 06-19 10:50:30 [activation.py:728] [ROCm] PyTorch's native GELU with tanh approximation is unstable. Falling back to GELU(approximate='none').
+(Worker_TP0 pid=190) WARNING 06-19 10:50:30 [awq_marlin.py:315] Layer 'language_model.model.layers.0.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 10:50:30 [awq_marlin.py:315] Layer 'language_model.model.layers.1.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 10:50:30 [awq_marlin.py:315] Layer 'language_model.model.layers.2.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 10:50:30 [awq_marlin.py:315] Layer 'language_model.model.layers.3.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 10:50:30 [awq_marlin.py:315] Layer 'language_model.model.layers.4.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 10:50:30 [awq_marlin.py:315] Layer 'language_model.model.layers.5.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 10:50:30 [awq_marlin.py:315] Layer 'language_model.model.layers.6.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 10:50:30 [awq_marlin.py:315] Layer 'language_model.model.layers.7.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 10:50:30 [awq_marlin.py:315] Layer 'language_model.model.layers.8.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 10:50:30 [awq_marlin.py:315] Layer 'language_model.model.layers.9.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 10:50:30 [awq_marlin.py:315] Layer 'language_model.model.layers.10.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 10:50:30 [awq_marlin.py:315] Layer 'language_model.model.layers.11.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 10:50:30 [awq_marlin.py:315] Layer 'language_model.model.layers.12.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 10:50:30 [awq_marlin.py:315] Layer 'language_model.model.layers.13.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 10:50:30 [awq_marlin.py:315] Layer 'language_model.model.layers.14.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 10:50:30 [awq_marlin.py:315] Layer 'language_model.model.layers.15.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 10:50:30 [awq_marlin.py:315] Layer 'language_model.model.layers.16.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 10:50:30 [awq_marlin.py:315] Layer 'language_model.model.layers.17.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 10:50:30 [awq_marlin.py:315] Layer 'language_model.model.layers.18.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 10:50:30 [awq_marlin.py:315] Layer 'language_model.model.layers.19.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 10:50:30 [awq_marlin.py:315] Layer 'language_model.model.layers.20.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 10:50:30 [awq_marlin.py:315] Layer 'language_model.model.layers.21.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 10:50:30 [awq_marlin.py:315] Layer 'language_model.model.layers.22.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 10:50:30 [awq_marlin.py:315] Layer 'language_model.model.layers.23.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 10:50:30 [awq_marlin.py:315] Layer 'language_model.model.layers.24.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 10:50:30 [awq_marlin.py:315] Layer 'language_model.model.layers.25.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 10:50:30 [awq_marlin.py:315] Layer 'language_model.model.layers.26.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 10:50:30 [awq_marlin.py:315] Layer 'language_model.model.layers.27.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 10:50:30 [awq_marlin.py:315] Layer 'language_model.model.layers.28.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 10:50:30 [awq_marlin.py:315] Layer 'language_model.model.layers.29.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 10:50:30 [awq_marlin.py:315] Layer 'language_model.model.layers.30.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 10:50:30 [awq_marlin.py:315] Layer 'language_model.model.layers.31.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 10:50:30 [awq_marlin.py:315] Layer 'language_model.model.layers.32.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 10:50:30 [awq_marlin.py:315] Layer 'language_model.model.layers.33.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 10:50:30 [awq_marlin.py:315] Layer 'language_model.model.layers.34.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 10:50:30 [awq_marlin.py:315] Layer 'language_model.model.layers.35.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 10:50:30 [awq_marlin.py:315] Layer 'language_model.model.layers.36.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 10:50:30 [awq_marlin.py:315] Layer 'language_model.model.layers.37.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 10:50:30 [awq_marlin.py:315] Layer 'language_model.model.layers.38.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 10:50:30 [awq_marlin.py:315] Layer 'language_model.model.layers.39.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 10:50:30 [compilation.py:1317] Op 'sparse_attn_indexer' not present in model, enabling with '+sparse_attn_indexer' has no effect
+(Worker_TP0 pid=190) Loading safetensors checkpoint shards:   0% Completed | 0/6 [00:00<?, ?it/s]
+(Worker_TP0 pid=190) Loading safetensors checkpoint shards:  17% Completed | 1/6 [00:12<01:04, 12.88s/it]
+(Worker_TP0 pid=190) Loading safetensors checkpoint shards:  33% Completed | 2/6 [00:25<00:51, 12.92s/it]
+(Worker_TP0 pid=190) Loading safetensors checkpoint shards:  50% Completed | 3/6 [00:38<00:38, 12.91s/it]
+(Worker_TP0 pid=190) Loading safetensors checkpoint shards:  67% Completed | 4/6 [00:48<00:23, 11.59s/it]
+(Worker_TP0 pid=190) Loading safetensors checkpoint shards:  83% Completed | 5/6 [00:53<00:09,  9.15s/it]
+(Worker_TP0 pid=190) Loading safetensors checkpoint shards: 100% Completed | 6/6 [00:53<00:00,  6.08s/it]
+(Worker_TP0 pid=190) Loading safetensors checkpoint shards: 100% Completed | 6/6 [00:53<00:00,  8.87s/it]
+(Worker_TP0 pid=190) 
+(Worker_TP0 pid=190) [w4a8_fp8_wmma] WNA16 MoE weights ready for grouped FP8-WMMA (int4 g=32 has_zp=True); engages PER-BATCH iff _moe_should_engage (crossover cache or VLLM_ROCM_W4A8_FP8_WMMA_MOE_MIN_M) — else stock Triton fused_moe
+(Worker_TP0 pid=190) WARNING 06-19 11:13:16 [fused_moe.py:1076] Using default MoE config. Performance might be sub-optimal! Config file not found at /app/vllm/vllm/model_executor/layers/fused_moe/configs/E=256,N=256,device_name=AMD_Radeon_RX9070XT,dtype=int4_w4a16.json
+(Worker_TP0 pid=190) Autotuning unified-attention (decode, 3D):   0%|          | 0/6 [00:00<?, ?bucket/s]Autotuning unified-attention (decode, 3D):  17%|█▋        | 1/6 [00:03<00:19,  3.97s/bucket]Autotuning unified-attention (decode, 3D):  33%|███▎      | 2/6 [00:07<00:15,  3.88s/bucket]Autotuning unified-attention (decode, 3D):  83%|████████▎ | 5/6 [00:12<00:02,  2.22s/bucket]Autotuning unified-attention (decode, 3D): 100%|██████████| 6/6 [00:13<00:00,  1.90s/bucket]Autotuning unified-attention (decode, 3D): 100%|██████████| 6/6 [00:13<00:00,  2.24s/bucket]
+(Worker_TP0 pid=190) Autotuning unified-attention (prefill, 2D):   0%|          | 0/27 [00:00<?, ?cfg/s]Autotuning unified-attention (prefill, 2D):   4%|▎         | 1/27 [00:00<00:10,  2.57cfg/s]Autotuning unified-attention (prefill, 2D):   7%|▋         | 2/27 [00:00<00:09,  2.63cfg/s]Autotuning unified-attention (prefill, 2D):  11%|█         | 3/27 [00:01<00:09,  2.60cfg/s]Autotuning unified-attention (prefill, 2D):  15%|█▍        | 4/27 [00:01<00:10,  2.30cfg/s]Autotuning unified-attention (prefill, 2D):  19%|█▊        | 5/27 [00:02<00:10,  2.16cfg/s]Autotuning unified-attention (prefill, 2D):  22%|██▏       | 6/27 [00:02<00:11,  1.82cfg/s]Autotuning unified-attention (prefill, 2D):  26%|██▌       | 7/27 [00:03<00:12,  1.60cfg/s]Autotuning unified-attention (prefill, 2D):  30%|██▉       | 8/27 [00:04<00:12,  1.50cfg/s]Autotuning unified-attention (prefill, 2D):  33%|███▎      | 9/27 [00:05<00:12,  1.45cfg/s]Autotuning unified-attention (prefill, 2D):  37%|███▋      | 10/27 [00:06<00:13,  1.26cfg/s]Autotuning unified-attention (prefill, 2D):  41%|████      | 11/27 [00:06<00:11,  1.41cfg/s]Autotuning unified-attention (prefill, 2D):  44%|████▍     | 12/27 [00:07<00:09,  1.52cfg/s]Autotuning unified-attention (prefill, 2D):  48%|████▊     | 13/27 [00:08<00:10,  1.35cfg/s]Autotuning unified-attention (prefill, 2D):  52%|█████▏    | 14/27 [00:08<00:09,  1.32cfg/s]Autotuning unified-attention (prefill, 2D):  56%|█████▌    | 15/27 [00:09<00:09,  1.29cfg/s]Autotuning unified-attention (prefill, 2D):  59%|█████▉    | 16/27 [00:11<00:10,  1.01cfg/s]Autotuning unified-attention (prefill, 2D):  63%|██████▎   | 17/27 [00:13<00:12,  1.26s/cfg]Autotuning unified-attention (prefill, 2D):  67%|██████▋   | 18/27 [00:14<00:12,  1.35s/cfg]Autotuning unified-attention (prefill, 2D):  70%|███████   | 19/27 [00:15<00:10,  1.31s/cfg]Autotuning unified-attention (prefill, 2D):  74%|███████▍  | 20/27 [00:17<00:08,  1.27s/cfg]Autotuning unified-attention (prefill, 2D):  78%|███████▊  | 21/27 [00:18<00:07,  1.24s/cfg]Autotuning unified-attention (prefill, 2D):  81%|████████▏ | 22/27 [00:20<00:07,  1.41s/cfg]Autotuning unified-attention (prefill, 2D):  85%|████████▌ | 23/27 [00:22<00:06,  1.59s/cfg]Autotuning unified-attention (prefill, 2D):  89%|████████▉ | 24/27 [00:24<00:05,  1.71s/cfg]Autotuning unified-attention (prefill, 2D):  93%|█████████▎| 25/27 [00:27<00:04,  2.25s/cfg]Autotuning unified-attention (prefill, 2D):  96%|█████████▋| 26/27 [00:31<00:02,  2.67s/cfg]Autotuning unified-attention (prefill, 2D): 100%|██████████| 27/27 [00:35<00:00,  3.01s/cfg]Autotuning unified-attention (prefill, 2D): 100%|██████████| 27/27 [00:35<00:00,  1.30s/cfg]
+(EngineCore pid=135) `Qwen2VLImageProcessorFast` is deprecated. The `Fast` suffix for image processors has been removed; use `Qwen2VLImageProcessor` instead.
+(EngineCore pid=135) WARNING 06-19 11:14:15 [vllm.py:1033] Enforce eager set, disabling torch.compile and CUDAGraphs. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none
+(EngineCore pid=135) WARNING 06-19 11:14:15 [vllm.py:1075] Inductor compilation was disabled by user settings, optimizations settings that are only active during inductor compilation will be ignored.
+(Worker_TP0 pid=190) WARNING 06-19 11:14:15 [jit_monitor.py:103] Triton kernel JIT compilation during inference: _zero_kv_blocks_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
+(Worker_TP0 pid=190) WARNING 06-19 11:14:15 [jit_monitor.py:103] Triton kernel JIT compilation during inference: _compute_slot_mapping_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
+(Worker_TP0 pid=190) WARNING 06-19 11:14:15 [jit_monitor.py:103] Triton kernel JIT compilation during inference: _causal_conv1d_fwd_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
+(Worker_TP0 pid=190) WARNING 06-19 11:14:16 [jit_monitor.py:103] Triton kernel JIT compilation during inference: _fused_post_conv_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
+(Worker_TP0 pid=190) WARNING 06-19 11:14:16 [jit_monitor.py:103] Triton kernel JIT compilation during inference: _triton_mrope_forward. This causes a latency spike; consider extending warmup to cover this shape/config.
+(Worker_TP0 pid=190) WARNING 06-19 11:14:16 [jit_monitor.py:103] Triton kernel JIT compilation during inference: kernel_unified_attention. This causes a latency spike; consider extending warmup to cover this shape/config.
+(Worker_TP0 pid=190) WARNING 06-19 11:14:17 [jit_monitor.py:103] Triton kernel JIT compilation during inference: _causal_conv1d_update_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
+(Worker_TP0 pid=190) WARNING 06-19 11:14:18 [jit_monitor.py:103] Triton kernel JIT compilation during inference: fused_recurrent_gated_delta_rule_packed_decode_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
+(Worker_TP0 pid=190) WARNING 06-19 11:14:18 [jit_monitor.py:103] Triton kernel JIT compilation during inference: layer_norm_fwd_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
+(Worker_TP0 pid=190) WARNING 06-19 11:14:18 [jit_monitor.py:103] Triton kernel JIT compilation during inference: fused_moe_kernel_gptq_awq. This causes a latency spike; consider extending warmup to cover this shape/config.
+(Worker_TP0 pid=190) WARNING 06-19 11:14:19 [jit_monitor.py:103] Triton kernel JIT compilation during inference: reduce_segments. This causes a latency spike; consider extending warmup to cover this shape/config.
+(Worker_TP0 pid=190) /app/.venv/lib/python3.12/site-packages/torch/profiler/profiler.py:217: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+(Worker_TP0 pid=190)   _warn_once(
+(Worker_TP1 pid=195) /app/.venv/lib/python3.12/site-packages/torch/profiler/profiler.py:217: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+(Worker_TP1 pid=195)   _warn_once(
+[rank0]:[W619 11:14:27.468533893 collection.cpp:1149] Warning: ROCTracer produced duplicate flow start: 3 (function operator())
+[rank1]:[W619 11:14:27.470704536 collection.cpp:1149] Warning: ROCTracer produced duplicate flow start: 3 (function operator())
+(Worker_TP0 pid=190) -------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+(Worker_TP0 pid=190)                                                    Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+(Worker_TP0 pid=190) -------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+(Worker_TP0 pid=190)                  execute_context_0(0)_generation_16(16)         0.00%       0.000us         0.00%       0.000us       0.000us        4.854s       211.42%        4.854s      79.574ms            61  
+(Worker_TP0 pid=190) ncclDevKernel_Generic_4(ncclDevKernelArgsStorage<409...         0.00%       0.000us         0.00%       0.000us       0.000us     935.861ms        40.76%     935.861ms     172.923us          5412  
+(Worker_TP0 pid=190)                                        vllm::all_reduce         2.19%     143.639ms         3.16%     206.923ms      38.706us     909.361ms        39.61%     909.361ms     170.101us          5346  
+(Worker_TP0 pid=190)                  execute_context_0(0)_generation_15(15)         0.00%       0.000us         0.00%       0.000us       0.000us     765.285ms        33.33%     765.285ms     382.643ms             2  
+(Worker_TP0 pid=190)                 execute_context_15(261)_generation_1(1)         0.00%       0.000us         0.00%       0.000us       0.000us     602.079ms        26.22%     602.079ms     602.079ms             1  
+(Worker_TP0 pid=190)                                                aten::mm         7.84%     513.710ms        10.28%     673.508ms      38.150us     578.910ms        25.21%     578.910ms      32.792us         17654  
+(Worker_TP0 pid=190)                                     vllm::fused_experts         9.37%     613.663ms        12.48%     817.758ms     309.757us     454.583ms        19.80%     483.655ms     183.203us          2640  
+(Worker_TP0 pid=190)                            fused_moe_kernel_gptq_awq.kd         0.00%       0.000us         0.00%       0.000us       0.000us     454.583ms        19.80%     454.583ms      86.095us          5280  
+(Worker_TP0 pid=190)                   execute_context_1(17)_generation_0(0)         0.00%       0.000us         0.00%       0.000us       0.000us     285.023ms        12.41%     285.023ms     285.023ms             1  
+(Worker_TP0 pid=190) Cijk_Alik_Bljk_HHS_BH_Bias_HA_S_SAV_UserArgs_MT128x1...         0.00%       0.000us         0.00%       0.000us       0.000us     252.818ms        11.01%     252.818ms      94.902us          2664  
+(Worker_TP0 pid=190) Cijk_Alik_Bljk_HHS_BH_Bias_HA_S_SAV_UserArgs_MT128x1...         0.00%       0.000us         0.00%       0.000us       0.000us     161.125ms         7.02%     161.125ms      30.986us          5200  
+(Worker_TP0 pid=190)                           vllm::qwen_gdn_attention_core         9.70%     635.389ms        11.19%     732.947ms     370.175us      88.621ms         3.86%     102.380ms      51.707us          1980  
+(Worker_TP0 pid=190) fused_recurrent_gated_delta_rule_packed_decode_kerne...         0.00%       0.000us         0.00%       0.000us       0.000us      81.419ms         3.55%      81.419ms      42.406us          1920  
+(Worker_TP0 pid=190)                                             aten::copy_         2.22%     145.193ms         5.06%     331.555ms      10.013us      68.307ms         2.98%      68.925ms       2.081us         33114  
+(Worker_TP0 pid=190)                    execute_context_0(0)_generation_1(1)         0.00%       0.000us         0.00%       0.000us       0.000us      55.672ms         2.42%      55.672ms      55.672ms             1  
+(Worker_TP0 pid=190) Cijk_Ailk_Bljk_HHS_BH_Bias_HA_S_SAV_UserArgs_MT16x16...         0.00%       0.000us         0.00%       0.000us       0.000us      54.173ms         2.36%      54.173ms      20.520us          2640  
+(Worker_TP0 pid=190)                                  hipPointerGetAttribute         0.42%      27.564ms         0.42%      27.564ms       0.252us      44.581ms         1.94%      44.581ms       0.407us        109499  
+(Worker_TP0 pid=190) Cijk_Alik_Bljk_HHS_BH_Bias_HA_S_SAV_UserArgs_MT16x16...         0.00%       0.000us         0.00%       0.000us       0.000us      41.535ms         1.81%      41.535ms      16.037us          2590  
+(Worker_TP0 pid=190) Cijk_Alik_Bljk_HHS_BH_Bias_HA_S_SAV_UserArgs_MT16x16...         0.00%       0.000us         0.00%       0.000us       0.000us      39.217ms         1.71%      39.217ms      15.319us          2560  
+(Worker_TP0 pid=190) Cijk_Alik_Bljk_HHS_BH_Bias_HA_S_SAV_UserArgs_MT16x16...         0.00%       0.000us         0.00%       0.000us       0.000us      28.245ms         1.23%      28.245ms      14.711us          1920  
+(Worker_TP0 pid=190)                                               aten::add         1.13%      74.285ms         2.20%     144.453ms       8.931us      26.953ms         1.17%      26.953ms       1.666us         16174  
+(Worker_TP0 pid=190)                                        vllm::all_gather         0.04%       2.662ms         0.09%       5.954ms      90.205us      26.500ms         1.15%      28.968ms     438.910us            66  
+(Worker_TP0 pid=190) void at::native::elementwise_kernel_manual_unroll<12...         0.00%       0.000us         0.00%       0.000us       0.000us      24.750ms         1.08%      24.750ms       2.893us          8554  
+(Worker_TP0 pid=190) void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us      21.722ms         0.95%      21.722ms       1.695us         12814  
+(Worker_TP0 pid=190)                                               aten::mul         0.39%      25.465ms         1.04%      68.113ms      11.218us      17.252ms         0.75%      17.252ms       2.841us          6072  
+(Worker_TP0 pid=190)                                    _moe_C::topk_softmax         0.16%      10.300ms         0.36%      23.415ms       8.870us      15.404ms         0.67%      15.404ms       5.835us          2640  
+(Worker_TP0 pid=190) void vllm::moe::topkGating<8, 256, 4, 16, 32, int, _...         0.00%       0.000us         0.00%       0.000us       0.000us      15.404ms         0.67%      15.404ms       5.835us          2640  
+(Worker_TP0 pid=190)                            _moe_C::moe_align_block_size         0.32%      20.769ms         1.06%      69.131ms      26.186us      15.109ms         0.66%      15.109ms       5.723us          2640  
+(Worker_TP0 pid=190) void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us      13.080ms         0.57%      13.080ms       1.624us          8052  
+(Worker_TP0 pid=190)                                            _C::rms_norm         0.42%      27.712ms         0.84%      55.303ms      10.474us      12.584ms         0.55%      12.584ms       2.383us          5280  
+(Worker_TP0 pid=190) void vllm::rms_norm_kernel<float, 4, 2>(float*, floa...         0.00%       0.000us         0.00%       0.000us       0.000us      12.584ms         0.55%      12.584ms       2.383us          5280  
+(Worker_TP0 pid=190) void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us      11.612ms         0.51%      11.612ms       1.742us          6666  
+(Worker_TP0 pid=190)                                   hipModuleLaunchKernel         1.38%      90.537ms         1.38%      90.537ms       6.230us      10.405ms         0.45%      10.405ms       0.716us         14533  
+(Worker_TP0 pid=190)                                        _C::silu_and_mul         0.45%      29.793ms         0.87%      56.936ms      10.783us       9.687ms         0.42%       9.687ms       1.835us          5280  
+(Worker_TP0 pid=190) _ZN4vllm18act_and_mul_kernelIN3c104HalfE7__half2TnPF...         0.00%       0.000us         0.00%       0.000us       0.000us       9.687ms         0.42%       9.687ms       1.835us          5280  
+(Worker_TP0 pid=190)                                               aten::sum         0.31%      20.557ms         0.51%      33.535ms      12.674us       9.491ms         0.41%       9.491ms       3.587us          2646  
+(Worker_TP0 pid=190) void at::native::reduce_kernel<128, 4, at::native::R...         0.00%       0.000us         0.00%       0.000us       0.000us       9.491ms         0.41%       9.491ms       3.595us          2640  
+(Worker_TP0 pid=190) void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us       9.044ms         0.39%       9.044ms       1.713us          5280  
+(Worker_TP0 pid=190)                             ChunkGatedDeltaRuleFunction         0.31%      20.612ms         0.38%      24.924ms     415.396us       8.742ms         0.38%       8.858ms     147.629us            60  
+(Worker_TP0 pid=190) void vllm::moe::moe_align_block_size_kernel<int>(int...         0.00%       0.000us         0.00%       0.000us       0.000us       8.387ms         0.37%       8.387ms       3.177us          2640  
+(Worker_TP0 pid=190) void at::native::elementwise_kernel_manual_unroll<12...         0.00%       0.000us         0.00%       0.000us       0.000us       8.255ms         0.36%       8.255ms       2.990us          2761  
+(Worker_TP0 pid=190)                     vllm::unified_attention_with_output        19.98%        1.309s        20.34%        1.333s       2.019ms       7.811ms         0.34%       7.811ms      11.835us           660  
+(Worker_TP0 pid=190)                              __amd_rocclr_copyBuffer.kd         0.00%       0.000us         0.00%       0.000us       0.000us       7.608ms         0.33%       7.608ms       2.011us          3784  
+(Worker_TP0 pid=190) void at::native::elementwise_kernel_manual_unroll<12...         0.00%       0.000us         0.00%       0.000us       0.000us       7.578ms         0.33%       7.578ms       2.870us          2640  
+(Worker_TP0 pid=190) void vllm::moe::count_and_sort_expert_tokens_kernel<...         0.00%       0.000us         0.00%       0.000us       0.000us       6.722ms         0.29%       6.722ms       2.546us          2640  
+(Worker_TP0 pid=190)                         _causal_conv1d_update_kernel.kd         0.00%       0.000us         0.00%       0.000us       0.000us       6.619ms         0.29%       6.619ms       3.448us          1920  
+(Worker_TP0 pid=190)                                           aten::sigmoid         0.36%      23.481ms         0.56%      36.614ms      11.095us       6.020ms         0.26%       6.020ms       1.824us          3300  
+(Worker_TP0 pid=190) void at::native::vectorized_elementwise_kernel<8, at...         0.00%       0.000us         0.00%       0.000us       0.000us       6.020ms         0.26%       6.020ms       1.824us          3300  
+(Worker_TP0 pid=190)                                              aten::mean         0.11%       7.095ms         0.23%      14.980ms      10.808us       5.607ms         0.24%       5.607ms       4.046us          1386  
+(Worker_TP0 pid=190) void at::native::reduce_kernel<512, 1, at::native::R...         0.00%       0.000us         0.00%       0.000us       0.000us       5.607ms         0.24%       5.607ms       4.046us          1386  
+(Worker_TP0 pid=190)                                layer_norm_fwd_kernel.kd         0.00%       0.000us         0.00%       0.000us       0.000us       5.552ms         0.24%       5.552ms       2.804us          1980  
+(Worker_TP0 pid=190)                                             aten::index         0.11%       7.196ms         0.33%      21.456ms      25.154us       4.769ms         0.21%       5.055ms       5.926us           853  
+(Worker_TP0 pid=190) void at::native::vectorized_elementwise_kernel<8, at...         0.00%       0.000us         0.00%       0.000us       0.000us       4.599ms         0.20%       4.599ms       1.742us          2640  
+(Worker_TP0 pid=190)                                       _rocm_C::wvSplitK         0.02%       1.128ms         0.04%       2.695ms      11.615us       4.205ms         0.18%       4.205ms      18.126us           232  
+(Worker_TP0 pid=190) void wvSplitK_hf_sml_<__half, 32, 2, 16, 8, 2, 1>(in...         0.00%       0.000us         0.00%       0.000us       0.000us       4.132ms         0.18%       4.132ms      20.455us           202  
+(Worker_TP0 pid=190)                             kernel_unified_attention.kd         0.00%       0.000us         0.00%       0.000us       0.000us       4.014ms         0.17%       4.014ms       6.083us           660  
+(Worker_TP0 pid=190)                      chunk_scaled_dot_kkt_fwd_kernel.kd         0.00%       0.000us         0.00%       0.000us       0.000us       3.930ms         0.17%       3.930ms      65.505us            60  
+(Worker_TP0 pid=190)                                      reduce_segments.kd         0.00%       0.000us         0.00%       0.000us       0.000us       3.797ms         0.17%       3.797ms       5.932us           640  
+(Worker_TP0 pid=190)                                             aten::fill_         0.13%       8.836ms         0.35%      23.083ms       7.908us       3.569ms         0.16%       3.569ms       1.223us          2919  
+(Worker_TP0 pid=190) void at::native::vectorized_elementwise_kernel<8, at...         0.00%       0.000us         0.00%       0.000us       0.000us       3.363ms         0.15%       3.363ms       1.597us          2106  
+(Worker_TP0 pid=190)                                             aten::rsqrt         0.07%       4.910ms         0.34%      22.327ms      16.109us       3.139ms         0.14%       3.139ms       2.264us          1386  
+(Worker_TP0 pid=190) void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us       3.139ms         0.14%       3.139ms       2.264us          1386  
+(Worker_TP0 pid=190)                                            aten::argmax         0.10%       6.331ms         0.10%       6.716ms      97.330us       3.042ms         0.13%       3.042ms      44.084us            69  
+(Worker_TP0 pid=190) void at::native::reduce_kernel<512, 1, at::native::R...         0.00%       0.000us         0.00%       0.000us       0.000us       3.038ms         0.13%       3.038ms      46.027us            66  
+(Worker_TP0 pid=190) void at::native::index_elementwise_kernel<128, 4, at...         0.00%       0.000us         0.00%       0.000us       0.000us       2.597ms         0.11%       2.597ms       3.923us           662  
+(Worker_TP0 pid=190)                                               aten::pow         0.11%       7.088ms         0.32%      21.138ms      15.251us       2.506ms         0.11%       2.506ms       1.808us          1386  
+(Worker_TP0 pid=190) void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us       2.506ms         0.11%       2.506ms       1.808us          1386  
+(Worker_TP0 pid=190)       chunk_gated_delta_rule_fwd_kernel_h_blockdim64.kd         0.00%       0.000us         0.00%       0.000us       0.000us       1.855ms         0.08%       1.855ms      30.914us            60  
+(Worker_TP0 pid=190) void at::native::elementwise_kernel_manual_unroll<12...         0.00%       0.000us         0.00%       0.000us       0.000us       1.777ms         0.08%       1.777ms       2.734us           650  
+(Worker_TP0 pid=190) void at::native::vectorized_gather_kernel<16, long>(...         0.00%       0.000us         0.00%       0.000us       0.000us       1.625ms         0.07%       1.625ms      16.932us            96  
+(Worker_TP0 pid=190)                                  aten::_index_put_impl_         0.01%     555.404us         0.06%       4.052ms      33.767us       1.452ms         0.06%       2.604ms      21.700us           120  
+(Worker_TP0 pid=190) void at::native::index_elementwise_kernel<128, 4, at...         0.00%       0.000us         0.00%       0.000us       0.000us       1.452ms         0.06%       1.452ms      24.193us            60  
+(Worker_TP0 pid=190)                                   chunk_fwd_kernel_o.kd         0.00%       0.000us         0.00%       0.000us       0.000us       1.401ms         0.06%       1.401ms      23.351us            60  
+(Worker_TP1 pid=195) [w4a8_fp8_wmma] WNA16 MoE weights ready for grouped FP8-WMMA (int4 g=32 has_zp=True); engages PER-BATCH iff _moe_should_engage (crossover cache or VLLM_ROCM_W4A8_FP8_WMMA_MOE_MIN_M) — else stock Triton fused_moe
+(Worker_TP0 pid=190)                           vllm::unified_kv_cache_update         0.58%      38.201ms         0.73%      47.521ms      72.002us       1.401ms         0.06%       1.401ms       2.123us           660  
+(Worker_TP0 pid=190)                       reshape_and_cache_kernel_flash.kd         0.00%       0.000us         0.00%       0.000us       0.000us       1.401ms         0.06%       1.401ms       2.123us           660  
+(Worker_TP0 pid=190) void at::native::vectorized_elementwise_kernel<8, at...         0.00%       0.000us         0.00%       0.000us       0.000us       1.371ms         0.06%       1.371ms       2.077us           660  
+(Worker_TP0 pid=190)                                _triton_mrope_forward.kd         0.00%       0.000us         0.00%       0.000us       0.000us       1.289ms         0.06%       1.289ms       1.953us           660  
+(Worker_TP0 pid=190)                                      aten::masked_fill_         0.01%     687.492us         0.05%       3.025ms      24.006us       1.246ms         0.05%       1.246ms       9.885us           126  
+(Worker_TP0 pid=190)                                               aten::sub         0.04%       2.316ms         0.07%       4.410ms       9.148us       1.165ms         0.05%       1.165ms       2.417us           482  
+(Worker_TP0 pid=190) void at::native::elementwise_kernel_manual_unroll<12...         0.00%       0.000us         0.00%       0.000us       0.000us       1.031ms         0.04%       1.031ms      17.188us            60  
+(Worker_TP0 pid=190) Cijk_Alik_Bljk_HHS_BH_Bias_HA_S_SAV_UserArgs_MT64x64...         0.00%       0.000us         0.00%       0.000us       0.000us     931.084us         0.04%     931.084us      23.277us            40  
+(Worker_TP0 pid=190) Cijk_Alik_Bljk_HHS_BH_Bias_HA_S_SAV_UserArgs_MT64x64...         0.00%       0.000us         0.00%       0.000us       0.000us     866.246us         0.04%     866.246us      21.656us            40  
+(Worker_TP0 pid=190)                  merge_16x16_to_64x64_inverse_kernel.kd         0.00%       0.000us         0.00%       0.000us       0.000us     794.543us         0.03%     794.543us      13.242us            60  
+(Worker_TP0 pid=190) void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     645.378us         0.03%     645.378us       2.445us           264  
+(Worker_TP0 pid=190)                         _compute_slot_mapping_kernel.kd         0.00%       0.000us         0.00%       0.000us       0.000us     625.501us         0.03%     625.501us       2.369us           264  
+(Worker_TP0 pid=190)                             recompute_w_u_fwd_kernel.kd         0.00%       0.000us         0.00%       0.000us       0.000us     600.304us         0.03%     600.304us      10.005us            60  
+(Worker_TP0 pid=190) void at::native::elementwise_kernel_manual_unroll<12...         0.00%       0.000us         0.00%       0.000us       0.000us     563.352us         0.02%     563.352us       2.236us           252  
+(Worker_TP0 pid=190) void at::native::index_elementwise_kernel<128, 4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     551.628us         0.02%     551.628us       5.687us            97  
+(Worker_TP0 pid=190)                                      aten::index_select         0.01%     933.062us         0.03%       1.647ms      12.481us     517.778us         0.02%     523.096us       3.963us           132  
+(Worker_TP0 pid=190) void at::native::(anonymous namespace)::indexSelectS...         0.00%       0.000us         0.00%       0.000us       0.000us     517.778us         0.02%     517.778us       8.090us            64  
+(Worker_TP0 pid=190) void at::native::unrolled_elementwise_kernel<at::nat...         0.00%       0.000us         0.00%       0.000us       0.000us     509.283us         0.02%     509.283us       2.572us           198  
+(Worker_TP0 pid=190)                            _causal_conv1d_fwd_kernel.kd         0.00%       0.000us         0.00%       0.000us       0.000us     381.067us         0.02%     381.067us       6.351us            60  
+(Worker_TP0 pid=190)                             hipGetDevicePropertiesR0600         0.47%      30.693ms         0.47%      30.693ms       0.579us     269.119us         0.01%     269.119us       0.005us         52974  
+(Worker_TP0 pid=190)                                         hipEventDestroy         0.00%     176.585us         0.00%     176.585us       1.338us     263.217us         0.01%     263.217us       1.994us           132  
+(Worker_TP0 pid=190) void at::native::elementwise_kernel_manual_unroll<12...         0.00%       0.000us         0.00%       0.000us       0.000us     214.255us         0.01%     214.255us       3.246us            66  
+(Worker_TP0 pid=190)                                     hipEventSynchronize         0.34%      22.369ms         1.17%      76.533ms     571.138us     202.068us         0.01%       5.216ms      38.927us           134  
+(Worker_TP0 pid=190)                              _fused_post_conv_kernel.kd         0.00%       0.000us         0.00%       0.000us       0.000us     201.501us         0.01%     201.501us       3.358us            60  
+(Worker_TP0 pid=190) void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     190.620us         0.01%     190.620us       1.362us           140  
+(Worker_TP0 pid=190)                               _zero_kv_blocks_kernel.kd         0.00%       0.000us         0.00%       0.000us       0.000us     185.199us         0.01%     185.199us      92.599us             2  
+(Worker_TP0 pid=190) triton_poi_fused_add_bitwise_and_bitwise_not_bitwise...         0.02%     990.780us         0.02%       1.606ms      24.714us     162.976us         0.01%     162.976us       2.507us            65  
+(Worker_TP0 pid=190) -------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+(Worker_TP0 pid=190) Self CPU time total: 6.552s
+(Worker_TP0 pid=190) Self CUDA time total: 2.296s
+(Worker_TP0 pid=190) 
+[even] 1024 tokens in 6.57s = 155.9 tok/s aggregate (16 seqs x 64 decode)
+[even] traces dir: /profiles
+[even] traces:
+-rw-r--r-- 1 root root 23060017 Jun 19 21:14 /home/pat/code/vllm-gfx1201/profiling/straggler/even/even_dp0_pp0_tp0_dcp0_ep0_rank0.1781867668231249015.pt.trace.json.gz
+-rw-r--r-- 1 root root 23091342 Jun 19 21:14 /home/pat/code/vllm-gfx1201/profiling/straggler/even/even_dp0_pp0_tp1_dcp0_ep1_rank1.1781867668218035953.pt.trace.json.gz
+=== [het75] cuw='2,1'  W4A8=1  dev=0,1 ===
+[w4a8_fp8_wmma] registered at _POSSIBLE_KERNELS[ROCM][0]: ['RocmW4A8Fp8WmmaLinearKernel', 'TritonW4A16LinearKernel', 'ConchLinearKernel', 'ExllamaLinearKernel']
+[w4a8_fp8_wmma] AWQ MoE hook installed (gfx12x): supported AWQ-4bit asym experts -> grouped FP8-WMMA; GPTQ/CT via own hooks
+[w4a8_fp8_wmma] CT MoE hook installed (gfx12x): symmetric int4 experts -> grouped FP8-WMMA; AWQ/GPTQ/Marlin untouched
+[w4a8_fp8_wmma] WNA16 MoE hook installed (gfx12x): int4 AWQ/GPTQ fallback experts -> grouped FP8-WMMA; Marlin untouched
+[w4a8_fp8_wmma] GPTQ MoE hook installed (gfx12x): symmetric int4 experts -> grouped FP8-WMMA; AWQ/CT/Marlin untouched
+WARNING 06-19 11:15:45 [envs.py:2060] Unknown vLLM environment variable detected: VLLM_TP_CU_WEIGHTS
+WARNING 06-19 11:15:45 [envs.py:2060] Unknown vLLM environment variable detected: VLLM_ROCM_W4A8_FP8_WMMA_MOE
+WARNING 06-19 11:15:45 [envs.py:2060] Unknown vLLM environment variable detected: VLLM_ROCM_USE_W4A8_FP8_WMMA
+WARNING 06-19 11:15:45 [envs.py:2060] Unknown vLLM environment variable detected: VLLM_ROCM_W4A8_FP8_WMMA_MOE_VERSION
+WARNING 06-19 11:15:50 [model.py:2098] Casting torch.bfloat16 to torch.float16.
+WARNING 06-19 11:15:50 [quark_ocp_mx.py:142] AITER is not found or QuarkOCP_MX is not supported on the current platform. QuarkOCP_MX quantization will not be available.
+WARNING 06-19 11:15:51 [vllm.py:1033] Enforce eager set, disabling torch.compile and CUDAGraphs. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none
+WARNING 06-19 11:15:51 [vllm.py:1075] Inductor compilation was disabled by user settings, optimizations settings that are only active during inductor compilation will be ignored.
+`Qwen2VLImageProcessorFast` is deprecated. The `Fast` suffix for image processors has been removed; use `Qwen2VLImageProcessor` instead.
+WARNING 06-19 11:15:52 [system_utils.py:157] We must use the `spawn` multiprocessing start method. Overriding VLLM_WORKER_MULTIPROC_METHOD to 'spawn'. See https://docs.vllm.ai/en/latest/usage/troubleshooting.html#python-multiprocessing for more information. Reasons: CUDA is initialized
+(EngineCore pid=135) [w4a8_fp8_wmma] registered at _POSSIBLE_KERNELS[ROCM][0]: ['RocmW4A8Fp8WmmaLinearKernel', 'TritonW4A16LinearKernel', 'ConchLinearKernel', 'ExllamaLinearKernel']
+(EngineCore pid=135) [w4a8_fp8_wmma] AWQ MoE hook installed (gfx12x): supported AWQ-4bit asym experts -> grouped FP8-WMMA; GPTQ/CT via own hooks
+(EngineCore pid=135) [w4a8_fp8_wmma] CT MoE hook installed (gfx12x): symmetric int4 experts -> grouped FP8-WMMA; AWQ/GPTQ/Marlin untouched
+(EngineCore pid=135) [w4a8_fp8_wmma] WNA16 MoE hook installed (gfx12x): int4 AWQ/GPTQ fallback experts -> grouped FP8-WMMA; Marlin untouched
+(EngineCore pid=135) [w4a8_fp8_wmma] GPTQ MoE hook installed (gfx12x): symmetric int4 experts -> grouped FP8-WMMA; AWQ/CT/Marlin untouched
+(EngineCore pid=135) WARNING 06-19 11:15:57 [multiproc_executor.py:1033] Reducing Torch parallelism from 16 threads to 1 to avoid unnecessary CPU contention. Set OMP_NUM_THREADS in the external environment to tune this value as needed.
+`Qwen2VLImageProcessorFast` is deprecated. The `Fast` suffix for image processors has been removed; use `Qwen2VLImageProcessor` instead.
+`Qwen2VLImageProcessorFast` is deprecated. The `Fast` suffix for image processors has been removed; use `Qwen2VLImageProcessor` instead.
+[w4a8_fp8_wmma] registered at _POSSIBLE_KERNELS[ROCM][0]: ['RocmW4A8Fp8WmmaLinearKernel', 'TritonW4A16LinearKernel', 'ConchLinearKernel', 'ExllamaLinearKernel']
+[w4a8_fp8_wmma] AWQ MoE hook installed (gfx12x): supported AWQ-4bit asym experts -> grouped FP8-WMMA; GPTQ/CT via own hooks
+[w4a8_fp8_wmma] CT MoE hook installed (gfx12x): symmetric int4 experts -> grouped FP8-WMMA; AWQ/GPTQ/Marlin untouched
+[w4a8_fp8_wmma] WNA16 MoE hook installed (gfx12x): int4 AWQ/GPTQ fallback experts -> grouped FP8-WMMA; Marlin untouched
+[w4a8_fp8_wmma] GPTQ MoE hook installed (gfx12x): symmetric int4 experts -> grouped FP8-WMMA; AWQ/CT/Marlin untouched
+[w4a8_fp8_wmma] registered at _POSSIBLE_KERNELS[ROCM][0]: ['RocmW4A8Fp8WmmaLinearKernel', 'TritonW4A16LinearKernel', 'ConchLinearKernel', 'ExllamaLinearKernel']
+[w4a8_fp8_wmma] AWQ MoE hook installed (gfx12x): supported AWQ-4bit asym experts -> grouped FP8-WMMA; GPTQ/CT via own hooks
+[w4a8_fp8_wmma] CT MoE hook installed (gfx12x): symmetric int4 experts -> grouped FP8-WMMA; AWQ/GPTQ/Marlin untouched
+[w4a8_fp8_wmma] WNA16 MoE hook installed (gfx12x): int4 AWQ/GPTQ fallback experts -> grouped FP8-WMMA; Marlin untouched
+[w4a8_fp8_wmma] GPTQ MoE hook installed (gfx12x): symmetric int4 experts -> grouped FP8-WMMA; AWQ/CT/Marlin untouched
+(Worker_TP0 pid=190) WARNING 06-19 11:16:21 [activation.py:728] [ROCm] PyTorch's native GELU with tanh approximation is unstable. Falling back to GELU(approximate='none').
+(Worker_TP0 pid=190) WARNING 06-19 11:16:21 [awq_marlin.py:315] Layer 'language_model.model.layers.0.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 11:16:21 [awq_marlin.py:315] Layer 'language_model.model.layers.1.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 11:16:21 [awq_marlin.py:315] Layer 'language_model.model.layers.2.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 11:16:22 [awq_marlin.py:315] Layer 'language_model.model.layers.3.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 11:16:22 [awq_marlin.py:315] Layer 'language_model.model.layers.4.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 11:16:22 [awq_marlin.py:315] Layer 'language_model.model.layers.5.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 11:16:22 [awq_marlin.py:315] Layer 'language_model.model.layers.6.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 11:16:22 [awq_marlin.py:315] Layer 'language_model.model.layers.7.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 11:16:22 [awq_marlin.py:315] Layer 'language_model.model.layers.8.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 11:16:22 [awq_marlin.py:315] Layer 'language_model.model.layers.9.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 11:16:22 [awq_marlin.py:315] Layer 'language_model.model.layers.10.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 11:16:22 [awq_marlin.py:315] Layer 'language_model.model.layers.11.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 11:16:22 [awq_marlin.py:315] Layer 'language_model.model.layers.12.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 11:16:22 [awq_marlin.py:315] Layer 'language_model.model.layers.13.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 11:16:22 [awq_marlin.py:315] Layer 'language_model.model.layers.14.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 11:16:22 [awq_marlin.py:315] Layer 'language_model.model.layers.15.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 11:16:22 [awq_marlin.py:315] Layer 'language_model.model.layers.16.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 11:16:22 [awq_marlin.py:315] Layer 'language_model.model.layers.17.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 11:16:22 [awq_marlin.py:315] Layer 'language_model.model.layers.18.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 11:16:22 [awq_marlin.py:315] Layer 'language_model.model.layers.19.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 11:16:22 [awq_marlin.py:315] Layer 'language_model.model.layers.20.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 11:16:22 [awq_marlin.py:315] Layer 'language_model.model.layers.21.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 11:16:22 [awq_marlin.py:315] Layer 'language_model.model.layers.22.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 11:16:22 [awq_marlin.py:315] Layer 'language_model.model.layers.23.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 11:16:22 [awq_marlin.py:315] Layer 'language_model.model.layers.24.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 11:16:22 [awq_marlin.py:315] Layer 'language_model.model.layers.25.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 11:16:22 [awq_marlin.py:315] Layer 'language_model.model.layers.26.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 11:16:22 [awq_marlin.py:315] Layer 'language_model.model.layers.27.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 11:16:22 [awq_marlin.py:315] Layer 'language_model.model.layers.28.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 11:16:22 [awq_marlin.py:315] Layer 'language_model.model.layers.29.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 11:16:22 [awq_marlin.py:315] Layer 'language_model.model.layers.30.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 11:16:22 [awq_marlin.py:315] Layer 'language_model.model.layers.31.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 11:16:22 [awq_marlin.py:315] Layer 'language_model.model.layers.32.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 11:16:22 [awq_marlin.py:315] Layer 'language_model.model.layers.33.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 11:16:22 [awq_marlin.py:315] Layer 'language_model.model.layers.34.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 11:16:22 [awq_marlin.py:315] Layer 'language_model.model.layers.35.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 11:16:22 [awq_marlin.py:315] Layer 'language_model.model.layers.36.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 11:16:22 [awq_marlin.py:315] Layer 'language_model.model.layers.37.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 11:16:22 [awq_marlin.py:315] Layer 'language_model.model.layers.38.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) WARNING 06-19 11:16:22 [awq_marlin.py:315] Layer 'language_model.model.layers.39.mlp.experts' is not supported by AWQMoeMarlin. Falling back to Moe WNA16 kernels.
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [gpu_model_runner.py:5163] Failed to load model - not enough GPU memory. Try lowering --gpu-memory-utilization to free memory for weights, increasing --tensor-parallel-size, or using --quantization. See https://docs.vllm.ai/en/latest/configuration/conserving_memory/ for more tips. (original error: HIP out of memory. Tried to allocate 486.00 MiB. GPU 0 has a total capacity of 15.92 GiB of which 350.00 MiB is free. Of the allocated memory 15.06 GiB is allocated by PyTorch, and 15.63 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables))
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874] WorkerProc failed to start.
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874] Traceback (most recent call last):
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874]   File "/app/vllm/vllm/v1/executor/multiproc_executor.py", line 841, in worker_main
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874]     worker = WorkerProc(*args, **kwargs)
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874]              ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874]   File "/app/vllm/vllm/tracing/otel.py", line 178, in sync_wrapper
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874]     return func(*args, **kwargs)
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874]            ^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874]   File "/app/vllm/vllm/v1/executor/multiproc_executor.py", line 620, in __init__
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874]     self.worker.load_model()
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874]   File "/app/vllm/vllm/v1/worker/gpu_worker.py", line 345, in load_model
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874]     self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874]   File "/app/vllm/vllm/tracing/otel.py", line 178, in sync_wrapper
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874]     return func(*args, **kwargs)
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874]            ^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874]   File "/app/vllm/vllm/v1/worker/gpu_model_runner.py", line 5164, in load_model
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874]     raise e
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874]   File "/app/vllm/vllm/v1/worker/gpu_model_runner.py", line 5086, in load_model
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874]     self.model = model_loader.load_model(
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874]                  ^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874]   File "/app/vllm/vllm/tracing/otel.py", line 178, in sync_wrapper
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874]     return func(*args, **kwargs)
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874]            ^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874]   File "/app/vllm/vllm/model_executor/model_loader/base_loader.py", line 55, in load_model
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874]     model = initialize_model(
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874]             ^^^^^^^^^^^^^^^^^
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874]   File "/app/vllm/vllm/tracing/otel.py", line 178, in sync_wrapper
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874]     return func(*args, **kwargs)
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874]            ^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874]   File "/app/vllm/vllm/model_executor/model_loader/utils.py", line 61, in initialize_model
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874]     model = model_class(vllm_config=vllm_config, prefix=prefix)
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874]             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874]   File "/app/vllm/vllm/model_executor/models/qwen3_5.py", line 800, in __init__
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874]     self.language_model = Qwen3_5MoeForCausalLM(
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874]                           ^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874]   File "/app/vllm/vllm/model_executor/models/qwen3_5.py", line 535, in __init__
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874]     super().__init__(vllm_config=vllm_config, prefix=prefix)
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874]   File "/app/vllm/vllm/model_executor/models/qwen3_5.py", line 477, in __init__
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874]     self.lm_head = ParallelLMHead(
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874]                    ^^^^^^^^^^^^^^^
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874]   File "/app/vllm/vllm/model_executor/layers/vocab_parallel_embedding.py", line 539, in __init__
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874]     super().__init__(
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874]   File "/app/vllm/vllm/model_executor/layers/vocab_parallel_embedding.py", line 311, in __init__
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874]     self.quant_method.create_weights(
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874]   File "/app/vllm/vllm/model_executor/layers/vocab_parallel_embedding.py", line 50, in create_weights
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874]     torch.empty(
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874]   File "/app/.venv/lib/python3.12/site-packages/torch/utils/_device.py", line 109, in __torch_function__
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874]     return func(*args, **kwargs)
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874]            ^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP0 pid=190) ERROR 06-19 11:16:22 [multiproc_executor.py:874] torch.OutOfMemoryError: HIP out of memory. Tried to allocate 486.00 MiB. GPU 0 has a total capacity of 15.92 GiB of which 350.00 MiB is free. Of the allocated memory 15.06 GiB is allocated by PyTorch, and 15.63 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874] WorkerProc failed to start.
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874] Traceback (most recent call last):
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]   File "/app/vllm/vllm/v1/executor/multiproc_executor.py", line 841, in worker_main
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]     worker = WorkerProc(*args, **kwargs)
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]              ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]   File "/app/vllm/vllm/tracing/otel.py", line 178, in sync_wrapper
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]     return func(*args, **kwargs)
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]            ^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]   File "/app/vllm/vllm/v1/executor/multiproc_executor.py", line 620, in __init__
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]     self.worker.load_model()
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]   File "/app/vllm/vllm/v1/worker/gpu_worker.py", line 345, in load_model
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]     self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]   File "/app/vllm/vllm/tracing/otel.py", line 178, in sync_wrapper
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]     return func(*args, **kwargs)
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]            ^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]   File "/app/vllm/vllm/v1/worker/gpu_model_runner.py", line 5086, in load_model
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]     self.model = model_loader.load_model(
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]                  ^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]   File "/app/vllm/vllm/tracing/otel.py", line 178, in sync_wrapper
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]     return func(*args, **kwargs)
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]            ^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]   File "/app/vllm/vllm/model_executor/model_loader/base_loader.py", line 64, in load_model
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]     self.load_weights(model, model_config)
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]   File "/app/vllm/vllm/tracing/otel.py", line 178, in sync_wrapper
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]     return func(*args, **kwargs)
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]            ^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]   File "/app/vllm/vllm/model_executor/model_loader/default_loader.py", line 394, in load_weights
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]     loaded_weights = model.load_weights(self.get_all_weights(model_config, model))
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]   File "/app/vllm/vllm/model_executor/models/qwen3_5.py", line 675, in load_weights
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]     return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]   File "/app/vllm/vllm/model_executor/model_loader/reload/torchao_decorator.py", line 50, in patched_model_load_weights
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]     return original_load_weights(self, weights, *args, **kwargs)
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]   File "/app/vllm/vllm/model_executor/models/utils.py", line 353, in load_weights
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]     autoloaded_weights = set(self._load_module("", self.module, weights))
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]   File "/app/vllm/vllm/model_executor/models/utils.py", line 300, in _load_module
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]     yield from self._load_module(
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]   File "/app/vllm/vllm/model_executor/models/utils.py", line 273, in _load_module
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]     loaded_params = module_load_weights(weights)
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]   File "/app/vllm/vllm/model_executor/models/qwen3_5.py", line 526, in load_weights
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]     return loader.load_weights(weights)
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]   File "/app/vllm/vllm/model_executor/model_loader/reload/torchao_decorator.py", line 50, in patched_model_load_weights
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]     return original_load_weights(self, weights, *args, **kwargs)
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]   File "/app/vllm/vllm/model_executor/models/utils.py", line 353, in load_weights
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]     autoloaded_weights = set(self._load_module("", self.module, weights))
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]   File "/app/vllm/vllm/model_executor/models/utils.py", line 300, in _load_module
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]     yield from self._load_module(
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]   File "/app/vllm/vllm/model_executor/models/utils.py", line 273, in _load_module
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]     loaded_params = module_load_weights(weights)
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]   File "/app/vllm/vllm/model_executor/models/qwen3_5.py", line 397, in load_weights
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]     success = weight_loader(
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]               ^^^^^^^^^^^^^^
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]   File "/app/vllm/vllm/model_executor/layers/quantization/moe_wna16.py", line 496, in moe_wna16_weight_loader
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]     param.data[expert_id] = loaded_weight.view(
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874]     ~~~~~~~~~~^^^^^^^^^^^
+(Worker_TP1 pid=195) ERROR 06-19 11:16:22 [multiproc_executor.py:874] RuntimeError: The expanded size of the tensor (4) must match the existing size (8) at non-singleton dimension 1.  Target sizes: [1024, 4].  Tensor sizes: [1024, 8]
+[rank0]:[W619 11:16:23.238839402 ProcessGroupNCCL.cpp:1557] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())
+(EngineCore pid=135) ERROR 06-19 11:16:24 [core.py:1390] EngineCore failed to start.
+(EngineCore pid=135) ERROR 06-19 11:16:24 [core.py:1390] Traceback (most recent call last):
+(EngineCore pid=135) ERROR 06-19 11:16:24 [core.py:1390]   File "/app/vllm/vllm/v1/engine/core.py", line 1364, in run_engine_core
+(EngineCore pid=135) ERROR 06-19 11:16:24 [core.py:1390]     engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
+(EngineCore pid=135) ERROR 06-19 11:16:24 [core.py:1390]                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=135) ERROR 06-19 11:16:24 [core.py:1390]   File "/app/vllm/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=135) ERROR 06-19 11:16:24 [core.py:1390]     return func(*args, **kwargs)
+(EngineCore pid=135) ERROR 06-19 11:16:24 [core.py:1390]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=135) ERROR 06-19 11:16:24 [core.py:1390]   File "/app/vllm/vllm/v1/engine/core.py", line 1130, in __init__
+(EngineCore pid=135) ERROR 06-19 11:16:24 [core.py:1390]     super().__init__(
+(EngineCore pid=135) ERROR 06-19 11:16:24 [core.py:1390]   File "/app/vllm/vllm/v1/engine/core.py", line 133, in __init__
+(EngineCore pid=135) ERROR 06-19 11:16:24 [core.py:1390]     self.model_executor = executor_class(vllm_config)
+(EngineCore pid=135) ERROR 06-19 11:16:24 [core.py:1390]                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=135) ERROR 06-19 11:16:24 [core.py:1390]   File "/app/vllm/vllm/v1/executor/multiproc_executor.py", line 108, in __init__
+(EngineCore pid=135) ERROR 06-19 11:16:24 [core.py:1390]     super().__init__(vllm_config)
+(EngineCore pid=135) ERROR 06-19 11:16:24 [core.py:1390]   File "/app/vllm/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=135) ERROR 06-19 11:16:24 [core.py:1390]     return func(*args, **kwargs)
+(EngineCore pid=135) ERROR 06-19 11:16:24 [core.py:1390]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=135) ERROR 06-19 11:16:24 [core.py:1390]   File "/app/vllm/vllm/v1/executor/abstract.py", line 109, in __init__
+(EngineCore pid=135) ERROR 06-19 11:16:24 [core.py:1390]     self._init_executor()
+(EngineCore pid=135) ERROR 06-19 11:16:24 [core.py:1390]   File "/app/vllm/vllm/v1/executor/multiproc_executor.py", line 201, in _init_executor
+(EngineCore pid=135) ERROR 06-19 11:16:24 [core.py:1390]     self.workers = WorkerProc.wait_for_ready(unready_workers)
+(EngineCore pid=135) ERROR 06-19 11:16:24 [core.py:1390]                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=135) ERROR 06-19 11:16:24 [core.py:1390]   File "/app/vllm/vllm/v1/executor/multiproc_executor.py", line 748, in wait_for_ready
+(EngineCore pid=135) ERROR 06-19 11:16:24 [core.py:1390]     raise e from None
+(EngineCore pid=135) ERROR 06-19 11:16:24 [core.py:1390] Exception: WorkerProc initialization failed due to an exception in a background process. See stack trace for root cause.
+(EngineCore pid=135) Process EngineCore:
+(EngineCore pid=135) Traceback (most recent call last):
+(EngineCore pid=135)   File "/root/.local/share/uv/python/cpython-3.12.13-linux-x86_64-gnu/lib/python3.12/multiprocessing/process.py", line 314, in _bootstrap
+(EngineCore pid=135)     self.run()
+(EngineCore pid=135)   File "/root/.local/share/uv/python/cpython-3.12.13-linux-x86_64-gnu/lib/python3.12/multiprocessing/process.py", line 108, in run
+(EngineCore pid=135)     self._target(*self._args, **self._kwargs)
+(EngineCore pid=135)   File "/app/vllm/vllm/v1/engine/core.py", line 1394, in run_engine_core
+(EngineCore pid=135)     raise e
+(EngineCore pid=135)   File "/app/vllm/vllm/v1/engine/core.py", line 1364, in run_engine_core
+(EngineCore pid=135)     engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
+(EngineCore pid=135)                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=135)   File "/app/vllm/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=135)     return func(*args, **kwargs)
+(EngineCore pid=135)            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=135)   File "/app/vllm/vllm/v1/engine/core.py", line 1130, in __init__
+(EngineCore pid=135)     super().__init__(
+(EngineCore pid=135)   File "/app/vllm/vllm/v1/engine/core.py", line 133, in __init__
+(EngineCore pid=135)     self.model_executor = executor_class(vllm_config)
+(EngineCore pid=135)                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=135)   File "/app/vllm/vllm/v1/executor/multiproc_executor.py", line 108, in __init__
+(EngineCore pid=135)     super().__init__(vllm_config)
+(EngineCore pid=135)   File "/app/vllm/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=135)     return func(*args, **kwargs)
+(EngineCore pid=135)            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=135)   File "/app/vllm/vllm/v1/executor/abstract.py", line 109, in __init__
+(EngineCore pid=135)     self._init_executor()
+(EngineCore pid=135)   File "/app/vllm/vllm/v1/executor/multiproc_executor.py", line 201, in _init_executor
+(EngineCore pid=135)     self.workers = WorkerProc.wait_for_ready(unready_workers)
+(EngineCore pid=135)                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=135)   File "/app/vllm/vllm/v1/executor/multiproc_executor.py", line 748, in wait_for_ready
+(EngineCore pid=135)     raise e from None
+(EngineCore pid=135) Exception: WorkerProc initialization failed due to an exception in a background process. See stack trace for root cause.
+Traceback (most recent call last):
+  File "/tmp/het_profile_check.py", line 69, in <module>
+    main()
+  File "/tmp/het_profile_check.py", line 46, in main
+    llm = LLM(**kwargs)
+          ^^^^^^^^^^^^^
+  File "/app/vllm/vllm/entrypoints/llm.py", line 349, in __init__
+    self.llm_engine = LLMEngine.from_engine_args(
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/vllm/vllm/v1/engine/llm_engine.py", line 170, in from_engine_args
+    return cls(
+           ^^^^
+  File "/app/vllm/vllm/v1/engine/llm_engine.py", line 104, in __init__
+    self.engine_core = EngineCoreClient.make_client(
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/vllm/vllm/v1/engine/core_client.py", line 102, in make_client
+    return SyncMPClient(vllm_config, executor_class, log_stats)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/vllm/vllm/tracing/otel.py", line 178, in sync_wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/app/vllm/vllm/v1/engine/core_client.py", line 761, in __init__
+    super().__init__(
+  File "/app/vllm/vllm/v1/engine/core_client.py", line 573, in __init__
+    with launch_core_engines(
+         ^^^^^^^^^^^^^^^^^^^^
+  File "/root/.local/share/uv/python/cpython-3.12.13-linux-x86_64-gnu/lib/python3.12/contextlib.py", line 144, in __exit__
+    next(self.gen)
+  File "/app/vllm/vllm/v1/engine/utils.py", line 1150, in launch_core_engines
+    wait_for_engine_startup(
+  File "/app/vllm/vllm/v1/engine/utils.py", line 1209, in wait_for_engine_startup
+    raise RuntimeError(
+RuntimeError: Engine core initialization failed. See root cause above. Failed core proc(s): {}
+/root/.local/share/uv/python/cpython-3.12.13-linux-x86_64-gnu/lib/python3.12/multiprocessing/resource_tracker.py:279: UserWarning: resource_tracker: There appear to be 1 leaked shared_memory objects to clean up at shutdown
+  warnings.warn('resource_tracker: There appear to be %d '
+[het75] traces:
+  (NONE — check output above)
+DONE_STRAGGLER_SWEEP
+EXITCODE=0

@@ -1,0 +1,27 @@
+NCCL bench matrix  (W4A8=1, graphs on, bench defaults: 32 prompts x 128 out)
+===== [default]  env:   =====
+  [default] rc=0  out_tok_s=957.5  total_tok_s=2570.9
+===== [simple]  env: -e NCCL_PROTO=Simple -e RCCL_PROTO=Simple  =====
+  [simple] rc=0  out_tok_s=955.0  total_tok_s=2564.2
+===== [simple_ring]  env: -e NCCL_PROTO=Simple -e RCCL_PROTO=Simple -e NCCL_ALGO=Ring -e RCCL_ALGO=Ring  =====
+  [simple_ring] rc=0  out_tok_s=956.2  total_tok_s=2567.4
+===== [simple_nch1]  env: -e NCCL_PROTO=Simple -e RCCL_PROTO=Simple -e NCCL_MIN_NCHANNELS=1 -e RCCL_MIN_NCHANNELS=1  =====
+  [simple_nch1] rc=0  out_tok_s=954.6  total_tok_s=2563.1
+===== [simple_ring_nch1]  env: -e NCCL_PROTO=Simple -e RCCL_PROTO=Simple -e NCCL_ALGO=Ring -e RCCL_ALGO=Ring -e NCCL_MIN_NCHANNELS=1 -e RCCL_MIN_NCHANNELS=1  =====
+  [simple_ring_nch1] rc=0  out_tok_s=955.2  total_tok_s=2564.9
+DONE_NCCL_BENCH_MATRIX
+
+===== SUMMARY =====
+NCCL bench matrix  (W4A8=1, graphs on, bench defaults: 32 prompts x 128 out)
+===== [default]  env:   =====
+  [default] rc=0  out_tok_s=957.5  total_tok_s=2570.9
+===== [simple]  env: -e NCCL_PROTO=Simple -e RCCL_PROTO=Simple  =====
+  [simple] rc=0  out_tok_s=955.0  total_tok_s=2564.2
+===== [simple_ring]  env: -e NCCL_PROTO=Simple -e RCCL_PROTO=Simple -e NCCL_ALGO=Ring -e RCCL_ALGO=Ring  =====
+  [simple_ring] rc=0  out_tok_s=956.2  total_tok_s=2567.4
+===== [simple_nch1]  env: -e NCCL_PROTO=Simple -e RCCL_PROTO=Simple -e NCCL_MIN_NCHANNELS=1 -e RCCL_MIN_NCHANNELS=1  =====
+  [simple_nch1] rc=0  out_tok_s=954.6  total_tok_s=2563.1
+===== [simple_ring_nch1]  env: -e NCCL_PROTO=Simple -e RCCL_PROTO=Simple -e NCCL_ALGO=Ring -e RCCL_ALGO=Ring -e NCCL_MIN_NCHANNELS=1 -e RCCL_MIN_NCHANNELS=1  =====
+  [simple_ring_nch1] rc=0  out_tok_s=955.2  total_tok_s=2564.9
+DONE_NCCL_BENCH_MATRIX
+EXITCODE=0

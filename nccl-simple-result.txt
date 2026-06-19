@@ -1,0 +1,8 @@
+[watch] waiting for boot (startup-complete) or failure [name~nccl-simple]...
+[watch] container=58b18e78cc32 — sending one inference
+MODEL_ID: cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit
+COMPLETION: ' Paris, a city renowned for its rich history, culture, and iconic landmarks.'
+USAGE: {'prompt_tokens': 5, 'total_tokens': 21, 'completion_tokens': 16, 'prompt_tokens_details': None}
+[watch] inference exit=0
+[watch] tearing down container 58b18e78cc32 (releases lease)
+[watch] done
