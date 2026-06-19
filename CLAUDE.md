@@ -109,6 +109,37 @@ and configs. So **every** container run mounts the repo cache to `/root/.triton`
   `.triton-cache-combined` (already mounted by that profile). ZAYA support is additive (a no-op for
   the 35B W4A8/het-TP path); build `--build-arg WITH_ZAYA=0` for a leaner W4A8-only image.
 
+#### ⚠ docker-compose defaults to a COLD cache outside the main checkout — set the env (MANDATORY)
+`docker-compose.yml` mounts `${VLLM_HOST_TRITON_CACHE:-./.triton-cache-combined}` and
+`${HF_HOME:-./.hf-cache}` — **relative paths**. Run compose from any worktree other than the main
+checkout (e.g. the `gpu-lease` worktree) and those resolve to **empty/cold** dirs in that worktree
+→ a ~15-30 min cold GDN compile *and* an offline `LocalEntryNotFoundError` for the model. This has
+bitten us repeatedly. **Before any compose GPU run, export both** so they point at the real warm
+artifacts (or an isolated copy — see below):
+```
+export HF_HOME=/home/pat/.cache/huggingface
+export VLLM_HOST_TRITON_CACHE=<warm cache or a copy of it>      # see procedure below
+```
+
+#### Use the existing warm cache via an ISOLATED COPY (don't compile cold, don't corrupt production)
+The canonical warm cache `/home/pat/code/vllm-gfx1201/.triton-cache-combined` (~170-200 MB, the
+GDN/attention autotune) already exists — **reuse it; never pay the cold compile.** For a throwaway
+test/experiment image, mount a **copy** so concurrent compiles can't corrupt the shared production
+cache (the §3 race caveat). The cache is **root-owned** (written by the container as root), so a
+plain `cp` as your user silently copies only the few files it can read — **copy via a root
+container**:
+```
+docker run --rm -v /home/pat/code/vllm-gfx1201/.triton-cache-combined:/src:ro \
+  -v /home/pat/code/.triton-cache-<tag>:/dst --entrypoint sh vllm22-w4a8:combined \
+  -c 'rm -rf /dst/* 2>/dev/null; cp -a /src/. /dst/'
+export VLLM_HOST_TRITON_CACHE=/home/pat/code/.triton-cache-<tag>     # warm copy, isolated
+```
+The Triton cache is keyed by kernel-source hash, so it is reused **regardless of a W4A8 `.so`
+change** (that's a separate HIP extension, not a Triton kernel) — a fused/variant image still hits
+the warm GDN/attention entries. Verify warmth: `find <dir> -name '*.json' | wc -l` should be ~1800+,
+and a boot should reach "Application startup complete" in ~2-5 min, not 30. Put the copy on real
+disk under `/home/pat/code` (never tmpfs — it's lost on reboot).
+
 ### 3. When NOT to reuse the cache (the caveat — start a fresh dir instead)
 Reusing across an **incompatible toolchain** can load a stale/wrong kernel and crash or
 silently misbehave. Use a new cache dir (or wipe the per-image one) when:
