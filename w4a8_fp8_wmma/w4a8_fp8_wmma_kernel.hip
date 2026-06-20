@@ -42,6 +42,7 @@
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <rocwmma/rocwmma.hpp>
+#include "kernel_names.h"   // w4a8::DenseKernel / dense_kernel_valid (opaque-int ABI tags)
 
 namespace w4a8_fp8_wmma {
 
@@ -2472,9 +2473,11 @@ void launch_mmq_fp8_gemm_gfx1201(
     const at::Tensor& scales,
     const at::Tensor& w_zeros,
     at::Tensor& out,
-    int64_t version) {
+    int64_t kernel) {
 
     using namespace w4a8_fp8_wmma;
+    using DK = w4a8::DenseKernel;
+    const DK dk = static_cast<DK>(kernel);   // opaque int -> scoped tag (values == old version ints)
 
     const int M = x.size(0);
     const int K = x.size(1);
@@ -2487,13 +2490,13 @@ void launch_mmq_fp8_gemm_gfx1201(
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    // The dispatched WMMA path (v5/v10) FUSES the activation fp8-quant into the
-    // GEMM prologue (per-row amax + e4m3 expand in-kernel), so it consumes the
-    // fp16 activations directly -- no separate launch, no (M,K) x_fp8 HBM
-    // round-trip. Every other (non-dispatched) version still uses the standalone
-    // pre-kernel + x_fp8 buffer below.
+    // The dispatched WMMA path (prefill_wmma / prefill_wmma_ashuffle) FUSES the
+    // activation fp8-quant into the GEMM prologue (per-row amax + e4m3 expand
+    // in-kernel), so it consumes the fp16 activations directly -- no separate
+    // launch, no (M,K) x_fp8 HBM round-trip. Every other (non-dispatched) kernel
+    // still uses the standalone pre-kernel + x_fp8 buffer below.
     const __half* x_h = reinterpret_cast<const __half*>(x.data_ptr<at::Half>());
-    const bool fused_actquant = (version == 5 || version == 10);
+    const bool fused_actquant = (dk == DK::PrefillWmma || dk == DK::PrefillWmmaAshuffle);
     at::Tensor x_fp8, act_scales;
     if (!fused_actquant) {
         x_fp8 = at::empty({M, K}, x.options().dtype(at::kByte));
@@ -2505,7 +2508,7 @@ void launch_mmq_fp8_gemm_gfx1201(
     const int* w_zeros_ptr = (w_zeros.defined() && w_zeros.numel() > 0)
                              ? w_zeros.data_ptr<int>() : nullptr;
 
-    if (version == 13) {
+    if (dk == DK::RegdirectShuffle) {  // v13
         // small-M register-direct WMMA (no B-LDS) + split-K. CFG VLLM_W4A8_V13_CFG
         // (BMxBN, def 16x64), VLLM_W4A8_V13_SPLITK (def 8). fp32 atomic -> fp16.
         int bm = 16, bn = 64, splitk = 8;
@@ -2537,7 +2540,7 @@ void launch_mmq_fp8_gemm_gfx1201(
         cvt_f32_f16_kernel<<<dim3((ne + 255) / 256), dim3(256), 0, stream>>>(
             out_acc.data_ptr<float>(),
             reinterpret_cast<__half*>(out.data_ptr<at::Half>()), ne);
-    } else if (version == 14) {
+    } else if (dk == DK::NsplitSmallm) {  // v14
         // small-M WMMA, N-split warps + split-K. CFG VLLM_W4A8_V14_CFG (BNxNWARPS,
         // def 128x8), VLLM_W4A8_V14_SPLITK (def 4). fp32 atomic -> fp16.
         TORCH_CHECK(group_size == 128 || group_size == 32,
@@ -2582,7 +2585,7 @@ void launch_mmq_fp8_gemm_gfx1201(
         cvt_f32_f16_kernel<<<dim3((ne + 255) / 256), dim3(256), 0, stream>>>(
             out_acc.data_ptr<float>(),
             reinterpret_cast<__half*>(out.data_ptr<at::Half>()), ne);
-    } else if (version == 12) {
+    } else if (dk == DK::SplitkSmallm) {  // v12
         // small-M split-K WMMA. CFG VLLM_W4A8_V12_CFG (BMxBN, def 64x64),
         // VLLM_W4A8_V12_SPLITK (def 8). fp32 atomic accumulate -> cast to fp16.
         TORCH_CHECK(group_size == 128 || group_size == 32,
@@ -2616,7 +2619,7 @@ void launch_mmq_fp8_gemm_gfx1201(
         cvt_f32_f16_kernel<<<dim3((ne + 255) / 256), dim3(256), 0, stream>>>(
             out_acc.data_ptr<float>(),
             reinterpret_cast<__half*>(out.data_ptr<at::Half>()), ne);
-    } else if (version == 11) {
+    } else if (dk == DK::DecodeGemv) {  // v11
         // v11: decode GEMV, K-TILED. one warp per output column; streams weights.
         TORCH_CHECK(K % 1024 == 0, "v11 needs K % 1024 == 0; got ", K);
         TORCH_CHECK(group_size % 32 == 0, "v11 needs group_size % 32; got ", group_size);
@@ -2645,7 +2648,7 @@ void launch_mmq_fp8_gemm_gfx1201(
         else if (nw == 16) L(mmq_fp8_gemv_kernel_v11<16, 16>);
         else if (nw == 32) L(mmq_fp8_gemv_kernel_v11<32, 16>);
         else TORCH_CHECK(false, "V11_NW must be 8/16/32");
-    } else if (version == 10) {
+    } else if (dk == DK::PrefillWmmaAshuffle) {  // v10
         // v10: A out of LDS (warp-shuffle transpose) -> B-only LDS -> double-buffer
         // B at the full BM=256/BN=128 tile. CFG VLLM_W4A8_V10_CFG (def 256x128),
         // DB via VLLM_W4A8_V10_DB (def 1), swiz via VLLM_W4A8_V7_SWIZ.
@@ -2691,7 +2694,7 @@ void launch_mmq_fp8_gemm_gfx1201(
         else TORCH_CHECK(false, "unsupported V10_CFG ", bm, "x", bn);
         #undef V10_BKT
         #undef V10_L
-    } else if (version == 9) {
+    } else if (dk == DK::WmmaDbuf2) {  // v9
         // v9: decoupled-depth double-buffer; keeps BM=256/BN=128 8-acc tile.
         // Needs a compile-time group size (32 or 128). CFG VLLM_W4A8_V9_CFG.
         TORCH_CHECK(group_size == 128 || group_size == 32,
@@ -2726,7 +2729,7 @@ void launch_mmq_fp8_gemm_gfx1201(
         else if (bm == 256 && bn == 64) V9_BKT(256, 64);
         else TORCH_CHECK(false, "unsupported V9_CFG ", bm, "x", bn);
         #undef V9_BKT
-    } else if (version == 8) {
+    } else if (dk == DK::WmmaDbuf) {  // v8
         // v8: double-buffered (overlap staging with compute, 1 barrier/group).
         // CFG via VLLM_W4A8_V8_CFG="BMxBN" (default 96x128 — the largest BM that
         // fits 2x LDS at BN=128/G=128 in 64KB while keeping 8-acc ILP).
@@ -2760,7 +2763,7 @@ void launch_mmq_fp8_gemm_gfx1201(
         else if (bm == 256 && bn == 128) V8_LAUNCH(256, 128);  // only fits small G
         else TORCH_CHECK(false, "unsupported V8_CFG ", bm, "x", bn);
         #undef V8_LAUNCH
-    } else if (version == 7) {
+    } else if (dk == DK::WmmaTiledTuned) {  // v7
         // v7: v5 algorithm, templated (BM x BN) tile + dynamic LDS, to sweep
         // occupancy (tile size) AND WMMA-ILP depth (BN/16 = independent accs per
         // warp; peak needs ~8). Config via VLLM_W4A8_V7_CFG = "BMxBN"
@@ -2814,7 +2817,7 @@ void launch_mmq_fp8_gemm_gfx1201(
         else if (bm == 256 && bn == 192) V7_BKT(256, 192);
         else TORCH_CHECK(false, "unsupported V7_CFG ", bm, "x", bn);
         #undef V7_BKT
-    } else if (version == 6) {
+    } else if (dk == DK::PrefillWmmaB128) {  // v6
         // v6: K-extension -- b128 dual-subtile loads + 2 WMMAs per load.
         // Requires group_size % 32 == 0; pad must be a multiple of 16 for the
         // b128 alignment / row stride. Sweepable via VLLM_W4A8_V6_PAD (def 16).
@@ -2838,7 +2841,7 @@ void launch_mmq_fp8_gemm_gfx1201(
             w_zeros_ptr,
             reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
             M, N, K, group_size, lds_pad);
-    } else if (version == 5) {
+    } else if (dk == DK::PrefillWmma) {  // v5
         // v5: raw fp8 WMMA builtin + direct K-major int2 loads.
         // Fused act-quant (fp16 in, e4m3 in A_tile during staging).
         dim3 block(V2_NWARPS * 32);
@@ -2850,7 +2853,7 @@ void launch_mmq_fp8_gemm_gfx1201(
             w_zeros_ptr,
             reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
             M, N, K, group_size);
-    } else if (version == 4) {
+    } else if (dk == DK::RocwmmaPipe) {  // v4
         // v4: single-buffer staging + kt-level fragment pipelining.
         dim3 block(V2_NWARPS * 32);
         dim3 grid((N + V2_BN - 1) / V2_BN, (M + V2_BM - 1) / V2_BM);
@@ -2862,7 +2865,7 @@ void launch_mmq_fp8_gemm_gfx1201(
             w_zeros_ptr,
             reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
             M, N, K, group_size);
-    } else if (version == 2) {
+    } else if (dk == DK::RocwmmaTiled) {  // v2
         // v2: optimized tiled fp8 WMMA (BM x BN tile, 4 warps, register accum).
         dim3 block(V2_NWARPS * 32);
         dim3 grid((N + V2_BN - 1) / V2_BN, (M + V2_BM - 1) / V2_BM);
@@ -2874,7 +2877,7 @@ void launch_mmq_fp8_gemm_gfx1201(
             w_zeros_ptr,
             reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
             M, N, K, group_size);
-    } else if (version == 1) {
+    } else if (dk == DK::RocwmmaV1) {  // v1
         // v1: rocWMMA fp8 16x16x16, one wave32 warp per 16x16 output tile.
         dim3 block(32);
         dim3 grid((N + WMMA_DIM - 1) / WMMA_DIM, (M + WMMA_DIM - 1) / WMMA_DIM);

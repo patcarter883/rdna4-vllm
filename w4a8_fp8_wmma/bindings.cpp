@@ -1,9 +1,11 @@
 // torch bindings for the W4A8-FP8 MMQ HIP custom op (gfx1201 / RDNA4).
 //
 // Exposes torch.ops.w4a8_fp8_wmma.mmq_fp8_gemm(x, w_packed, scales, w_zeros,
-// version) -> out.
+// kernel) -> out.
 //
-//   version: 0 = v0 scalar fp8 reference (always correct), 1 = v1 WMMA (stub).
+//   kernel: an opaque DenseKernel id (kernel_names.h); enum values equal the old
+//   version ints (0 = reference_scalar golden, 5 = prefill_wmma, 10 = ashuffle,
+//   11 = decode_gemv, ...). Descriptive NAMES live above the ABI in __init__.py.
 //
 // Tensor contracts (match vLLM compressed_tensors_wNa16 / the gfx1151 ref):
 //   x         : (M, K)        fp16,  CUDA, contiguous
@@ -23,7 +25,7 @@ void launch_mmq_fp8_gemm_gfx1201(
     const at::Tensor& scales,
     const at::Tensor& w_zeros,
     at::Tensor& out,
-    int64_t version);
+    int64_t kernel);
 
 void launch_mmq_fp8_gemm_v15_gfx1201(
     const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
@@ -94,7 +96,7 @@ at::Tensor mmq_fp8_gemm_forward(
     const at::Tensor& w_packed,
     const at::Tensor& scales,
     const at::Tensor& w_zeros,
-    int64_t version) {
+    int64_t kernel) {
 
     TORCH_CHECK(x.is_cuda() && w_packed.is_cuda() && scales.is_cuda(),
                 "x, w_packed, scales must be CUDA");
@@ -119,9 +121,10 @@ at::Tensor mmq_fp8_gemm_forward(
                 "K not divisible by scales' K dim");
     TORCH_CHECK(group_size % 16 == 0 && group_size <= 128,
                 "group_size must be a multiple of 16 and <= 128; got ", group_size);
-    TORCH_CHECK(version >= 0 && version <= 14,
-                "version must be 0..14 (7 = tile/ILP, 10 = A-shuffle prefill, 11 = "
-                "decode GEMV, 12 = split-K, 13 = register-direct, 14 = N-split small-M)");
+    TORCH_CHECK(w4a8::dense_kernel_valid(kernel),
+                "dense kernel id invalid (got ", kernel, "); must be a DenseKernel "
+                "value 0..14 (rejecting the retired v3 gap) — see kernel_names.h. "
+                "Names live above the torch ABI in __init__.py.");
 
     if (w_zeros.defined() && w_zeros.numel() > 0) {
         TORCH_CHECK(w_zeros.is_cuda() && w_zeros.scalar_type() == at::kInt,
@@ -132,7 +135,7 @@ at::Tensor mmq_fp8_gemm_forward(
     }
 
     auto out = at::empty({M, N}, x.options());
-    launch_mmq_fp8_gemm_gfx1201(x, w_packed, scales, w_zeros, out, version);
+    launch_mmq_fp8_gemm_gfx1201(x, w_packed, scales, w_zeros, out, kernel);
     return out;
 }
 
@@ -374,7 +377,7 @@ at::Tensor mmq_fp8_moe_gather_reduce_forward(
 // "unsupported operator: w4a8_fp8_wmma.*" the moment the kernel actually engages).
 // The matching fake/meta kernels (output-shape inference) live in __init__.py.
 TORCH_LIBRARY(w4a8_fp8_wmma, m) {
-    m.def("mmq_fp8_gemm(Tensor x, Tensor w_packed, Tensor scales, Tensor w_zeros, int version) -> Tensor",
+    m.def("mmq_fp8_gemm(Tensor x, Tensor w_packed, Tensor scales, Tensor w_zeros, int kernel) -> Tensor",
           {at::Tag::pt2_compliant_tag});
     m.def("mmq_fp8_gemm_v15(Tensor x, Tensor w_rep, Tensor scales, Tensor w_zeros, int N) -> Tensor",
           {at::Tag::pt2_compliant_tag});
@@ -413,5 +416,5 @@ TORCH_LIBRARY_IMPL(w4a8_fp8_wmma, CUDA, m) {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "W4A8-FP8 MMQ kernel for gfx1201. "
-              "torch.ops.w4a8_fp8_wmma.mmq_fp8_gemm(x, w_packed, scales, w_zeros, version)";
+              "torch.ops.w4a8_fp8_wmma.mmq_fp8_gemm(x, w_packed, scales, w_zeros, kernel)";
 }

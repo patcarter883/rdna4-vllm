@@ -9,6 +9,32 @@ from . import _C  # noqa: F401
 # not a name. Hard-break: a removed numeric value (e.g. 5) raises, never mis-dispatches.
 _MOE_KERNELS = {"scalar": 0, "wmma": 6, "gemv": 7}
 
+# Dense mmq_fp8_gemm kernels — names ↔ the opaque DenseKernel ints (kernel_names.h).
+# Enum values equal the old version ints; the v3 gap is absent. Served names are
+# reference_scalar(0) / prefill_wmma(5) / prefill_wmma_ashuffle(10) / decode_gemv(11);
+# the rest are retired research kernels kept for benches. (The register-direct
+# v15/16/17 are SEPARATE ops, not values here.)
+_DENSE_KERNELS = {
+    "reference_scalar": 0, "rocwmma_v1": 1, "rocwmma_tiled": 2, "rocwmma_pipe": 4,
+    "prefill_wmma": 5, "prefill_wmma_b128": 6, "wmma_tiled_tuned": 7, "wmma_dbuf": 8,
+    "wmma_dbuf2": 9, "prefill_wmma_ashuffle": 10, "decode_gemv": 11,
+    "splitk_smallm": 12, "regdirect_shuffle": 13, "nsplit_smallm": 14,
+}
+
+
+def _resolve_dense_kernel(kernel) -> int:
+    """Map a descriptive dense kernel name to its op id; reject unknowns/legacy ints."""
+    if isinstance(kernel, str):
+        try:
+            return _DENSE_KERNELS[kernel]
+        except KeyError:
+            raise ValueError(
+                f"unknown dense kernel {kernel!r}; known: {sorted(_DENSE_KERNELS)}"
+            ) from None
+    raise TypeError(
+        f"dense kernel must be a name in {sorted(_DENSE_KERNELS)} (the integer "
+        f"'version' was removed); got {kernel!r}")
+
 
 def _resolve_moe_kernel(kernel) -> int:
     """Map a descriptive MoE kernel name to its op id; reject unknowns/legacy ints."""
@@ -35,7 +61,7 @@ def mmq_fp8_gemm(
     x: torch.Tensor,
     w_packed: torch.Tensor,
     scales: torch.Tensor,
-    version: int = 0,
+    kernel: str = "reference_scalar",
     w_zeros: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """W4A8-FP8 MMQ kernel for gfx1201 (RDNA4).
@@ -44,8 +70,9 @@ def mmq_fp8_gemm(
         x: (M, K) fp16 activations.
         w_packed: (N, K/8) int32 weights, 8 uint4b8 per int32, low nibble first.
         scales: (N, K/32) fp16 per-group weight scales.
-        version: 0 = scalar fp8 reference (always correct, slow);
-                 1 = WMMA + LDS staging (on-device WIP).
+        kernel: descriptive dense-kernel name (see _DENSE_KERNELS); default
+                "reference_scalar" (the scalar fp8 golden). Served names are
+                "prefill_wmma" / "prefill_wmma_ashuffle" / "decode_gemv".
         w_zeros: optional (N/8, K/32) int32 packed per-group zero points for
                  asymmetric (AWQ) quant; None for symmetric uint4b8 (zp=8).
 
@@ -54,7 +81,8 @@ def mmq_fp8_gemm(
     """
     if w_zeros is None:
         w_zeros = torch.empty(0, dtype=torch.int32, device=x.device)
-    return torch.ops.w4a8_fp8_wmma.mmq_fp8_gemm(x, w_packed, scales, w_zeros, version)
+    return torch.ops.w4a8_fp8_wmma.mmq_fp8_gemm(
+        x, w_packed, scales, w_zeros, _resolve_dense_kernel(kernel))
 
 
 def mmq_fp8_moe_gemm(
@@ -218,7 +246,7 @@ def mmq_fp8_moe_gather_reduce(out2, sorted_token_ids, topk_weights,
 _register_fake = getattr(getattr(torch, "library", None), "register_fake", None)
 if _register_fake is not None:  # torch >= 2.4 (base is 2.10)
     @_register_fake("w4a8_fp8_wmma::mmq_fp8_gemm")
-    def _fake_mmq_fp8_gemm(x, w_packed, scales, w_zeros, version):
+    def _fake_mmq_fp8_gemm(x, w_packed, scales, w_zeros, kernel):
         return x.new_empty((x.shape[0], w_packed.shape[0]), dtype=torch.float16)
 
     @_register_fake("w4a8_fp8_wmma::mmq_fp8_gemm_v15")

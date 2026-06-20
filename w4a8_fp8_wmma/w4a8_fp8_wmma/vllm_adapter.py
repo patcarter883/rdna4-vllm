@@ -198,7 +198,8 @@ def _autotune_crossover(layer: torch.nn.Module, w_q_name: str,
     ratios = {}
     for m in _AUTOTUNE_MGRID:
         x = (torch.randn(m, K, device=dev) * 0.4).to(torch.float16)
-        t_o = _ms(lambda: torch.ops.w4a8_fp8_wmma.mmq_fp8_gemm(x, w_q, w_s, empty, 10))
+        t_o = _ms(lambda: w4a8_fp8_wmma.mmq_fp8_gemm(
+            x, w_q, w_s, kernel="prefill_wmma_ashuffle", w_zeros=empty))
         t_t = _ms(lambda: triton_w4a16_gemm(x, tri_bq, tri_s, tri_zp, group, 8))
         ratios[m] = t_o / t_t if t_t > 0 else None
     co = _winning_suffix_crossover(ratios)
@@ -276,7 +277,8 @@ def _w4a8_dense_apply(
     weight_type_bias: int,
     cached_min_m: int,
 ) -> torch.Tensor:
-    """Version-ladder dispatch for one dense W4A8 linear. Operates on 2D (M,K)
+    """Per-M kernel-name ladder dispatch for one dense W4A8 linear (decode_gemv /
+    prefill_wmma_ashuffle / prefill_wmma, else Triton). Operates on 2D (M,K)
     activations, returns (M,N) fp16. Body identical to the former apply_weights
     ladder; see _force_mode/_layout_mode for the env gates. Returns fp16 always so the
     registered fake's dtype is exact regardless of which sub-kernel runs."""
@@ -290,40 +292,46 @@ def _w4a8_dense_apply(
     if x2d.dtype != torch.float16:
         x2d = x2d.to(torch.float16)
     gs = group_size
-    v10_ok = gs in (32, 128)
-    v11_ok = (K % 1024 == 0) and (gs % 32 == 0) and (M <= 16)
+    # Served dense kernels by NAME (kernel_names.h / __init__._DENSE_KERNELS):
+    # decode_gemv (v11), prefill_wmma_ashuffle (v10), prefill_wmma (v5).
+    ashuffle_ok = gs in (32, 128)
+    gemv_ok = (K % 1024 == 0) and (gs % 32 == 0) and (M <= 16)
     decode_max = int(os.environ.get("VLLM_ROCM_W4A8_DECODE_MAX_M", "2"))
-    v10_min = int(os.environ.get("VLLM_ROCM_W4A8_V10_MIN_M", "256"))
+    prefill_min_env = int(os.environ.get("VLLM_ROCM_W4A8_PREFILL_MIN_M", "256"))
     cached = cached_min_m
-    prefill_min = min(cached, v10_min) if v10_ok else cached
+    prefill_min = min(cached, prefill_min_env) if ashuffle_ok else cached
 
-    use_v11 = v11_ok and M <= decode_max
-    use_v10 = (not use_v11) and v10_ok and M >= prefill_min
-    use_v5 = (not use_v11) and (not use_v10) and M >= cached
+    use_gemv = gemv_ok and M <= decode_max
+    use_ashuffle = (not use_gemv) and ashuffle_ok and M >= prefill_min
+    use_prefill = (not use_gemv) and (not use_ashuffle) and M >= cached
 
     have_fallback = tri_bq is not None
     force = _force_mode()
     if force == "off" and have_fallback:
-        use_v11 = use_v10 = use_v5 = False
-    elif (force == "on" or not have_fallback) and not (use_v11 or use_v10 or use_v5):
-        if v10_ok:
-            use_v10 = True
+        use_gemv = use_ashuffle = use_prefill = False
+    elif (force == "on" or not have_fallback) and not (use_gemv or use_ashuffle or use_prefill):
+        if ashuffle_ok:
+            use_ashuffle = True
         else:
-            use_v5 = True
+            use_prefill = True
 
-    # v6 (b128 double-K) RETIRED 2026-06-15: the unified all-versions bench
-    # (profiling/all-versions-bench/) showed v6 loses to v5 at every measured
-    # (shape, M) cell and never approaches v10 — the b128 double-K LDS trick does
-    # not pay on gfx1201. Its _v6_band gate is removed; v6 is research-only now.
+    # prefill_wmma_b128 (v6, b128 double-K) RETIRED 2026-06-15: the unified
+    # all-versions bench (profiling/all-versions-bench/) showed it loses to
+    # prefill_wmma (v5) at every measured (shape, M) cell and never approaches
+    # prefill_wmma_ashuffle (v10) — the b128 double-K LDS trick does not pay on
+    # gfx1201. Its _v6_band gate is removed; the kernel is research-only now.
 
-    if use_v11 or use_v10 or use_v5:
+    if use_gemv or use_ashuffle or use_prefill:
+        import w4a8_fp8_wmma  # named dense wrapper (module-cached; eager in this op)
         x16 = x2d  # already fp16 (downcast at top -> activation-dtype-agnostic)
         if zero_points and w_zp is not None:
             zp_in = w_zp
         else:
             zp_in = torch.empty(0, dtype=torch.int32, device=x2d.device)
-        ver = 11 if use_v11 else (10 if use_v10 else 5)
-        out = torch.ops.w4a8_fp8_wmma.mmq_fp8_gemm(x16, w_q, w_s, zp_in, ver)
+        kernel = ("decode_gemv" if use_gemv
+                  else "prefill_wmma_ashuffle" if use_ashuffle
+                  else "prefill_wmma")
+        out = w4a8_fp8_wmma.mmq_fp8_gemm(x16, w_q, w_s, kernel=kernel, w_zeros=zp_in)
     else:
         if M <= 32 and gs > 64:
             from w4a8_fp8_wmma.triton_w4a16_gfx1201 import (

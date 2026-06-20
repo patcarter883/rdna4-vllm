@@ -15,6 +15,29 @@ import os
 
 _REGISTERED = False
 
+# De-numbered env vars whose old numeric names are REMOVED. A stale numeric
+# override must fail loudly, never silently mis-dispatch / fall back to stock.
+_REMOVED_W4A8_ENV = {
+    "VLLM_ROCM_W4A8_FP8_WMMA_MOE_VERSION":
+        "use VLLM_ROCM_W4A8_FP8_WMMA_MOE_KERNEL=wmma|scalar|gemv "
+        "(A-residence, formerly v5-vs-v6, is now VLLM_W4A8_MOE_A_IN_LDS)",
+    "VLLM_ROCM_W4A8_V10_MIN_M":
+        "use VLLM_ROCM_W4A8_PREFILL_MIN_M (same int threshold, renamed)",
+}
+
+
+def _check_removed_w4a8_env() -> None:
+    """Hard-break for de-numbered env vars, at the one LOUD chokepoint. vLLM's
+    load_general_plugins() calls register() UNWRAPPED (only the plugin *import* is
+    try/excepted), so a raise here crashes boot — whereas a raise inside the
+    register_moe* hooks is swallowed by register()'s own try/except below (logged,
+    then MoE silently falls to stock). Covers BOTH the MoE (MOE_VERSION) and dense
+    (V10_MIN_M) renames so neither stale override can silently change behavior."""
+    bad = [f"{k} is removed — {why}"
+           for k, why in _REMOVED_W4A8_ENV.items() if k in os.environ]
+    if bad:
+        raise RuntimeError("[w4a8_fp8_wmma] removed env var(s) set: " + "; ".join(bad))
+
 
 def register(verbose: bool = True) -> bool:
     """Prepend RocmW4A8Fp8WmmaLinearKernel to _POSSIBLE_KERNELS[ROCM].
@@ -30,6 +53,10 @@ def register(verbose: bool = True) -> bool:
         if verbose:
             print("[w4a8_fp8_wmma] disabled via VLLM_ROCM_USE_W4A8_FP8_WMMA=0")
         return False
+
+    # Loud hard-break BEFORE any try/except below (register() is called unwrapped
+    # by vLLM's plugin loader, so this raise crashes boot as intended).
+    _check_removed_w4a8_env()
 
     # Ensure the op is loaded.
     import w4a8_fp8_wmma  # noqa: F401

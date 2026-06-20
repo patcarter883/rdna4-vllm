@@ -119,7 +119,7 @@ def reference_fp8_model_asym(x, w_packed, scales, zeros, group_size=32):
     return (out * a_scale).to(torch.float16)
 
 
-def run_one_asym(M, N, K, version=0, group_size=32, atol=0.15, rtol=0.03,
+def run_one_asym(M, N, K, kernel="reference_scalar", group_size=32, atol=0.15, rtol=0.03,
                  mean_tol=2e-3, mean_rtol=0.01, x_scale=1.0):
     """Asymmetric (AWQ) variant of run_one: random per-(col,group) zero points,
     packed into the op's (N//8, K//group) layout and passed as w_zeros.
@@ -130,7 +130,7 @@ def run_one_asym(M, N, K, version=0, group_size=32, atol=0.15, rtol=0.03,
     activation noise scales with them; a fixed absolute mean_tol calibrated for
     small outputs would false-fail. mean_rtol=1% still catches real logic bugs
     (a dropped/wrong zero point shifts the mean by O(|ref|))."""
-    print(f"\n=== v{version} ASYM: M={M}, N={N}, K={K}, g={group_size} ===")
+    print(f"\n=== {kernel} ASYM: M={M}, N={N}, K={K}, g={group_size} ===")
     device = torch.device("cuda")
     x = torch.randn(M, K, dtype=torch.float16, device=device) * x_scale
     w_int4 = torch.randint(0, 16, (N, K), dtype=torch.int8, device=device)
@@ -143,7 +143,7 @@ def run_one_asym(M, N, K, version=0, group_size=32, atol=0.15, rtol=0.03,
 
     out_ref = reference_fp8_model_asym(x, w_packed, scales, zeros, group_size)
     out_ours = w4a8_fp8_wmma.mmq_fp8_gemm(
-        x, w_packed, scales, version=version, w_zeros=zeros_packed)
+        x, w_packed, scales, kernel=kernel, w_zeros=zeros_packed)
 
     diff = (out_ours.float() - out_ref.float()).abs()
     ref = out_ref.float().abs()
@@ -161,7 +161,7 @@ def run_one_asym(M, N, K, version=0, group_size=32, atol=0.15, rtol=0.03,
     return ok
 
 
-def run_one(M, N, K, version=0, group_size=32, atol=0.15, rtol=0.03, mean_tol=2e-3, x_scale=1.0):
+def run_one(M, N, K, kernel="reference_scalar", group_size=32, atol=0.15, rtol=0.03, mean_tol=2e-3, x_scale=1.0):
     """Pass criteria reflect the fp8 precision regime:
       - mean_abs is the global correctness signal (a real bug shows a systematic
         offset and blows this up); held to mean_tol.
@@ -169,7 +169,7 @@ def run_one(M, N, K, version=0, group_size=32, atol=0.15, rtol=0.03, mean_tol=2e
         sign-cancelling fp32 sums, are dominated by fp8 rounding noise where the
         HW cvt and torch's fp8 cast disagree by ~1 ULP. rtol covers larger outputs.
     """
-    print(f"\n=== v{version}: M={M}, N={N}, K={K} ===")
+    print(f"\n=== {kernel}: M={M}, N={N}, K={K} ===")
     device = torch.device("cuda")
     x = torch.randn(M, K, dtype=torch.float16, device=device) * x_scale
     w_int4 = torch.randint(0, 16, (N, K), dtype=torch.int8, device=device)
@@ -177,7 +177,7 @@ def run_one(M, N, K, version=0, group_size=32, atol=0.15, rtol=0.03, mean_tol=2e
     scales = torch.randn(N, K // group_size, dtype=torch.float16, device=device).abs() * 0.01 + 0.001
 
     out_ref = reference_fp8_model(x, w_packed, scales, group_size)
-    out_ours = w4a8_fp8_wmma.mmq_fp8_gemm(x, w_packed, scales, version=version)
+    out_ours = w4a8_fp8_wmma.mmq_fp8_gemm(x, w_packed, scales, kernel=kernel)
 
     diff = (out_ours.float() - out_ref.float()).abs()
     ref = out_ref.float().abs()
@@ -209,37 +209,37 @@ def main():
         (17, 48, 256, 32),      # odd M tail
     ]
 
-    # Asymmetric (AWQ) shapes: explicit per-group zero points. v0 is the golden
-    # scalar path; v5 is the optimized raw-builtin kernel used at large M.
+    # Asymmetric (AWQ) shapes: explicit per-group zero points. reference_scalar is
+    # the golden path; prefill_wmma is the optimized raw-builtin kernel at large M.
     asym_shapes = [
         (64, 256, 256, 32),     # g32
         (128, 1024, 1024, 128), # g128
-        (256, 512, 1024, 32),   # v5 tile-ish, g32
+        (256, 512, 1024, 32),   # prefill_wmma tile-ish, g32
         (1, 4096, 4096, 128),   # decode shape (M=1 tail), g128
         (100, 80, 256, 32),     # M and N tails
     ]
 
-    print("\n" + "=" * 60 + "\nv0 (scalar fp8 reference)\n" + "=" * 60)
-    v0 = [run_one(M, N, K, version=0, group_size=g) for M, N, K, g in v0_shapes]
-    print("\n" + "=" * 60 + "\nv1 (rocWMMA fp8 16x16x16, tails + g128)\n" + "=" * 60)
-    v1 = [run_one(M, N, K, version=1, group_size=g) for M, N, K, g in v1_shapes]
-    print("\n" + "=" * 60 + "\nv0 ASYM (AWQ zero points, golden)\n" + "=" * 60)
-    a0 = [run_one_asym(M, N, K, version=0, group_size=g)
+    print("\n" + "=" * 60 + "\nreference_scalar (scalar fp8 reference)\n" + "=" * 60)
+    v0 = [run_one(M, N, K, kernel="reference_scalar", group_size=g) for M, N, K, g in v0_shapes]
+    print("\n" + "=" * 60 + "\nrocwmma_v1 (rocWMMA fp8 16x16x16, tails + g128)\n" + "=" * 60)
+    v1 = [run_one(M, N, K, kernel="rocwmma_v1", group_size=g) for M, N, K, g in v1_shapes]
+    print("\n" + "=" * 60 + "\nreference_scalar ASYM (AWQ zero points, golden)\n" + "=" * 60)
+    a0 = [run_one_asym(M, N, K, kernel="reference_scalar", group_size=g)
           for M, N, K, g in asym_shapes]
-    print("\n" + "=" * 60 + "\nv5 ASYM (AWQ zero points, optimized)\n" + "=" * 60)
-    a5 = [run_one_asym(M, N, K, version=5, group_size=g)
+    print("\n" + "=" * 60 + "\nprefill_wmma ASYM (AWQ zero points, optimized)\n" + "=" * 60)
+    a5 = [run_one_asym(M, N, K, kernel="prefill_wmma", group_size=g)
           for M, N, K, g in asym_shapes]
 
     print("\n" + "=" * 60)
     results = v0 + v1 + a0 + a5
     if all(results):
-        print(f"ALL PASSED ({len(v0)} v0 + {len(v1)} v1 + {len(a0)} v0-asym "
-              f"+ {len(a5)} v5-asym)")
+        print(f"ALL PASSED ({len(v0)} reference_scalar + {len(v1)} rocwmma_v1 + "
+              f"{len(a0)} reference_scalar-asym + {len(a5)} prefill_wmma-asym)")
         sys.exit(0)
-    print(f"FAIL: v0={sum(1 for r in v0 if not r)}/{len(v0)}, "
-          f"v1={sum(1 for r in v1 if not r)}/{len(v1)}, "
-          f"v0_asym={sum(1 for r in a0 if not r)}/{len(a0)}, "
-          f"v5_asym={sum(1 for r in a5 if not r)}/{len(a5)}")
+    print(f"FAIL: reference_scalar={sum(1 for r in v0 if not r)}/{len(v0)}, "
+          f"rocwmma_v1={sum(1 for r in v1 if not r)}/{len(v1)}, "
+          f"reference_scalar_asym={sum(1 for r in a0 if not r)}/{len(a0)}, "
+          f"prefill_wmma_asym={sum(1 for r in a5 if not r)}/{len(a5)}")
     sys.exit(1)
 
 
