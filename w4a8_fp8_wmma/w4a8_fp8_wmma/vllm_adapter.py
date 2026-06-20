@@ -291,7 +291,10 @@ def _w4a8_dense_apply(
         x2d = x2d.to(torch.float16)
     gs = group_size
     v10_ok = gs in (32, 128)
-    v11_ok = (K % 1024 == 0) and (gs % 32 == 0) and (M <= 16)
+    # v11 needs K % 512 == 0 (clamped final chunk handles a 512-k tail) -- this lets
+    # the GEMV take down_proj (TP=2 shards intermediate 17408 -> K=8704 = 8*1024+512),
+    # which previously fell to the v10 WMMA kernel (pads M=1->16) every decode token.
+    v11_ok = (K % 512 == 0) and (gs % 32 == 0) and (M <= 16)
     decode_max = int(os.environ.get("VLLM_ROCM_W4A8_DECODE_MAX_M", "2"))
     v10_min = int(os.environ.get("VLLM_ROCM_W4A8_V10_MIN_M", "256"))
     cached = cached_min_m
