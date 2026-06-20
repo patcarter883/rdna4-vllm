@@ -1,8 +1,14 @@
 # W4A8 dense kernel versions — functional crosswalk & status
 
-Kernels are still **numbered internally** (the version int passed to `mmq_fp8_gemm`, the env-var and
-`crossover_cache.json` keys, and the DIARY/PIECE notes all key on numbers — those are load-bearing and
-unchanged). This table is the **public functional identity** + serving status. Source of the verdicts:
+Kernels are now selected by **descriptive name**, not a version int (de-numbered 2026-06-20). The
+names below are the public surface (env vars, the `__init__.py` wrappers, the served ladder);
+`__init__._DENSE_KERNELS` maps each name to an opaque `DenseKernel` int over the torch ABI
+(`kernel_names.h`), whose values **equal the old version ints** — so this table doubles as the
+old-number↔name crosswalk. The `ver` column is that internal enum value (still the key in
+`crossover_cache.json` and DIARY/PIECE notes). The numeric `mmq_fp8_gemm` selector and the
+`VLLM_ROCM_W4A8_V10_MIN_M` env are removed (the latter → `VLLM_ROCM_W4A8_PREFILL_MIN_M`); a stale
+numeric override now hard-errors at boot. The register-direct kernels are now **separate ops**
+`mmq_regdirect_fp8/_f16/_w4a16` (no longer `mmq_fp8_gemm_v15/16/17`). Source of the verdicts:
 `profiling/all-versions-bench/FINDINGS.md` (unified bench, 2026-06-15, eager+graph).
 
 ## Active — dispatched on the served path (`_w4a8_dense_apply` ladder)
@@ -27,11 +33,14 @@ The register-direct kernels need an offline `w_rep` (N//16,K//16,32) prepack (he
 shows a **narrow** small-M edge on large shapes; needs a full-decode-step graph A/B before wiring (the
 single-op number understates Triton's real small-M advantage).
 
-| ver | functional name | numerics | single-op finding |
+These are **separate torch ops** (not values in the `DenseKernel` ladder); the `ver` column is their
+historical number only.
+
+| ver | op name | numerics | single-op finding |
 |---|---|---|---|
-| v15 | `regdirect_fp8`   | W4A8 (fp8 WMMA) | wins M=4-8 large shapes; Triton retakes M=16 (except very-large-K) |
-| v16 | `regdirect_f16`   | W4A8 (fp8→f16 WMMA) | ~v15 |
-| v17 | `regdirect_w4a16` | **W4A16** (fp16 acts, no act-quant — different op) | wins 11008-g32 M≤16 only |
+| v15 | `mmq_regdirect_fp8`   | W4A8 (fp8 WMMA) | wins M=4-8 large shapes; Triton retakes M=16 (except very-large-K) |
+| v16 | `mmq_regdirect_f16`   | W4A8 (fp8→f16 WMMA) | ~mmq_regdirect_fp8 |
+| v17 | `mmq_regdirect_w4a16` | **W4A16** (fp16 acts, no act-quant — different op) | wins 11008-g32 M≤16 only |
 
 ## Retired → research-only — NOT dispatched (kept for the research trail + git history)
 

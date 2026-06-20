@@ -50,7 +50,7 @@ def _resolve_moe_kernel(kernel) -> int:
 
 
 # FakeTensor / meta registration for all W4A8 ops lives in ONE place — the
-# comprehensive block further down (dense v15/v16/v17 + the MoE ops). Without a
+# comprehensive block further down (dense regdirect ops + the MoE ops). Without a
 # fake (abstract) impl, Dynamo can't trace these custom ops and vLLM's full
 # torch.compile + cudagraph path aborts, leaving the layer --enforce-eager only.
 # (Do not add a second registration here: register_fake raises if an op already
@@ -238,7 +238,7 @@ def mmq_fp8_moe_gather_reduce(out2, sorted_token_ids, topk_weights,
 # kernel; paired with the pt2_compliant_tag on each m.def (bindings.cpp). No GPU
 # work runs in a fake. Output contracts mirror the CUDA impls exactly:
 #   mmq_fp8_gemm:            (M, N) f16        N = w_packed.size(0)   [(N, K//8)]
-#   mmq_fp8_gemm_v15/16/17:  (M, N) f16        N = the `N` arg
+#   mmq_regdirect_fp8/_f16/_w4a16: (M, N) f16   N = the `N` arg
 #   mmq_fp8_moe_gemm:        (P, N) f16        P = sorted_ids, N = w_packed.size(1)
 #   mmq_fp8_moe_gemm1_silu:  (P, inter) f16    inter = w_packed.size(1)//2  [(E,2*inter,K//8)]
 #   mmq_fp8_moe_gemm_scatter: () — in-place into `output` (mutating, dormant)
@@ -249,16 +249,16 @@ if _register_fake is not None:  # torch >= 2.4 (base is 2.10)
     def _fake_mmq_fp8_gemm(x, w_packed, scales, w_zeros, kernel):
         return x.new_empty((x.shape[0], w_packed.shape[0]), dtype=torch.float16)
 
-    @_register_fake("w4a8_fp8_wmma::mmq_fp8_gemm_v15")
-    def _fake_mmq_fp8_gemm_v15(x, w_rep, scales, w_zeros, N):
+    @_register_fake("w4a8_fp8_wmma::mmq_regdirect_fp8")
+    def _fake_mmq_regdirect_fp8(x, w_rep, scales, w_zeros, N):
         return x.new_empty((x.shape[0], N), dtype=torch.float16)
 
-    @_register_fake("w4a8_fp8_wmma::mmq_fp8_gemm_v16")
-    def _fake_mmq_fp8_gemm_v16(x, w_rep, scales, w_zeros, N):
+    @_register_fake("w4a8_fp8_wmma::mmq_regdirect_f16")
+    def _fake_mmq_regdirect_f16(x, w_rep, scales, w_zeros, N):
         return x.new_empty((x.shape[0], N), dtype=torch.float16)
 
-    @_register_fake("w4a8_fp8_wmma::mmq_w4a16_gemm_v17")
-    def _fake_mmq_w4a16_gemm_v17(x, w_rep, scales, w_zeros, N):
+    @_register_fake("w4a8_fp8_wmma::mmq_regdirect_w4a16")
+    def _fake_mmq_regdirect_w4a16(x, w_rep, scales, w_zeros, N):
         return x.new_empty((x.shape[0], N), dtype=torch.float16)
 
     @_register_fake("w4a8_fp8_wmma::mmq_fp8_moe_gemm")

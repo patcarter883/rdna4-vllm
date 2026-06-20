@@ -67,9 +67,9 @@ VERSIONS = [
     ("v12_splitk",      ("std", 12),       SMALL),
     ("v13_regdirect",   ("std", 13),       [1, 4, 8, 16]), # 5-15x slow: cap hard
     ("v14_nsplit",      ("std", 14),       SMALL),
-    ("v15_marlin",      ("wrep", "mmq_fp8_gemm_v15"),  SMALL),
-    ("v16_f16wmma",     ("wrep", "mmq_fp8_gemm_v16"),  SMALL),
-    ("v17_w4a16",       ("wrep", "mmq_w4a16_gemm_v17"), SMALL),
+    ("v15_marlin",      ("wrep", "mmq_regdirect_fp8"),  SMALL),
+    ("v16_f16wmma",     ("wrep", "mmq_regdirect_f16"),  SMALL),
+    ("v17_w4a16",       ("wrep", "mmq_regdirect_w4a16"), SMALL),
 ]
 
 # Shapes: dense crossover-cache + PIECE/VALIDATION shapes. (N, K, group, label)
@@ -193,7 +193,7 @@ def main():
         rel_tri = ((ref - tri).abs().mean() / (tri.abs().mean() + 1e-6)).item()
         print(f"   v5 vs triton mean-rel: {rel_tri:.3e}", flush=True)
         if wr is not None:
-            v15 = OPS.mmq_fp8_gemm_v15(xc, wr, sc, EMPTY_ZP, N).float()
+            v15 = OPS.mmq_regdirect_fp8(xc, wr, sc, EMPTY_ZP, N).float()
             rel_v15 = ((ref - v15).abs().max()).item()
             print(f"   v15(w_rep) vs v5 max-abs: {rel_v15:.3e}  "
                   f"(==0 -> prepack bit-correct)", flush=True)

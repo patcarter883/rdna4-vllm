@@ -17,7 +17,7 @@
 #include <torch/extension.h>
 #include <torch/library.h>
 #include <ATen/cuda/CUDAContext.h>
-#include "kernel_names.h"   // w4a8::MoeKernel / moe_kernel_valid (descriptive ids; opaque int ABI)
+#include "kernel_names.h"   // w4a8::{Dense,Moe}Kernel + *_valid() (descriptive ids; opaque int ABI)
 
 void launch_mmq_fp8_gemm_gfx1201(
     const at::Tensor& x,
@@ -27,15 +27,15 @@ void launch_mmq_fp8_gemm_gfx1201(
     at::Tensor& out,
     int64_t kernel);
 
-void launch_mmq_fp8_gemm_v15_gfx1201(
+void launch_mmq_regdirect_fp8_gfx1201(
     const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
     at::Tensor&, int64_t);
 
-void launch_mmq_fp8_gemm_v16_gfx1201(
+void launch_mmq_regdirect_f16_gfx1201(
     const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
     at::Tensor&, int64_t);
 
-void launch_mmq_w4a16_gemm_v17_gfx1201(
+void launch_mmq_regdirect_w4a16_gfx1201(
     const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
     at::Tensor&, int64_t);
 
@@ -139,33 +139,33 @@ at::Tensor mmq_fp8_gemm_forward(
     return out;
 }
 
-// v15: register-direct WMMA with pre-repacked (N/16,K/16,32) weights.
-at::Tensor mmq_fp8_gemm_v15_forward(
+// mmq_regdirect_fp8 (was v15): register-direct WMMA with pre-repacked (N/16,K/16,32) weights.
+at::Tensor mmq_regdirect_fp8_forward(
     const at::Tensor& x, const at::Tensor& w_rep, const at::Tensor& scales,
     const at::Tensor& w_zeros, int64_t N) {
     const int64_t M = x.size(0);
     auto out = at::empty({M, N}, x.options());
-    launch_mmq_fp8_gemm_v15_gfx1201(x, w_rep, scales, w_zeros, out, N);
+    launch_mmq_regdirect_fp8_gfx1201(x, w_rep, scales, w_zeros, out, N);
     return out;
 }
 
-// v16: f16-WMMA twin of v15 (same w_rep contract).
-at::Tensor mmq_fp8_gemm_v16_forward(
+// mmq_regdirect_f16 (was v16): f16-WMMA twin of mmq_regdirect_fp8 (same w_rep contract).
+at::Tensor mmq_regdirect_f16_forward(
     const at::Tensor& x, const at::Tensor& w_rep, const at::Tensor& scales,
     const at::Tensor& w_zeros, int64_t N) {
     const int64_t M = x.size(0);
     auto out = at::empty({M, N}, x.options());
-    launch_mmq_fp8_gemm_v16_gfx1201(x, w_rep, scales, w_zeros, out, N);
+    launch_mmq_regdirect_f16_gfx1201(x, w_rep, scales, w_zeros, out, N);
     return out;
 }
 
-// v17: true W4A16 -- fp16 activations direct (no act-quant).
-at::Tensor mmq_w4a16_gemm_v17_forward(
+// mmq_regdirect_w4a16 (was v17): true W4A16 -- fp16 activations direct (no act-quant).
+at::Tensor mmq_regdirect_w4a16_forward(
     const at::Tensor& x, const at::Tensor& w_rep, const at::Tensor& scales,
     const at::Tensor& w_zeros, int64_t N) {
     const int64_t M = x.size(0);
     auto out = at::empty({M, N}, x.options());
-    launch_mmq_w4a16_gemm_v17_gfx1201(x, w_rep, scales, w_zeros, out, N);
+    launch_mmq_regdirect_w4a16_gfx1201(x, w_rep, scales, w_zeros, out, N);
     return out;
 }
 
@@ -379,11 +379,11 @@ at::Tensor mmq_fp8_moe_gather_reduce_forward(
 TORCH_LIBRARY(w4a8_fp8_wmma, m) {
     m.def("mmq_fp8_gemm(Tensor x, Tensor w_packed, Tensor scales, Tensor w_zeros, int kernel) -> Tensor",
           {at::Tag::pt2_compliant_tag});
-    m.def("mmq_fp8_gemm_v15(Tensor x, Tensor w_rep, Tensor scales, Tensor w_zeros, int N) -> Tensor",
+    m.def("mmq_regdirect_fp8(Tensor x, Tensor w_rep, Tensor scales, Tensor w_zeros, int N) -> Tensor",
           {at::Tag::pt2_compliant_tag});
-    m.def("mmq_fp8_gemm_v16(Tensor x, Tensor w_rep, Tensor scales, Tensor w_zeros, int N) -> Tensor",
+    m.def("mmq_regdirect_f16(Tensor x, Tensor w_rep, Tensor scales, Tensor w_zeros, int N) -> Tensor",
           {at::Tag::pt2_compliant_tag});
-    m.def("mmq_w4a16_gemm_v17(Tensor x, Tensor w_rep, Tensor scales, Tensor w_zeros, int N) -> Tensor",
+    m.def("mmq_regdirect_w4a16(Tensor x, Tensor w_rep, Tensor scales, Tensor w_zeros, int N) -> Tensor",
           {at::Tag::pt2_compliant_tag});
     m.def("mmq_fp8_moe_gemm(Tensor x, Tensor w_packed, Tensor scales, Tensor w_zeros, "
           "Tensor sorted_token_ids, Tensor expert_ids, Tensor num_tokens_post_padded, "
@@ -405,9 +405,9 @@ TORCH_LIBRARY(w4a8_fp8_wmma, m) {
 
 TORCH_LIBRARY_IMPL(w4a8_fp8_wmma, CUDA, m) {
     m.impl("mmq_fp8_gemm", &mmq_fp8_gemm_forward);
-    m.impl("mmq_fp8_gemm_v15", &mmq_fp8_gemm_v15_forward);
-    m.impl("mmq_fp8_gemm_v16", &mmq_fp8_gemm_v16_forward);
-    m.impl("mmq_w4a16_gemm_v17", &mmq_w4a16_gemm_v17_forward);
+    m.impl("mmq_regdirect_fp8", &mmq_regdirect_fp8_forward);
+    m.impl("mmq_regdirect_f16", &mmq_regdirect_f16_forward);
+    m.impl("mmq_regdirect_w4a16", &mmq_regdirect_w4a16_forward);
     m.impl("mmq_fp8_moe_gemm", &mmq_fp8_moe_gemm_forward);
     m.impl("mmq_fp8_moe_gemm1_silu", &mmq_fp8_moe_gemm1_silu_forward);
     m.impl("mmq_fp8_moe_gemm_scatter", &mmq_fp8_moe_gemm_scatter_forward);

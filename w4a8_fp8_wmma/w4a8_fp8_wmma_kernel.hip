@@ -2905,7 +2905,7 @@ void launch_mmq_fp8_gemm_gfx1201(
 }
 
 // =================== v15 launcher (register-direct, repacked weights) ===================
-void launch_mmq_fp8_gemm_v15_gfx1201(
+void launch_mmq_regdirect_fp8_gfx1201(
     const at::Tensor& x,           // (M, K) fp16
     const at::Tensor& w_rep,       // (N/16, K/16, 32) int32 lane-order
     const at::Tensor& scales,      // (N, K/group) fp16
@@ -2952,7 +2952,7 @@ void launch_mmq_fp8_gemm_v15_gfx1201(
 }
 
 // v16: f16-WMMA twin of v15 (same w_rep contract). Reuses v15's repacked weights.
-void launch_mmq_fp8_gemm_v16_gfx1201(
+void launch_mmq_regdirect_f16_gfx1201(
     const at::Tensor& x,           // (M, K) fp16
     const at::Tensor& w_rep,       // (N/16, K/16, 32) int32 lane-order
     const at::Tensor& scales,      // (N, K/group) fp16
@@ -3000,7 +3000,7 @@ void launch_mmq_fp8_gemm_v16_gfx1201(
 }
 
 // v17: true W4A16 -- fp16 activations DIRECT (no act-quant), same w_rep contract.
-void launch_mmq_w4a16_gemm_v17_gfx1201(
+void launch_mmq_regdirect_w4a16_gfx1201(
     const at::Tensor& x,           // (M, K) fp16
     const at::Tensor& w_rep,       // (N/16, K/16, 32) int32 lane-order
     const at::Tensor& scales,      // (N, K/group) fp16
