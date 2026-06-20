@@ -43,7 +43,8 @@
 #include <hip/hip_fp16.h>
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
-#include "moe_gemm_tiled.h"   // consolidated TileConfig path (VLLM_W4A8_MOE_TILED A/B)
+#include "moe_gemm_tiled.h"   // consolidated TileConfig WMMA grouped GEMM (the live default)
+#include "kernel_names.h"     // w4a8::MoeKernel (descriptive ids; opaque int over the ABI)
 
 namespace w4a8_fp8_moe {
 
@@ -1043,6 +1044,21 @@ __global__ void __launch_bounds__(NWARPS * 32) moe_gemv_v7_kernel(
 
 // shared body for both launchers: act-fp8-quant then the grouped GEMM. SCATTER
 // selects the epilogue. For non-scatter, output_scatter/topk_weights are null.
+// TileConfig for the consolidated WMMA grouped GEMM: the named `Wmma` kernel's default
+// config (BN=64, GTILE=4, A-shuffle = the prior served v6) overlaid with the dev tuning
+// env knobs. A_IN_LDS=1 selects the former v5 (A-in-LDS). The GTILE/LDS clamps stay at
+// the launch site (they depend on K/group_size/BN).
+static inline w4a8_tile::TileConfig make_moe_tile_config(int /*K*/, int /*group_size*/) {
+    w4a8_tile::TileConfig cfg;
+    cfg.BN = MV5_BN;                 // 64
+    if (const char* e = std::getenv("VLLM_W4A8_MOE_BN")) cfg.BN = std::atoi(e);
+    cfg.GTILE = 4;
+    if (const char* e = std::getenv("VLLM_W4A8_MOE_GTILE")) cfg.GTILE = std::atoi(e);
+    cfg.A_IN_LDS = false;            // default = A-shuffle / B-only LDS (the prior v6)
+    if (const char* e = std::getenv("VLLM_W4A8_MOE_A_IN_LDS")) cfg.A_IN_LDS = std::atoi(e) != 0;
+    return cfg;
+}
+
 template<bool SCATTER>
 static void run_moe_gemm(
     const at::Tensor& x, const at::Tensor& w_packed, const at::Tensor& scales,
@@ -1071,17 +1087,19 @@ static void run_moe_gemm(
     const float* asc = act_scales.data_ptr<float>();
     const int* wq = w_packed.data_ptr<int>();
 
-    if (version == 5 || version == 6) {
-        // BN tile width: 64 (4 accs/warp, original) or 128 (8 accs/warp, the
-        // dense-v7 ILP win). Default 64; VLLM_W4A8_MOE_BN=128 to engage.
-        // version 6 = A-out-of-LDS (warp-shuffle gather), B-only LDS.
-        int bn = MV5_BN;
-        if (const char* e = std::getenv("VLLM_W4A8_MOE_BN")) bn = std::atoi(e);
-        // v6 multi-group staging: gtile groups per __syncthreads. Default 4 -- the
-        // per-group syncs (72 at g=32,K=2304) were the whole M=128 tax; gtile=4
-        // took M=128 from 1.10x to 0.53x vs stock. Capped so the B LDS stays <=40KB.
-        int gt6 = 4;
-        if (const char* e = std::getenv("VLLM_W4A8_MOE_GTILE")) gt6 = std::atoi(e);
+    const w4a8::MoeKernel mk = static_cast<w4a8::MoeKernel>(version);
+    if (mk == w4a8::MoeKernel::Wmma) {
+        // Consolidated WMMA grouped GEMM behind the WmmaFp8 MMA policy + TileConfig
+        // (tile_config.h / moe_gemm_tiled.h) — the ONLY WMMA path now. The former v5
+        // (A-in-LDS) vs v6 (A-shuffle, B-only LDS) split is cfg.A_IN_LDS, not a version
+        // number; default = A-shuffle (the prior served v6). BIT-EXACT to the retired
+        // standalone moe_gemm_v5/v6_kernel (test_tiled_bitexact.py: 56/56 across
+        // v5/v6 x sym/asym x BN=64/128 incl. the real 35B gemm1/gemm2 shapes).
+        // BN tile width: 64 (4 accs/warp) or 128 (8 accs/warp ILP); VLLM_W4A8_MOE_BN.
+        // gt6 = groups per __syncthreads (v6 multi-group staging); capped so B LDS <=40KB.
+        const w4a8_tile::TileConfig cfg = make_moe_tile_config(K, group_size);
+        int bn = cfg.BN;
+        int gt6 = cfg.GTILE;
         const int ng = K / group_size;
         if (gt6 < 1) gt6 = 1; if (gt6 > ng) gt6 = ng;
         const size_t per_grp = (size_t)bn * (group_size + LDS_PAD);
@@ -1090,40 +1108,21 @@ static void run_moe_gemm(
         dim3 grid((N + bn - 1) / bn, P / block_m);
         const size_t smem5 = (size_t)(block_m + bn) * (group_size + LDS_PAD);
         const size_t smem6 = (size_t)bn * (group_size + LDS_PAD) * gt6;  // B only, gtile groups
-        // Consolidated TileConfig path (moe_gemm_tiled.h, WmmaFp8 policy): bit-exact +
-        // perf-neutral vs v5/v6 (TILE_FRAMEWORK_DESIGN.md §2.4, microbench-validated). Opt-in
-        // A/B toggle; default path below is unchanged. Step 2 adds the SwmmacFp8 backend here.
-        if (std::getenv("VLLM_W4A8_MOE_TILED")) {
-            using w4a8_tile::WmmaFp8;
-            if (version == 6) {
-                #define TV6(BN_T) w4a8_tile::moe_gemm_tiled_v6_kernel<WmmaFp8, SCATTER, BN_T><<<grid, block, smem6, stream>>>( \
-                    xf, asc, wq, wsc, wz, sti, eid, ntp, out, T, N, K, group_size, \
-                    top_k, block_m, num_valid_tokens, output_scatter, topk_weights, out_top_k, gt6)
-                if (bn == 128) TV6(128); else TV6(MV5_BN);
-                #undef TV6
-            } else {
-                #define TV5(BN_T) w4a8_tile::moe_gemm_tiled_kernel<WmmaFp8, SCATTER, BN_T><<<grid, block, smem5, stream>>>( \
-                    xf, asc, wq, wsc, wz, sti, eid, ntp, out, T, N, K, group_size, \
-                    top_k, block_m, num_valid_tokens, output_scatter, topk_weights, out_top_k)
-                if (bn == 128) TV5(128); else TV5(MV5_BN);
-                #undef TV5
-            }
-            return;
-        }
-        if (version == 6) {
-            #define V6_LAUNCH(BN_T, SM) moe_gemm_v6_kernel<SCATTER, BN_T><<<grid, block, SM, stream>>>( \
+        using w4a8_tile::WmmaFp8;
+        if (!cfg.A_IN_LDS) {   // default: A via warp-shuffle gather, B-only LDS (former v6)
+            #define TV6(BN_T) w4a8_tile::moe_gemm_tiled_v6_kernel<WmmaFp8, SCATTER, BN_T><<<grid, block, smem6, stream>>>( \
                 xf, asc, wq, wsc, wz, sti, eid, ntp, out, T, N, K, group_size, \
                 top_k, block_m, num_valid_tokens, output_scatter, topk_weights, out_top_k, gt6)
-            if (bn == 128) V6_LAUNCH(128, smem6); else V6_LAUNCH(MV5_BN, smem6);
-            #undef V6_LAUNCH
-        } else {
-            #define V5_LAUNCH(BN_T, SM) moe_gemm_v5_kernel<SCATTER, BN_T><<<grid, block, SM, stream>>>( \
+            if (bn == 128) TV6(128); else TV6(MV5_BN);
+            #undef TV6
+        } else {               // A staged in LDS (former v5)
+            #define TV5(BN_T) w4a8_tile::moe_gemm_tiled_kernel<WmmaFp8, SCATTER, BN_T><<<grid, block, smem5, stream>>>( \
                 xf, asc, wq, wsc, wz, sti, eid, ntp, out, T, N, K, group_size, \
                 top_k, block_m, num_valid_tokens, output_scatter, topk_weights, out_top_k)
-            if (bn == 128) V5_LAUNCH(128, smem5); else V5_LAUNCH(MV5_BN, smem5);
-            #undef V5_LAUNCH
+            if (bn == 128) TV5(128); else TV5(MV5_BN);
+            #undef TV5
         }
-    } else if (version == 7) {
+    } else if (mk == w4a8::MoeKernel::Gemv) {
         // grouped GEMV (decode): NWARPS cols/block, K-tiled LDS activations.
         // Each expert block has at most min(block_m, T) real rows (a token routes
         // to an expert at most once) -> size LDS by that, not the padded block_m,
@@ -1258,12 +1257,13 @@ static void run_moe_gemm1_silu(
     const float* asc = act_scales.data_ptr<float>();
     const int* wq = w_packed.data_ptr<int>();
 
-    // Same BN / gtile knobs as the unfused v5/v6 path; the grid spans `inter`
-    // (gate columns), each block also pulling the matching up tile.
-    int bn = MV5_BN;
-    if (const char* e = std::getenv("VLLM_W4A8_MOE_BN")) bn = std::atoi(e);
-    int gt6 = 4;
-    if (const char* e = std::getenv("VLLM_W4A8_MOE_GTILE")) gt6 = std::atoi(e);
+    // Same TileConfig as the unfused WMMA path; the grid spans `inter` (gate
+    // columns), each block also pulling the matching up tile. NB: the fused-silu
+    // kernels are the hand-written moe_gemm1_silu_v5/v6 (no tiled equivalent) —
+    // A-residence still selects between them, now via cfg.A_IN_LDS not a version.
+    const w4a8_tile::TileConfig cfg = make_moe_tile_config(K, group_size);
+    int bn = cfg.BN;
+    int gt6 = cfg.GTILE;
     const int ng = K / group_size;
     if (gt6 < 1) gt6 = 1; if (gt6 > ng) gt6 = ng;
     // two slabs/group (gate + up) -> half the 40KB B budget per group-pair.
@@ -1271,14 +1271,14 @@ static void run_moe_gemm1_silu(
     while (gt6 > 1 && per_grp * gt6 > 40960) gt6--;
     dim3 block((block_m / WMMA_DIM) * 32);
     dim3 grid((inter + bn - 1) / bn, P / block_m);
-    if (version == 6) {
+    if (!cfg.A_IN_LDS) {  // former v6: A-shuffle, B-only LDS, gtile groups
         const size_t smem6 = per_grp * gt6;  // 2 slabs (gate|up) x gtile groups
         #define G1SILU_V6(BN_T) moe_gemm1_silu_v6_kernel<BN_T><<<grid, block, smem6, stream>>>( \
             xf, asc, wq, wsc, wz, sti, eid, ntp, out, T, N, K, group_size, \
             top_k, block_m, num_valid_tokens, gt6, inter)
         if (bn == 128) G1SILU_V6(128); else G1SILU_V6(MV5_BN);
         #undef G1SILU_V6
-    } else {  // version 5: A+B LDS, gate + up B slabs + A tile
+    } else {  // former v5: A+B LDS, gate + up B slabs + A tile
         const size_t smem5 = (size_t)(block_m + 2 * bn) * (group_size + LDS_PAD);
         #define G1SILU_V5(BN_T) moe_gemm1_silu_v5_kernel<BN_T><<<grid, block, smem5, stream>>>( \
             xf, asc, wq, wsc, wz, sti, eid, ntp, out, T, N, K, group_size, \
@@ -1302,7 +1302,7 @@ void launch_mmq_fp8_moe_gemm1_silu_gfx1201(
     const at::Tensor& expert_ids,        // (P/block_m,) int32
     const at::Tensor& num_tokens_post_padded,  // (1,) int32
     at::Tensor& out,                     // (P, inter) fp16
-    int64_t top_k, int64_t block_m, int64_t version) {
+    int64_t top_k, int64_t block_m, int64_t kernel) {
 
     using namespace w4a8_fp8_moe;
     const int N = w_packed.size(1);           // 2*inter (gate|up)
@@ -1311,8 +1311,8 @@ void launch_mmq_fp8_moe_gemm1_silu_gfx1201(
     const int group_size = x.size(1) / scales.size(2);
     TORCH_CHECK(group_size % WMMA_DIM == 0 && group_size <= MAX_GROUP_SIZE,
                 "group_size must be mult of 16 and <=128; got ", group_size);
-    TORCH_CHECK(version == 5 || version == 6,
-                "fused gemm1+silu needs version 5 or 6; got ", version);
+    TORCH_CHECK(static_cast<w4a8::MoeKernel>(kernel) == w4a8::MoeKernel::Wmma,
+                "fused gemm1+silu needs the 'wmma' kernel; got id ", kernel);
     TORCH_CHECK(block_m % WMMA_DIM == 0 && block_m <= 128,
                 "fused gemm1+silu block_m must be mult of 16 and <=128; got ", block_m);
     const int* wz = (w_zeros.defined() && w_zeros.numel() > 0)
@@ -1321,7 +1321,7 @@ void launch_mmq_fp8_moe_gemm1_silu_gfx1201(
         x, w_packed, scales, wz, sorted_token_ids, expert_ids,
         num_tokens_post_padded,
         reinterpret_cast<__half*>(out.data_ptr<at::Half>()), N, inter,
-        num_valid_tokens, (int)top_k, (int)block_m, (int)version);
+        num_valid_tokens, (int)top_k, (int)block_m, (int)kernel);
 }
 
 void launch_mmq_fp8_moe_gemm_gfx1201(
@@ -1333,7 +1333,7 @@ void launch_mmq_fp8_moe_gemm_gfx1201(
     const at::Tensor& expert_ids,        // (P/block_m,) int32
     const at::Tensor& num_tokens_post_padded,  // (1,) int32
     at::Tensor& out,                     // (P, N) fp16
-    int64_t top_k, int64_t block_m, int64_t version) {
+    int64_t top_k, int64_t block_m, int64_t kernel) {
 
     using namespace w4a8_fp8_moe;
     const int N = w_packed.size(1);
@@ -1341,20 +1341,21 @@ void launch_mmq_fp8_moe_gemm_gfx1201(
     const int group_size = x.size(1) / scales.size(2);
     TORCH_CHECK(group_size % WMMA_DIM == 0 && group_size <= MAX_GROUP_SIZE,
                 "group_size must be mult of 16 and <=128; got ", group_size);
-    if (version == 5 || version == 6)
+    const w4a8::MoeKernel mk = static_cast<w4a8::MoeKernel>(kernel);
+    if (mk == w4a8::MoeKernel::Wmma)
         TORCH_CHECK(block_m % WMMA_DIM == 0 && block_m <= 128,
-                    "v5 block_m must be mult of 16 and <=128; got ", block_m);
-    if (version == 7)
+                    "wmma block_m must be mult of 16 and <=128; got ", block_m);
+    if (mk == w4a8::MoeKernel::Gemv)
         TORCH_CHECK(block_m % 8 == 0 && block_m <= 64 &&
                     x.size(1) % 32 == 0 && group_size % 32 == 0,
-                    "v7 needs block_m mult of 8 <=64, K%32==0, group_size%32==0");
+                    "gemv needs block_m mult of 8 <=64, K%32==0, group_size%32==0");
     const int* wz = (w_zeros.defined() && w_zeros.numel() > 0)
                     ? w_zeros.data_ptr<int>() : nullptr;
     run_moe_gemm</*SCATTER=*/false>(
         x, w_packed, scales, wz, sorted_token_ids, expert_ids,
         num_tokens_post_padded,
         reinterpret_cast<__half*>(out.data_ptr<at::Half>()), N,
-        num_valid_tokens, (int)top_k, (int)block_m, (int)version,
+        num_valid_tokens, (int)top_k, (int)block_m, (int)kernel,
         /*output_scatter=*/nullptr, /*topk_weights=*/nullptr, /*out_top_k=*/0);
 }
 
@@ -1372,7 +1373,7 @@ void launch_mmq_fp8_moe_gemm_scatter_gfx1201(
     const at::Tensor& num_tokens_post_padded,  // (1,) int32
     const at::Tensor& topk_weights,      // (M*top_k,) fp32
     at::Tensor& output,                  // (M, N) fp32, pre-zeroed
-    int64_t top_k, int64_t block_m, int64_t version) {
+    int64_t top_k, int64_t block_m, int64_t kernel) {
 
     using namespace w4a8_fp8_moe;
     const int N = w_packed.size(1);
@@ -1381,19 +1382,20 @@ void launch_mmq_fp8_moe_gemm_scatter_gfx1201(
     const int group_size = x.size(1) / scales.size(2);
     TORCH_CHECK(group_size % WMMA_DIM == 0 && group_size <= MAX_GROUP_SIZE,
                 "group_size must be mult of 16 and <=128; got ", group_size);
-    if (version == 5 || version == 6)
+    const w4a8::MoeKernel mk = static_cast<w4a8::MoeKernel>(kernel);
+    if (mk == w4a8::MoeKernel::Wmma)
         TORCH_CHECK(block_m % WMMA_DIM == 0 && block_m <= 128,
-                    "v5 block_m must be mult of 16 and <=128; got ", block_m);
-    if (version == 7)
+                    "wmma block_m must be mult of 16 and <=128; got ", block_m);
+    if (mk == w4a8::MoeKernel::Gemv)
         TORCH_CHECK(block_m % 8 == 0 && block_m <= 64 &&
                     x.size(1) % 32 == 0 && group_size % 32 == 0,
-                    "v7 needs block_m mult of 8 <=64, K%32==0, group_size%32==0");
+                    "gemv needs block_m mult of 8 <=64, K%32==0, group_size%32==0");
     const int* wz = (w_zeros.defined() && w_zeros.numel() > 0)
                     ? w_zeros.data_ptr<int>() : nullptr;
     run_moe_gemm</*SCATTER=*/true>(
         x, w_packed, scales, wz, sorted_token_ids, expert_ids,
         num_tokens_post_padded, /*out=*/nullptr, N, num_valid_tokens,
-        (int)top_k, (int)block_m, (int)version,
+        (int)top_k, (int)block_m, (int)kernel,
         output.data_ptr<float>(), topk_weights.data_ptr<float>(), (int)top_k);
 }
 

@@ -52,7 +52,7 @@ def main():
         P = sti.numel()
         x16 = x.contiguous()
         def g1():
-            return mmq(x16, w13o, s13o, sti, eid, ntp, top_k, bm, version=7, w_zeros=z13o)
+            return mmq(x16, w13o, s13o, sti, eid, ntp, top_k, bm, kernel="gemv", w_zeros=z13o)
         out1 = g1()
         buf2 = torch.empty((P, inter), dtype=torch.float16, device=dev)
         def silu():
@@ -62,9 +62,9 @@ def main():
         outacc = torch.zeros((M, hidden), dtype=torch.float32, device=dev)
         def g2():
             outacc.zero_()
-            scat(buf2, w2o, s2o, sti, eid, ntp, tw_flat, outacc, top_k, bm, version=7, w_zeros=z2o)
+            scat(buf2, w2o, s2o, sti, eid, ntp, tw_flat, outacc, top_k, bm, kernel="gemv", w_zeros=z2o)
         ours = lambda: _run_grouped_moe(x, w13o, w2o, s13o, s2o, z13o, z2o, tw, tids,
-                                        MoEActivation.SILU, E, None, False, 6, out_dtype=x.dtype)
+                                        MoEActivation.SILU, E, None, False, "wmma", out_dtype=x.dtype)
         stock = lambda: fused_experts(x, w13, w2, topk_weights=tw, topk_ids=tids,
                                       activation=MoEActivation.SILU,
                                       apply_router_weight_on_input=False,

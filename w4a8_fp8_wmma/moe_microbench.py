@@ -39,8 +39,8 @@ def main():
     w2o, s2o, z2o = _wna16_moe_to_op_layout(w2, s2, z2)
     qc = int4_w4a16_moe_quant_config(w1_scale=s13, w2_scale=s2, w1_zp=z13,
                                      w2_zp=z2, block_shape=[0, g])
-    ver = int(__import__("os").environ.get("VLLM_ROCM_W4A8_FP8_WMMA_MOE_VERSION", "5"))
-    print(f"E={E} hidden={hidden} inter={inter} g={g} top_k={top_k} ver={ver} "
+    kernel = __import__("os").environ.get("VLLM_ROCM_W4A8_FP8_WMMA_MOE_KERNEL", "wmma")
+    print(f"E={E} hidden={hidden} inter={inter} g={g} top_k={top_k} kernel={kernel} "
           f"dev={torch.cuda.get_device_name(0)}")
     print(f"{'M':>6} {'ours_ms':>9} {'stock_ms':>9} {'ours/stock':>10}")
     import os as _os2
@@ -53,7 +53,7 @@ def main():
         tw = torch.rand(M, top_k, dtype=torch.float32, device=dev)
         ours = lambda: _run_grouped_moe(
             x, w13o, w2o, s13o, s2o, z13o, z2o, tw, tids, MoEActivation.SILU,
-            E, None, False, ver, out_dtype=x.dtype)
+            E, None, False, kernel, out_dtype=x.dtype)
         stock = lambda: fused_experts(
             x, w13, w2, topk_weights=tw, topk_ids=tids,
             activation=MoEActivation.SILU, apply_router_weight_on_input=False,

@@ -127,8 +127,10 @@ your serving script.
   16 GB card — hence `--max-model-len 2048 --max-num-batched-tokens 2048
   --gpu-memory-utilization 0.92`.
 - Bisect knobs: `VLLM_ROCM_W4A8_FP8_WMMA_MOE=0` (fall back to the Marlin baseline),
-  `VLLM_ROCM_W4A8_FP8_WMMA_MOE_VERSION=0` (scalar golden kernel, isolates v5 WMMA
-  numerics).
+  `VLLM_ROCM_W4A8_FP8_WMMA_MOE_KERNEL=scalar` (scalar golden kernel, isolates WMMA
+  numerics). The grouped kernel is named — `wmma` (default) / `scalar` / `gemv`; the old
+  numeric `MOE_VERSION` is removed and now hard-errors at boot if set. A-residence
+  (formerly v5-vs-v6) is the `VLLM_W4A8_MOE_A_IN_LDS` knob.
 
 Confirm it's engaged: the worker logs show `WNA16 MoE -> grouped FP8-WMMA`.
 

@@ -6,6 +6,7 @@ Triton `fused_experts`), and compares against our converter + grouped op. A
 layout/nibble-order bug -> gross divergence (rel ~1); correct -> only fp8
 activation-quant noise (rel <~3%). Runs in tiny VRAM (no full model).
 """
+import os
 import sys
 import torch
 
@@ -52,12 +53,12 @@ def stock_ref(x, w13p, w2p, s13, s2, tw, tids, E, g):
         expert_map=None, quant_config=qc)
 
 
-def ours(x, w13p, w2p, s13, s2, tw, tids, E, version):
+def ours(x, w13p, w2p, s13, s2, tw, tids, E, kernel):
     w13_op, s13_op = _ct_moe_to_op_layout(w13p, s13)
     w2_op, s2_op = _ct_moe_to_op_layout(w2p, s2)
     return _run_grouped_moe(
         x, w13_op, w2_op, s13_op, s2_op, None, None, tw, tids,
-        MoEActivation.SILU, E, None, False, version, out_dtype=x.dtype)
+        MoEActivation.SILU, E, None, False, kernel, out_dtype=x.dtype)
 
 
 def main():
@@ -76,14 +77,22 @@ def main():
         except Exception as e:
             print(f"  REF FAILED (E={E} h={hidden}): {type(e).__name__}: {e}")
             ok_all = False; continue
-        for v in (0, 5):
-            out = ours(x, w13p, w2p, s13, s2, tw, tids, E, v).float()
+        # former v0 -> "scalar"; former v5 (A-in-LDS) -> "wmma" + VLLM_W4A8_MOE_A_IN_LDS=1
+        for (label, kernel, a_in_lds) in (("scalar", "scalar", False),
+                                          ("wmma", "wmma", True)):
+            if a_in_lds:
+                os.environ["VLLM_W4A8_MOE_A_IN_LDS"] = "1"
+            try:
+                out = ours(x, w13p, w2p, s13, s2, tw, tids, E, kernel).float()
+            finally:
+                if a_in_lds:
+                    os.environ.pop("VLLM_W4A8_MOE_A_IN_LDS", None)
             diff = (out - ref).abs()
             refm = ref.abs().mean().item()
             rel = diff.mean().item() / max(refm, 1e-6)
             ok = rel < 0.05
             ok_all &= ok
-            print(f"  CT-layer v{v} E={E} h={hidden} I={inter} tk={tk} g={g} "
+            print(f"  CT-layer {label} E={E} h={hidden} I={inter} tk={tk} g={g} "
                   f"T={T}: rel_mean={rel:.4f} |ref|={refm:.4f} -> "
                   f"{'PASS' if ok else 'FAIL'}")
     print("=" * 56)

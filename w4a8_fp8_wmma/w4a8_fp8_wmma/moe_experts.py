@@ -65,11 +65,39 @@ def _moe_enabled() -> bool:
     return os.environ.get("VLLM_ROCM_W4A8_FP8_WMMA_MOE", "1") == "1"
 
 
-def _moe_version() -> int:
-    """Grouped-kernel version: 6 = fp8 WMMA with A out of LDS (default; bit-exact
-    to v5 and >= v5, ~5-11% faster at large M), 5 = fp8 WMMA A-in-LDS, 0 = scalar
-    golden (debug)."""
-    return int(os.environ.get("VLLM_ROCM_W4A8_FP8_WMMA_MOE_VERSION", "6"))
+# The env-selectable grouped-kernel names (the public surface above the torch
+# ABI; __init__._MOE_KERNELS maps each to its opaque op id). "wmma" is the tiled
+# WMMA default; the former v5-vs-v6 A-residence split is now the env knob
+# VLLM_W4A8_MOE_A_IN_LDS (consumed in C++ make_moe_tile_config), NOT a name.
+_VALID_MOE_KERNELS = ("scalar", "wmma", "gemv")
+
+
+def _raise_if_removed_moe_env() -> None:
+    """Hard-break for the removed numeric MOE_VERSION override. Called BOTH from
+    _moe_kernel() AND once at hook-install time (register_moe*) — the latter is the
+    load-bearing chokepoint: _moe_kernel() is also reached from the first-batch
+    autotune A/B, whose try/except would SWALLOW a raise there (caching None ->
+    silent stock fallthrough, exactly the silent mis-dispatch the hard-break
+    forbids). Raising at register time fires loudly at server boot instead."""
+    if "VLLM_ROCM_W4A8_FP8_WMMA_MOE_VERSION" in os.environ:
+        raise RuntimeError(
+            "VLLM_ROCM_W4A8_FP8_WMMA_MOE_VERSION is removed; set "
+            "VLLM_ROCM_W4A8_FP8_WMMA_MOE_KERNEL=wmma|scalar|gemv instead "
+            "(the old 5-vs-6 A-residence split is now VLLM_W4A8_MOE_A_IN_LDS).")
+
+
+def _moe_kernel() -> str:
+    """Grouped-kernel NAME (default "wmma" = tiled fp8 WMMA, the served default;
+    "scalar" = golden reference for debug; "gemv" = decode GEMV). The decode path
+    still auto-selects gemv per-batch (M<=GEMV_MAX_M) regardless; this only names
+    the WMMA-vs-scalar default."""
+    _raise_if_removed_moe_env()
+    kernel = os.environ.get("VLLM_ROCM_W4A8_FP8_WMMA_MOE_KERNEL", "wmma")
+    if kernel not in _VALID_MOE_KERNELS:
+        raise RuntimeError(
+            f"VLLM_ROCM_W4A8_FP8_WMMA_MOE_KERNEL={kernel!r} invalid; "
+            f"use one of {list(_VALID_MOE_KERNELS)}")
+    return kernel
 
 
 def _force_mode() -> str:
@@ -229,7 +257,7 @@ def _moe_autotune_crossover(layer, E, hidden, inter, group, top_k):
         tw = torch.rand(M, top_k, dtype=torch.float32, device=dev)
         ours = lambda: _run_grouped_moe(
             x, w13_op, w2_op, w13_s, w2_s, w13_z, w2_z, tw, tids,
-            MoEActivation.SILU, E, None, False, _moe_version(), out_dtype=x.dtype)
+            MoEActivation.SILU, E, None, False, _moe_kernel(), out_dtype=x.dtype)
         stock = lambda: fused_experts(
             x, w13_u8, w2_u8, topk_weights=tw, topk_ids=tids,
             activation=MoEActivation.SILU, apply_router_weight_on_input=False,
@@ -465,7 +493,7 @@ def _supported_group_size(gs: int) -> bool:
 def _run_grouped_moe(x, w1, w2, w1_s, w2_s, w1_zp, w2_zp,
                      topk_weights, topk_ids, activation,
                      global_num_experts, expert_map,
-                     apply_router_weight_on_input, version, out_dtype=None):
+                     apply_router_weight_on_input, kernel, out_dtype=None):
     """Compose the whole gated MoE from the one grouped FP8-WMMA op and return
     the final ``(M, K)`` output (already topk-weighted + reduced).
 
@@ -509,7 +537,7 @@ def _run_grouped_moe(x, w1, w2, w1_s, w2_s, w1_zp, w2_zp,
             out[lo:hi] = _run_grouped_moe(
                 x[lo:hi], w1, w2, w1_s, w2_s, w1_zp, w2_zp,
                 topk_weights[lo:hi], topk_ids[lo:hi], activation,
-                global_num_experts, expert_map, False, version, out_dtype)
+                global_num_experts, expert_map, False, kernel, out_dtype)
         return out
 
     # The op requires fp16 scales; convert defensively (no-op if already fp16).
@@ -522,23 +550,23 @@ def _run_grouped_moe(x, w1, w2, w1_s, w2_s, w1_zp, w2_zp,
     if w2_zp is None:
         w2_zp = torch.empty(0, dtype=torch.int32, device=dev)
 
-    # DECODE specialisation: at small M the WMMA grouped kernels (v5/v6) waste
-    # most of their block_m-row tiles on routing padding (1-2 real rows/expert)
-    # and pay a __syncthreads per K-group. v7 is a grouped GEMV that compacts to
-    # the REAL routed rows and streams weights barrier-free -- op micro-bench
-    # (Qwen3.6 expert shape, gemm1): 3-4.6x faster than v6 at T<=8, crossing back
+    # DECODE specialisation: at small M the WMMA grouped kernel ("wmma") wastes
+    # most of its block_m-row tiles on routing padding (1-2 real rows/expert)
+    # and pays a __syncthreads per K-group. "gemv" is a grouped GEMV that compacts
+    # to the REAL routed rows and streams weights barrier-free -- op micro-bench
+    # (Qwen3.6 expert shape, gemm1): 3-4.6x faster than wmma at T<=8, crossing back
     # near T~64. Use it (with the smallest block_m, less padding) for gemm1, and
     # its SCATTER variant for the fused gemm2+reduce (the atomic scatter is
-    # contention-free at decode). Gated by M<=GEMV_MAX_M; v0 (golden) opts out.
+    # contention-free at decode). Gated by M<=GEMV_MAX_M; "scalar" (golden) opts out.
     gemv_max = int(os.environ.get("VLLM_ROCM_W4A8_FP8_WMMA_MOE_GEMV_MAX_M", "96"))
-    use_gemv = version != 0 and M <= gemv_max
+    use_gemv = kernel != "scalar" and M <= gemv_max
     # GEMV uses block_m=8 (not a WMMA multiple -- it doesn't tile): caps real
     # rows/block at 8 so the acc[COLS][MMAX] register footprint stays small
     # (MMAX=8) even at batched decode M=16-32, where block_m=16 oversized MMAX
     # and crushed occupancy. Large per-expert counts just spill into more blocks.
     gemv_bm = int(os.environ.get("VLLM_ROCM_W4A8_FP8_WMMA_MOE_GEMV_BLOCK_M", "8"))
     block_m = gemv_bm if use_gemv else _choose_block_m(M, top_k, E_local)
-    gver = 7 if use_gemv else version
+    gver = "gemv" if use_gemv else kernel
     # pad_sorted_ids=True rounds the sorted_ids length up to a multiple of
     # block_m (the op binding needs P % block_m == 0 and exactly P/block_m
     # blocks). The trailing rows past num_tokens_post_padded (ntp) are left
@@ -555,28 +583,30 @@ def _run_grouped_moe(x, w1, w2, w1_s, w2_s, w1_zp, w2_zp,
     x16 = x_in.to(torch.float16) if x_in.dtype != torch.float16 else x_in
     x16 = x16.contiguous()
 
-    # gemm1 (w13) -> (gate * silu(up)) -> (P, inter). The WMMA path (v5/v6) fuses
+    # gemm1 (w13) -> (gate * silu(up)) -> (P, inter). The "wmma" path fuses
     # silu_and_mul into gemm1's epilogue (mmq_fp8_moe_gemm1_silu), so gemm1 writes
     # the post-activation (P, inter) DIRECTLY -- dropping the (P, 2*inter) out1 +
     # (P, inter) buf2 HBM round-trip and the separate silu launch (ROADMAP Task 3,
     # the prefill/mid intermediate-traffic win; at DECODE the wall is gemm2's
     # weight-read BW, not these buffers -- so the use_gemv decode branch keeps the
-    # unfused v7 path). Fused only for gated SILU on v5/v6; everything else (v0
-    # golden, GELU/other activations, the GEMV decode path) takes the unfused
-    # gemm1 + apply_moe_activation. Bit-exact to the unfused path (see the kernel's
-    # moe_silu_and_mul_h). Env-gated for A/B + bit-exact verification.
+    # unfused "gemv" path). Fused only for gated SILU on "wmma"; everything else
+    # ("scalar" golden, GELU/other activations, the GEMV decode path) takes the
+    # unfused gemm1 + apply_moe_activation. Bit-exact to the unfused path (see the
+    # kernel's moe_silu_and_mul_h). Env-gated for A/B + bit-exact verification.
+    # NOTE: the silu-fused kernel has NO tiled equivalent -- it keeps its own
+    # v5/v6 A-residence kernels, selected in C++ by VLLM_W4A8_MOE_A_IN_LDS.
     fuse_silu = os.environ.get(
         "VLLM_ROCM_W4A8_FP8_WMMA_MOE_FUSE_SILU", "1") == "1"
-    can_fuse = (fuse_silu and not use_gemv and gver in (5, 6)
+    can_fuse = (fuse_silu and not use_gemv and gver == "wmma"
                 and activation.is_gated and activation == MoEActivation.SILU)
     if can_fuse:
         buf2 = w4a8_fp8_wmma.mmq_fp8_moe_gemm1_silu(
             x16, w1, w1_s, sorted_ids, expert_ids, ntp,
-            top_k, block_m, version=gver, w_zeros=w1_zp)     # (P, inter)
+            top_k, block_m, kernel=gver, w_zeros=w1_zp)     # (P, inter)
     else:
         # gemm1 (w13): padded-sorted (P, 2*inter)
         out1 = mmq(x16, w1, w1_s, sorted_ids, expert_ids, ntp,
-                   top_k, block_m, version=gver, w_zeros=w1_zp)
+                   top_k, block_m, kernel=gver, w_zeros=w1_zp)
         # gate * up -> (P, inter)
         act_dim = out1.size(1) // 2 if activation.is_gated else out1.size(1)
         buf2 = torch.empty((P, act_dim), dtype=torch.float16, device=dev)
@@ -588,15 +618,15 @@ def _run_grouped_moe(x, w1, w2, w1_s, w2_s, w1_zp, w2_zp,
         tw_flat = topk_weights.reshape(-1).to(torch.float32).contiguous()
 
     if use_gemv:
-        # gemm2 via the fused v7 SCATTER epilogue. v7 compacts to the real routed
-        # slots (identity-gather src=row_pad, validity from sorted_ids), so unlike
-        # the non-scatter+gather_reduce path it never touches the padding rows. The
-        # atomic scatter is contention-free at decode (few tokens). output must be
-        # pre-zeroed (captured in any HIP graph).
+        # gemm2 via the fused "gemv" SCATTER epilogue. gemv compacts to the real
+        # routed slots (identity-gather src=row_pad, validity from sorted_ids), so
+        # unlike the non-scatter+gather_reduce path it never touches the padding
+        # rows. The atomic scatter is contention-free at decode (few tokens).
+        # output must be pre-zeroed (captured in any HIP graph).
         output = torch.zeros((M, K), dtype=torch.float32, device=dev)
         w4a8_fp8_wmma.mmq_fp8_moe_gemm_scatter(
             buf2.contiguous(), w2, w2_s, sorted_ids, expert_ids, ntp, tw_flat,
-            output, top_k, block_m, version=gver, w_zeros=w2_zp)
+            output, top_k, block_m, kernel=gver, w_zeros=w2_zp)
         return output.to(out_dtype)
 
     # gemm2 (w2) + topk-weight + reduce. SINGLE PATH (no adaptive branch): gemm2
@@ -608,7 +638,7 @@ def _run_grouped_moe(x, w1, w2, w1_s, w2_s, w1_zp, w2_zp,
     # behind, <0.3% e2e). HIP-graph safe everywhere (no atomics, static shapes).
     ident = torch.arange(P, dtype=torch.int32, device=dev)
     out2 = mmq(buf2.contiguous(), w2, w2_s, ident, expert_ids, ntp, 1, block_m,
-               version=version, w_zeros=w2_zp)                        # (P, K) fp16
+               kernel=kernel, w_zeros=w2_zp)                          # (P, K) fp16
     acc = w4a8_fp8_wmma.mmq_fp8_moe_gather_reduce(
         out2.contiguous(), sorted_ids, tw_flat, ntp, top_k)           # (M, K) fp32
     return acc.to(out_dtype)
@@ -639,13 +669,13 @@ def _w4a8_moe_apply(
     global_num_experts: int,
     expert_map: Optional[torch.Tensor],
     apply_router_weight_on_input: bool,
-    version: int,
+    kernel: str,
 ) -> torch.Tensor:
     from vllm.model_executor.layers.fused_moe.activation import MoEActivation
     act = MoEActivation(activation)
     return _run_grouped_moe(
         x, w1, w2, w1_s, w2_s, w1_zp, w2_zp, topk_weights, topk_ids, act,
-        global_num_experts, expert_map, apply_router_weight_on_input, version,
+        global_num_experts, expert_map, apply_router_weight_on_input, kernel,
         out_dtype=x.dtype)
 
 
@@ -663,7 +693,7 @@ def _w4a8_moe_apply_fake(
     global_num_experts: int,
     expert_map: Optional[torch.Tensor],
     apply_router_weight_on_input: bool,
-    version: int,
+    kernel: str,
 ) -> torch.Tensor:
     # MoE preserves the hidden dim: output is (M, K) == x.shape, dtype = x.dtype.
     return torch.empty_like(x)
@@ -786,7 +816,7 @@ def _build_experts_class():
                 hidden_states, w1, w2, self.w1_scale, self.w2_scale,
                 self.w1_zp, self.w2_zp, topk_weights, topk_ids, act,
                 global_num_experts, expert_map, apply_router_weight_on_input,
-                _moe_version())
+                _moe_kernel())
             output.copy_(out)
 
     return W4A8Fp8WmmaExperts
@@ -842,6 +872,7 @@ def register_moe(verbose: bool = True) -> bool:
     global _MOE_REGISTERED
     if _MOE_REGISTERED:
         return True
+    _raise_if_removed_moe_env()  # loud at boot; can't be swallowed by autotune
     if not _moe_enabled():
         if verbose:
             print("[w4a8_fp8_wmma] MoE disabled via env")
@@ -979,6 +1010,7 @@ def register_moe_gptq(verbose: bool = True) -> bool:
     global _MOE_GPTQ_REGISTERED
     if _MOE_GPTQ_REGISTERED:
         return True
+    _raise_if_removed_moe_env()  # loud at boot; can't be swallowed by autotune
     if not _moe_enabled():
         if verbose:
             print("[w4a8_fp8_wmma] GPTQ MoE disabled via env")
@@ -1095,6 +1127,7 @@ def register_moe_ct(verbose: bool = True) -> bool:
     global _MOE_CT_REGISTERED
     if _MOE_CT_REGISTERED:
         return True
+    _raise_if_removed_moe_env()  # loud at boot; can't be swallowed by autotune
     if not _moe_enabled():
         if verbose:
             print("[w4a8_fp8_wmma] CT MoE disabled via env")
@@ -1172,7 +1205,7 @@ def register_moe_ct(verbose: bool = True) -> bool:
             layer._w4a8_ct_w13_s, layer._w4a8_ct_w2_s, None, None,
             topk_weights, topk_ids, act, layer.global_num_experts,
             layer.expert_map, layer.apply_router_weight_on_input,
-            _moe_version(), out_dtype=x.dtype)
+            _moe_kernel(), out_dtype=x.dtype)
         return out.reshape(x.shape[:-1] + (out.shape[-1],))
 
     CompressedTensorsWNA16MoEMethod.process_weights_after_loading = _patched_process
@@ -1203,6 +1236,7 @@ def register_moe_wna16(verbose: bool = True) -> bool:
     global _MOE_WNA16_REGISTERED
     if _MOE_WNA16_REGISTERED:
         return True
+    _raise_if_removed_moe_env()  # loud at boot; can't be swallowed by autotune
     if not _moe_enabled():
         if verbose:
             print("[w4a8_fp8_wmma] WNA16 MoE disabled via env")
@@ -1273,7 +1307,7 @@ def register_moe_wna16(verbose: bool = True) -> bool:
             layer._w4a8_w2s, layer._w4a8_w13z, layer._w4a8_w2z,
             topk_weights, topk_ids, act, layer.global_num_experts,
             layer.expert_map, layer.apply_router_weight_on_input,
-            _moe_version(), out_dtype=x.dtype)
+            _moe_kernel(), out_dtype=x.dtype)
         return out.reshape(x.shape[:-1] + (out.shape[-1],))
 
     MoeWNA16Method.process_weights_after_loading = _patched_process

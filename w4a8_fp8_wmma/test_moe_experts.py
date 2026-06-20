@@ -15,6 +15,7 @@ this tests the NEW Python wiring in ``moe_experts.py``:
 Run inside the container (needs the built .so + a gfx1201 device):
     python test_moe_experts.py
 """
+import os
 import sys
 
 import torch
@@ -31,6 +32,18 @@ except ImportError as e:
     sys.exit(1)
 
 E4M3_MAX = 448.0
+
+
+def _with_a_in_lds(a_in_lds, fn):
+    """Run ``fn`` with VLLM_W4A8_MOE_A_IN_LDS set (the former-v5 A-in-LDS path)
+    when ``a_in_lds`` is True; restore the default (env unset) afterwards."""
+    if a_in_lds:
+        os.environ["VLLM_W4A8_MOE_A_IN_LDS"] = "1"
+    try:
+        return fn()
+    finally:
+        if a_in_lds:
+            os.environ.pop("VLLM_W4A8_MOE_A_IN_LDS", None)
 
 
 def to_e4m3(x):
@@ -179,11 +192,11 @@ def fp8_ref_moe(x, W13t, W13s, W13z, W2t, W2s, W2z, topk_ids, topk_weights,
 
 
 def kernel_moe(x, qw13, s13, z13, qw2, s2, z2, topk_ids, topk_weights,
-               group_size, version, fuse_silu=False):
+               group_size, kernel, fuse_silu=False):
     """Replicate W4A8Fp8WmmaExperts.apply with the real op + conversion.
 
     ``fuse_silu`` exercises the fused gemm1+silu kernel (mmq_fp8_moe_gemm1_silu)
-    in place of the separate gemm1 + silu_and_mul (v5/v6 only)."""
+    in place of the separate gemm1 + silu_and_mul (wmma only)."""
     T, K = x.shape
     top_k = topk_ids.shape[1]
     E = qw13.shape[0]
@@ -200,12 +213,12 @@ def kernel_moe(x, qw13, s13, z13, qw2, s2, z2, topk_ids, topk_weights,
     if fuse_silu:
         buf2 = w4a8_fp8_wmma.mmq_fp8_moe_gemm1_silu(
             x16, w13_p, s13_p, sti, eids, ntp, top_k, block_m,
-            version=version, w_zeros=z13_p)                  # (P, inter)
+            kernel=kernel, w_zeros=z13_p)                    # (P, inter)
         buf2 = buf2.contiguous()
     else:
         out1 = w4a8_fp8_wmma.mmq_fp8_moe_gemm(
             x16, w13_p, s13_p, sti, eids, ntp, top_k, block_m,
-            version=version, w_zeros=z13_p)                  # (P, 2*inter)
+            kernel=kernel, w_zeros=z13_p)                    # (P, 2*inter)
         inter = out1.shape[1] // 2
         buf2 = (torch.nn.functional.silu(out1[:, :inter].float()).to(torch.float16)
                 * out1[:, inter:])                           # (P, inter)
@@ -218,7 +231,7 @@ def kernel_moe(x, qw13, s13, z13, qw2, s2, z2, topk_ids, topk_weights,
                         torch.full((P,), P, dtype=torch.int32, device=dev))
     out2 = w4a8_fp8_wmma.mmq_fp8_moe_gemm(
         buf2, w2_p, s2_p, ident, eids, ntp, 1, block_m,
-        version=version, w_zeros=z2_p)                       # (P, K)
+        kernel=kernel, w_zeros=z2_p)                         # (P, K)
 
     slots = sti[valid].long()
     tokens = slots // top_k
@@ -228,7 +241,7 @@ def kernel_moe(x, qw13, s13, z13, qw2, s2, z2, topk_ids, topk_weights,
     return y
 
 
-def test_composition(T, E, K, inter, top_k, group_size, version, dev,
+def test_composition(T, E, K, inter, top_k, group_size, kernel, dev,
                      mean_rtol=0.03, fuse_silu=False):
     N13 = 2 * inter
     qv13, z13, s13, qw13, qz13 = make_awq_expert_weights(E, K, N13, group_size, dev)
@@ -241,14 +254,14 @@ def test_composition(T, E, K, inter, top_k, group_size, version, dev,
     ref = fp8_ref_moe(x, qv13, s13, z13, qv2, s2_, z2, topk_ids, topk_weights,
                       group_size)
     out = kernel_moe(x, qw13, s13, qz13, qw2, s2_, qz2, topk_ids, topk_weights,
-                     group_size, version, fuse_silu=fuse_silu)
+                     group_size, kernel, fuse_silu=fuse_silu)
     diff = (out - ref).abs()
     refm = ref.abs().mean().item()
     mean = diff.mean().item()
     eff = max(2e-3, mean_rtol * refm)
     n_bad = int((diff > 0.15 + 0.05 * ref.abs()).sum().item())
     ok = mean <= eff and n_bad == 0
-    tag = "v%d+fusedsilu" % version if fuse_silu else "v%d" % version
+    tag = ("%s+fusedsilu" % kernel) if fuse_silu else kernel
     print(f"  compose {tag} T={T} E={E} K={K} I={inter} tk={top_k} "
           f"g={group_size}: mean={mean:.5f} |ref|={refm:.4f} bad={n_bad} "
           f"-> {'PASS' if ok else 'FAIL'}")
@@ -267,7 +280,7 @@ def silu_and_mul_ref(out1):
     return silu * up                                           # fp16 * fp16
 
 
-def test_fused_gemm1_silu(T, E, K, inter, top_k, group_size, version, dev):
+def test_fused_gemm1_silu(T, E, K, inter, top_k, group_size, kernel, dev):
     """The fused gemm1+silu kernel must be BIT-EXACT to running the existing
     gemm1 op then the exact silu_and_mul arithmetic (the kernel rounds each half
     to fp16 the same way gemm1 stores, then applies the identical silu)."""
@@ -285,18 +298,18 @@ def test_fused_gemm1_silu(T, E, K, inter, top_k, group_size, version, dev):
 
     out1 = w4a8_fp8_wmma.mmq_fp8_moe_gemm(
         x16, w13_p, s13_p, sti, eids, ntp, top_k, block_m,
-        version=version, w_zeros=z13_p)                        # (P, 2*inter)
+        kernel=kernel, w_zeros=z13_p)                          # (P, 2*inter)
     ref = silu_and_mul_ref(out1)                               # (P, inter)
     fused = w4a8_fp8_wmma.mmq_fp8_moe_gemm1_silu(
         x16, w13_p, s13_p, sti, eids, ntp, top_k, block_m,
-        version=version, w_zeros=z13_p)                        # (P, inter)
+        kernel=kernel, w_zeros=z13_p)                          # (P, inter)
 
     num_valid = T * top_k
     row_idx = torch.arange(P, dtype=torch.int32, device=dev)
     valid = (sti < num_valid) & (row_idx < ntp)
     diff = (fused[valid].float() - ref[valid].float()).abs().max().item()
     ok = diff == 0.0           # bit-exact: same fp16 store + same silu arithmetic
-    print(f"  fused-vs-unfused v{version} T={T} E={E} K={K} I={inter} "
+    print(f"  fused-vs-unfused {kernel} T={T} E={E} K={K} I={inter} "
           f"tk={top_k} g={group_size}: max|diff|={diff:.2e} "
           f"-> {'PASS (bit-exact)' if ok else 'FAIL'}")
     return ok
@@ -321,20 +334,25 @@ def main():
         (16, 16, 256, 128, 4, 32),
     ]
     for c in cases:
-        res.append(test_composition(*c, version=0, dev="cuda"))
-        res.append(test_composition(*c, version=5, dev="cuda"))
+        # former v0 -> "scalar"; former v5 (A-in-LDS) -> "wmma" + A_IN_LDS env
+        res.append(test_composition(*c, kernel="scalar", dev="cuda"))
+        res.append(_with_a_in_lds(True, lambda c=c:
+                                  test_composition(*c, kernel="wmma", dev="cuda")))
 
     print("=== fused gemm1+silu == unfused gemm1 + silu_and_mul (bit-exact) ===")
-    # mid/prefill batches (the regime the fusion targets); v5 and v6.
+    # mid/prefill batches (the regime the fusion targets); former v5 (A-in-LDS)
+    # and v6 -- both "wmma" now, differing only by the A_IN_LDS env.
     for c in [(64, 8, 256, 128, 2, 32), (128, 8, 512, 256, 2, 128),
               (16, 16, 256, 128, 4, 32), (256, 4, 512, 256, 2, 32)]:
-        res.append(test_fused_gemm1_silu(*c, version=5, dev="cuda"))
-        res.append(test_fused_gemm1_silu(*c, version=6, dev="cuda"))
+        res.append(_with_a_in_lds(True, lambda c=c:
+                                  test_fused_gemm1_silu(*c, kernel="wmma", dev="cuda")))
+        res.append(test_fused_gemm1_silu(*c, kernel="wmma", dev="cuda"))
 
     print("=== full MoE composition through the FUSED gemm1+silu path ===")
     for c in cases:
-        res.append(test_composition(*c, version=5, dev="cuda", fuse_silu=True))
-        res.append(test_composition(*c, version=6, dev="cuda", fuse_silu=True))
+        res.append(_with_a_in_lds(True, lambda c=c:
+                                  test_composition(*c, kernel="wmma", dev="cuda", fuse_silu=True)))
+        res.append(test_composition(*c, kernel="wmma", dev="cuda", fuse_silu=True))
 
     print("=" * 56)
     if all(res):

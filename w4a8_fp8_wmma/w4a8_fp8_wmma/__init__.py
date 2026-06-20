@@ -3,6 +3,26 @@ import torch  # MUST come before `from . import _C` so libtorch is dlopen'd firs
 from . import _C  # noqa: F401
 
 
+# Descriptive kernel names map to the opaque int the torch op carries over the ABI
+# (kernel_names.h). Names are the public surface; no caller writes the int. The former
+# MoE v5/v6 are ONE name "wmma" — A-residence is an env knob (VLLM_W4A8_MOE_A_IN_LDS),
+# not a name. Hard-break: a removed numeric value (e.g. 5) raises, never mis-dispatches.
+_MOE_KERNELS = {"scalar": 0, "wmma": 6, "gemv": 7}
+
+
+def _resolve_moe_kernel(kernel) -> int:
+    """Map a descriptive MoE kernel name to its op id; reject unknowns/legacy ints."""
+    if isinstance(kernel, str):
+        try:
+            return _MOE_KERNELS[kernel]
+        except KeyError:
+            raise ValueError(
+                f"unknown moe kernel {kernel!r}; known: {sorted(_MOE_KERNELS)}") from None
+    raise TypeError(
+        f"moe kernel must be a name in {sorted(_MOE_KERNELS)} (the integer 'version' was "
+        f"removed); got {kernel!r}")
+
+
 # FakeTensor / meta registration for all W4A8 ops lives in ONE place — the
 # comprehensive block further down (dense v15/v16/v17 + the MoE ops). Without a
 # fake (abstract) impl, Dynamo can't trace these custom ops and vLLM's full
@@ -46,7 +66,7 @@ def mmq_fp8_moe_gemm(
     num_tokens_post_padded: torch.Tensor,
     top_k: int,
     block_m: int,
-    version: int = 0,
+    kernel: str = "wmma",
     w_zeros: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Grouped (MoE) W4A8-FP8 GEMM for gfx1201.
@@ -63,8 +83,10 @@ def mmq_fp8_moe_gemm(
         expert_ids: (P/block_m,) int32, expert per block.
         num_tokens_post_padded: (1,) int32 valid padded length.
         top_k: experts per token (activation row = sorted_token_id // top_k).
-        block_m: moe_align block size (multiple of 16; v5 needs <=64).
-        version: 0 = scalar golden, 5 = fp8 WMMA.
+        block_m: moe_align block size (multiple of 16; wmma needs <=64).
+        kernel: "scalar" = golden reference, "wmma" = fp8 WMMA (tiled, default),
+                "gemv" = scalar-dot decode GEMV. A-residence (former v5 vs v6) is
+                the env knob VLLM_W4A8_MOE_A_IN_LDS, not a kernel name.
         w_zeros: (E, N/8, K/group) int32 packed zeros (AWQ); None for uint4b8.
 
     Returns:
@@ -74,7 +96,7 @@ def mmq_fp8_moe_gemm(
         w_zeros = torch.empty(0, dtype=torch.int32, device=x.device)
     return torch.ops.w4a8_fp8_wmma.mmq_fp8_moe_gemm(
         x, w_packed, scales, w_zeros, sorted_token_ids, expert_ids,
-        num_tokens_post_padded, top_k, block_m, version)
+        num_tokens_post_padded, top_k, block_m, _resolve_moe_kernel(kernel))
 
 
 def mmq_fp8_moe_gemm1_silu(
@@ -86,7 +108,7 @@ def mmq_fp8_moe_gemm1_silu(
     num_tokens_post_padded: torch.Tensor,
     top_k: int,
     block_m: int,
-    version: int = 6,
+    kernel: str = "wmma",
     w_zeros: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Fused gemm1 + silu_and_mul for the gated MoE (gfx1201).
@@ -96,7 +118,7 @@ def mmq_fp8_moe_gemm1_silu(
     -- dropping the separate silu launch and the (P, 2*inter) out1 / (P, inter)
     buf2 HBM round-trip the unfused ``mmq_fp8_moe_gemm`` + ``silu_and_mul`` pays.
 
-    Bit-exact to ``mmq_fp8_moe_gemm(x, w13, ..., version)`` followed by
+    Bit-exact to ``mmq_fp8_moe_gemm(x, w13, ..., kernel)`` followed by
     ``torch.ops._C.silu_and_mul`` (each half rounded to fp16 exactly as gemm1's
     store, silu in fp32 then fp16, final half*half multiply).
 
@@ -104,8 +126,10 @@ def mmq_fp8_moe_gemm1_silu(
         x: (T, K) fp16 token activations.
         w_packed: (E, 2*inter, K/8) int32 stacked w13 ([gate|up] along dim 1).
         scales: (E, 2*inter, K/group) fp16.
-        version: 5 (A+B LDS) or 6 (A-out-of-LDS, served default). Only the WMMA
-                 tiles support the fused epilogue.
+        kernel: "wmma" (the only fused-epilogue path). A-residence (former v5 A+B
+                LDS vs v6 A-out-of-LDS, served default) is the env knob
+                VLLM_W4A8_MOE_A_IN_LDS. The silu-fused path keeps its own
+                v5/v6 kernels (no tiled equivalent).
         w_zeros: (E, (2*inter)/8, K/group) int32 (AWQ) or None (uint4b8 zp=8).
 
     Returns:
@@ -115,7 +139,7 @@ def mmq_fp8_moe_gemm1_silu(
         w_zeros = torch.empty(0, dtype=torch.int32, device=x.device)
     return torch.ops.w4a8_fp8_wmma.mmq_fp8_moe_gemm1_silu(
         x, w_packed, scales, w_zeros, sorted_token_ids, expert_ids,
-        num_tokens_post_padded, top_k, block_m, version)
+        num_tokens_post_padded, top_k, block_m, _resolve_moe_kernel(kernel))
 
 
 def mmq_fp8_moe_gemm_scatter(
@@ -129,7 +153,7 @@ def mmq_fp8_moe_gemm_scatter(
     output: torch.Tensor,
     top_k: int,
     block_m: int,
-    version: int = 0,
+    kernel: str = "wmma",
     w_zeros: torch.Tensor | None = None,
 ) -> None:
     """Fused gemm2 + topk-weight + indirect atomic scatter (gfx1201).
@@ -153,7 +177,8 @@ def mmq_fp8_moe_gemm_scatter(
         w_zeros = torch.empty(0, dtype=torch.int32, device=x.device)
     torch.ops.w4a8_fp8_wmma.mmq_fp8_moe_gemm_scatter(
         x, w_packed, scales, w_zeros, sorted_token_ids, expert_ids,
-        num_tokens_post_padded, topk_weights, output, top_k, block_m, version)
+        num_tokens_post_padded, topk_weights, output, top_k, block_m,
+        _resolve_moe_kernel(kernel))
 
 
 def mmq_fp8_moe_gather_reduce(out2, sorted_token_ids, topk_weights,
@@ -211,21 +236,21 @@ if _register_fake is not None:  # torch >= 2.4 (base is 2.10)
     @_register_fake("w4a8_fp8_wmma::mmq_fp8_moe_gemm")
     def _fake_mmq_fp8_moe_gemm(x, w_packed, scales, w_zeros, sorted_token_ids,
                                expert_ids, num_tokens_post_padded, top_k,
-                               block_m, version):
+                               block_m, kernel):
         return x.new_empty((sorted_token_ids.shape[0], w_packed.shape[1]),
                            dtype=torch.float16)
 
     @_register_fake("w4a8_fp8_wmma::mmq_fp8_moe_gemm1_silu")
     def _fake_mmq_fp8_moe_gemm1_silu(x, w_packed, scales, w_zeros, sorted_token_ids,
                                      expert_ids, num_tokens_post_padded, top_k,
-                                     block_m, version):
+                                     block_m, kernel):
         return x.new_empty((sorted_token_ids.shape[0], w_packed.shape[1] // 2),
                            dtype=torch.float16)
 
     @_register_fake("w4a8_fp8_wmma::mmq_fp8_moe_gemm_scatter")
     def _fake_mmq_fp8_moe_gemm_scatter(x, w_packed, scales, w_zeros, sorted_token_ids,
                                        expert_ids, num_tokens_post_padded, topk_weights,
-                                       output, top_k, block_m, version):
+                                       output, top_k, block_m, kernel):
         return None  # in-place accumulate into `output`; nothing returned
 
     @_register_fake("w4a8_fp8_wmma::mmq_fp8_moe_gather_reduce")

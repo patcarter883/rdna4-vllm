@@ -66,8 +66,9 @@ x-combined-common: &combined-common
     # entry point and AUTO-TUNES its dense/MoE crossover per shape at load, caching it
     # (VLLM_ROCM_W4A8_AUTOTUNE, default on) -- so the old manual gates are gone: MOE_MIN_M
     # is intentionally UNSET (setting it would bypass the autotune crossover), and MOE=1 /
-    # MOE_VERSION=6 are already baked into the image. Bisect knobs (MOE=0, FORCE, LAYOUT,
-    # V6_MIN_M/_MAX_M) are documented in the README, not set here.
+    # MOE_KERNEL=wmma are already baked into the image (MOE_KERNEL replaced the de-numbered
+    # MOE_VERSION). Bisect knobs (MOE=0, FORCE, LAYOUT, MOE_KERNEL=scalar) are documented in
+    # the README, not set here.
     VLLM_ROCM_USE_W4A8_FP8_WMMA: "${USE_W4A8:-1}"
     # Cold-boot compile accelerators. Thread-pool Triton @autotune parallel-compile is OFF for now:
     # on TP=2 the two ranks' pools (up to 8x2) thrash the shared /root/.triton on RDNA4 → the GDN

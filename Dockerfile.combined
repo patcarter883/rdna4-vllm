@@ -94,12 +94,15 @@ RUN set -eu; \
     rm -rf /tmp/hettp
 
 # --- 3. W4A8 defaults (all overridable at runtime via -e / compose; no rebuild to toggle) ---
-# MOE_VERSION=6 is the grouped kernel that actually executes on the MoE path.
+# MOE_KERNEL=wmma is the (tiled) grouped WMMA kernel that executes on the MoE path; it is
+# also the built-in default, so this ENV is documentation. The numeric MOE_VERSION was
+# de-numbered to names (wmma|scalar|gemv); the old var now HARD-ERRORS at boot if set, so
+# it must not be baked here (A-residence, formerly v5-vs-v6, is the VLLM_W4A8_MOE_A_IN_LDS knob).
 # Do NOT bake VLLM_ROCM_W4A8_FORCE — W4A8 is a *decode-regime* win and loses at mid/large/prefill,
 # so leave the adaptive crossover dispatch in charge; force per-run if needed.
 ENV VLLM_ROCM_USE_W4A8_FP8_WMMA=1 \
     VLLM_ROCM_W4A8_FP8_WMMA_MOE=1 \
-    VLLM_ROCM_W4A8_FP8_WMMA_MOE_VERSION=6
+    VLLM_ROCM_W4A8_FP8_WMMA_MOE_KERNEL=wmma
 
 # --- 4. (optional) ZAYA1-8B + CCA support — the second model, folded in ---
 # Was a derived image (Dockerfile.zaya); now a gated step so ONE combined image serves both the

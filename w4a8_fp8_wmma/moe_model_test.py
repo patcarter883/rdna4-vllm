@@ -16,8 +16,8 @@ What to look for in the log:
 Compare against the Marlin baseline by disabling just the MoE hook:
   VLLM_ROCM_W4A8_FP8_WMMA_MOE=0 python moe_model_test.py <model>
 
-Debug with the scalar golden grouped kernel instead of v5 WMMA:
-  VLLM_ROCM_W4A8_FP8_WMMA_MOE_VERSION=0 python moe_model_test.py <model>
+Debug with the scalar golden grouped kernel instead of the WMMA tile:
+  VLLM_ROCM_W4A8_FP8_WMMA_MOE_KERNEL=scalar python moe_model_test.py <model>
 
 Run inside kyuz0/vllm-therock-gfx1201 with the GPU + HF cache mounted. The 35B
 final-goal model is too big for 16GB; use a small cached AWQ MoE, e.g.
@@ -41,9 +41,9 @@ DEFAULT_MODEL = "cyankiwi/Mellum2-12B-A2.5B-base-AWQ-INT4"
 def main():
     mid = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_MODEL
     moe_on = os.environ.get("VLLM_ROCM_W4A8_FP8_WMMA_MOE", "1") == "1"
-    ver = os.environ.get("VLLM_ROCM_W4A8_FP8_WMMA_MOE_VERSION", "5")
+    kernel = os.environ.get("VLLM_ROCM_W4A8_FP8_WMMA_MOE_KERNEL", "wmma")
     print(f"===== AWQ MoE end-to-end: {mid} =====")
-    print(f"MoE hook: {'ON (grouped FP8-WMMA, v' + ver + ')' if moe_on else 'OFF (Marlin baseline)'}")
+    print(f"MoE hook: {f'ON (grouped FP8-WMMA, {kernel})' if moe_on else 'OFF (Marlin baseline)'}")
 
     llm = LLM(
         model=mid,

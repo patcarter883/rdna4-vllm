@@ -44,18 +44,18 @@ def main():
 
         def v7sc():
             outacc.zero_()
-            scat(buf2, w2o, s2o, sti, eid, ntp, tw_flat, outacc, top_k, bm, version=7, w_zeros=z2o)
+            scat(buf2, w2o, s2o, sti, eid, ntp, tw_flat, outacc, top_k, bm, kernel="gemv", w_zeros=z2o)
         def v7ns():
-            return mmq(buf2, w2o, s2o, ident, eid, ntp, 1, bm, version=7, w_zeros=z2o)
+            return mmq(buf2, w2o, s2o, ident, eid, ntp, 1, bm, kernel="gemv", w_zeros=z2o)
         def v6sc():
             outacc.zero_()
-            scat(buf2, w2o, s2o, sti, eid, ntp, tw_flat, outacc, top_k, bm, version=6, w_zeros=z2o)
+            scat(buf2, w2o, s2o, sti, eid, ntp, tw_flat, outacc, top_k, bm, kernel="wmma", w_zeros=z2o)
         def v6ns():
-            return mmq(buf2, w2o, s2o, ident, eid, ntp, 1, bm, version=6, w_zeros=z2o)
+            return mmq(buf2, w2o, s2o, ident, eid, ntp, 1, bm, kernel="wmma", w_zeros=z2o)
         def v7sc_nw(nw):
             os.environ["VLLM_W4A8_MOE_GEMV_NWARPS"] = str(nw)
             outacc.zero_()
-            scat(buf2, w2o, s2o, sti, eid, ntp, tw_flat, outacc, top_k, bm, version=7, w_zeros=z2o)
+            scat(buf2, w2o, s2o, sti, eid, ntp, tw_flat, outacc, top_k, bm, kernel="gemv", w_zeros=z2o)
         r = {}
         for k, fn in [("v7sc", v7sc), ("v7ns", v7ns), ("v6sc", v6sc), ("v6ns", v6ns)]:
             try: r[k] = t_ms(fn)

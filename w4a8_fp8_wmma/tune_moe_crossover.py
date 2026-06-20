@@ -68,7 +68,7 @@ def tune_shape(E, hidden, inter, group, top_k, margin, dev="cuda"):
         tw = torch.rand(M, top_k, dtype=torch.float32, device=dev)
         ours = lambda: _run_grouped_moe(
             x, w13o, w2o, s13o, s2o, z13o, z2o, tw, tids, MoEActivation.SILU,
-            E, None, False, 5, out_dtype=x.dtype)
+            E, None, False, "wmma", out_dtype=x.dtype)
         stock = lambda: fused_experts(
             x, w13, w2, topk_weights=tw, topk_ids=tids,
             activation=MoEActivation.SILU, apply_router_weight_on_input=False,

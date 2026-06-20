@@ -5,6 +5,7 @@ Triton `fused_experts` (what MoeWNA16Method.apply calls), and compares against
 our zero-copy `.view(int32)` + grouped op. Layout/zp bug -> rel~1; correct ->
 fp8 noise (rel <~5%). Tiny VRAM.
 """
+import os
 import sys
 import torch
 
@@ -42,12 +43,12 @@ def stock_ref(x, w13, w2, s13, s2, z13, z2, tw, tids, E, g):
         expert_map=None, quant_config=qc)
 
 
-def ours(x, w13, w2, s13, s2, z13, z2, tw, tids, E, version):
+def ours(x, w13, w2, s13, s2, z13, z2, tw, tids, E, kernel):
     w13o, s13o, z13o = _wna16_moe_to_op_layout(w13, s13, z13)
     w2o, s2o, z2o = _wna16_moe_to_op_layout(w2, s2, z2)
     return _run_grouped_moe(
         x, w13o, w2o, s13o, s2o, z13o, z2o, tw, tids, MoEActivation.SILU,
-        E, None, False, version, out_dtype=x.dtype)
+        E, None, False, kernel, out_dtype=x.dtype)
 
 
 def main():
@@ -69,12 +70,20 @@ def main():
         except Exception as ex:
             print(f"  REF FAILED (E={E} h={hidden} zp={zp}): {type(ex).__name__}: {ex}")
             ok_all = False; continue
-        for v in (0, 5):
-            out = ours(x, w13, w2, s13, s2, z13, z2, tw, tids, E, v).float()
+        # former v0 -> "scalar"; former v5 (A-in-LDS) -> "wmma" + VLLM_W4A8_MOE_A_IN_LDS=1
+        for (label, kernel, a_in_lds) in (("scalar", "scalar", False),
+                                          ("wmma", "wmma", True)):
+            if a_in_lds:
+                os.environ["VLLM_W4A8_MOE_A_IN_LDS"] = "1"
+            try:
+                out = ours(x, w13, w2, s13, s2, z13, z2, tw, tids, E, kernel).float()
+            finally:
+                if a_in_lds:
+                    os.environ.pop("VLLM_W4A8_MOE_A_IN_LDS", None)
             rel = (out - ref).abs().mean().item() / max(ref.abs().mean().item(), 1e-6)
             ok = rel < 0.07
             ok_all &= ok
-            print(f"  WNA16 v{v} E={E} h={hidden} I={inter} g={g} T={T} zp={zp}: "
+            print(f"  WNA16 {label} E={E} h={hidden} I={inter} g={g} T={T} zp={zp}: "
                   f"rel_mean={rel:.4f} -> {'PASS' if ok else 'FAIL'}")
     print("=" * 56)
     print("ALL PASSED" if ok_all else "FAIL")

@@ -3,9 +3,14 @@
 Builds a random top-k routing, the moe_align_block_size routing tensors
 (sorted_token_ids / expert_ids / num_tokens_post_padded), stacked per-expert
 int4 weights (symmetric uint4b8 and asymmetric AWQ), and checks the grouped
-kernels (v0 golden, v5 WMMA) against an fp8 reference that mirrors the kernel's
-arithmetic (per-token fp8 act, per-expert fp8 weights, per-group fp32 reduce).
+kernels by NAME ("scalar" golden, "wmma" tiled WMMA, "gemv" decode GEMV) against
+an fp8 reference that mirrors the kernel's arithmetic (per-token fp8 act,
+per-expert fp8 weights, per-group fp32 reduce). The former v5-vs-v6 A-residence
+split is now the env knob VLLM_W4A8_MOE_A_IN_LDS (read per-dispatch in C++), so
+"wmma" is exercised with it both unset (A-shuffle, former v6) and =1 (A-in-LDS,
+former v5) in one process.
 """
+import os
 import sys
 
 import torch
@@ -96,7 +101,8 @@ def reference(x, w_int4, scales, zeros, sti, eids, ntp, top_k, block_m, group_si
     return out
 
 
-def run(T, E, N, K, top_k, block_m, group_size, version, asym, mean_rtol=0.02):
+def run(T, E, N, K, top_k, block_m, group_size, kernel, asym, mean_rtol=0.02,
+        label=None):
     dev = torch.device("cuda")
     G = K // group_size
     x = torch.randn(T, K, dtype=torch.float16, device=dev)
@@ -117,7 +123,7 @@ def run(T, E, N, K, top_k, block_m, group_size, version, asym, mean_rtol=0.02):
     ref = reference(x, w_int4, scales, zeros, sti, eids, ntp, top_k, block_m, group_size)
     out = w4a8_fp8_wmma.mmq_fp8_moe_gemm(
         x, w_packed, scales, sti, eids, ntp, top_k, block_m,
-        version=version, w_zeros=zp_packed)
+        kernel=kernel, w_zeros=zp_packed)
 
     # compare only valid (non-padding) rows
     num_valid = T * top_k
@@ -129,7 +135,8 @@ def run(T, E, N, K, top_k, block_m, group_size, version, asym, mean_rtol=0.02):
     n_bad = int((diff > 0.15 + 0.03 * ref[valid].float().abs()).sum().item())
     ok = mean <= eff and n_bad == 0
     tag = "ASYM" if asym else "SYM "
-    print(f"  v{version} {tag} T={T} E={E} N={N} K={K} tk={top_k} bm={block_m} "
+    name = label or kernel
+    print(f"  {name:14s} {tag} T={T} E={E} N={N} K={K} tk={top_k} bm={block_m} "
           f"g={group_size}: mean={mean:.5f} |ref|={refm:.4f} bad={n_bad} "
           f"-> {'PASS' if ok else 'FAIL'}")
     return ok
@@ -148,22 +155,25 @@ def main():
         (1, 8, 512, 1024, 2, 16, 128),   # single-token decode
     ]
     res = []
-    print("=== grouped v0 (golden) ===")
+    print("=== grouped scalar (golden) ===")
     for c in cases:
-        res.append(run(*c, version=0, asym=False))
-        res.append(run(*c, version=0, asym=True))
-    print("=== grouped v5 (WMMA) ===")
+        res.append(run(*c, kernel="scalar", asym=False))
+        res.append(run(*c, kernel="scalar", asym=True))
+    print("=== grouped wmma (A-shuffle / B-only LDS; default, former v6) ===")
+    os.environ.pop("VLLM_W4A8_MOE_A_IN_LDS", None)
     for c in cases:
-        res.append(run(*c, version=5, asym=False))
-        res.append(run(*c, version=5, asym=True))
-    print("=== grouped v6 (A-out-of-LDS WMMA) ===")
+        res.append(run(*c, kernel="wmma", asym=False))
+        res.append(run(*c, kernel="wmma", asym=True))
+    print("=== grouped wmma + VLLM_W4A8_MOE_A_IN_LDS=1 (A-in-LDS, former v5) ===")
+    os.environ["VLLM_W4A8_MOE_A_IN_LDS"] = "1"
     for c in cases:
-        res.append(run(*c, version=6, asym=False))
-        res.append(run(*c, version=6, asym=True))
-    print("=== grouped v7 (decode GEMV) ===")
+        res.append(run(*c, kernel="wmma", asym=False, label="wmma[A_IN_LDS]"))
+        res.append(run(*c, kernel="wmma", asym=True, label="wmma[A_IN_LDS]"))
+    os.environ.pop("VLLM_W4A8_MOE_A_IN_LDS", None)
+    print("=== grouped gemv (decode GEMV) ===")
     for c in cases:
-        res.append(run(*c, version=7, asym=False))
-        res.append(run(*c, version=7, asym=True))
+        res.append(run(*c, kernel="gemv", asym=False))
+        res.append(run(*c, kernel="gemv", asym=True))
     print("=" * 50)
     if all(res):
         print(f"ALL PASSED ({len(res)})"); sys.exit(0)
