@@ -2466,6 +2466,13 @@ __global__ void __launch_bounds__(NWARPS * 32) mmq_w4a16_gemm_kernel_v17(
 
 }  // namespace w4a8_fp8_wmma
 
+// Dense TileConfig consolidation: the v5/v10 WMMA prefill kernels re-expressed over
+// a local MMA policy (gemm_tiled_kernel / gemm_tiled_ashuffle_kernel). Included at
+// global scope AFTER the namespace's helpers are defined; the header re-opens
+// namespace w4a8_fp8_wmma. Validated (bit-exact + perf-neutral) and available behind
+// VLLM_W4A8_DENSE_TILED, but NOT the default — see the gemm_tiled.h header note.
+#include "gemm_tiled.h"
+
 // =================== Host launcher ===================
 void launch_mmq_fp8_gemm_gfx1201(
     const at::Tensor& x,
@@ -2662,6 +2669,10 @@ void launch_mmq_fp8_gemm_gfx1201(
         }
         if (const char* e = std::getenv("VLLM_W4A8_V10_DB")) db = std::atoi(e);
         if (const char* e = std::getenv("VLLM_W4A8_V7_SWIZ")) swiz = std::atoi(e);
+        // VLLM_W4A8_DENSE_TILED (opt-in): gemm_tiled_ashuffle_kernel re-expression
+        // over the DenseWmmaFp8 policy, bit-exact to v10 (same template params /
+        // grid/block/smem) + perf-neutral. NOT the default (see PrefillWmma note).
+        const bool use_tiled = std::getenv("VLLM_W4A8_DENSE_TILED") != nullptr;
         const int LDSBK = group_size + 8;
         const size_t shmem = static_cast<size_t>(db ? 2 : 1) * bn * LDSBK;
         dim3 grid = swiz ? dim3((M + bm - 1) / bm, (N + bn - 1) / bn)
@@ -2677,8 +2688,13 @@ void launch_mmq_fp8_gemm_gfx1201(
                 M, N, K, group_size, swiz);
         };
         #define V10_L(BM, BN, G) do { \
-            if (db) launch(mmq_fp8_gemm_kernel_v10<BM, BN, BM/16, G, true>, BM/16); \
-            else    launch(mmq_fp8_gemm_kernel_v10<BM, BN, BM/16, G, false>, BM/16); \
+            if (db) { \
+                if (use_tiled) launch(gemm_tiled_ashuffle_kernel<DenseWmmaFp8, BM, BN, BM/16, G, true>, BM/16); \
+                else           launch(mmq_fp8_gemm_kernel_v10<BM, BN, BM/16, G, true>, BM/16); \
+            } else { \
+                if (use_tiled) launch(gemm_tiled_ashuffle_kernel<DenseWmmaFp8, BM, BN, BM/16, G, false>, BM/16); \
+                else           launch(mmq_fp8_gemm_kernel_v10<BM, BN, BM/16, G, false>, BM/16); \
+            } \
         } while (0)
         #define V10_BKT(BM, BN) do { \
             if (group_size == 128) V10_L(BM, BN, 128); else V10_L(BM, BN, 32); \
@@ -2846,13 +2862,28 @@ void launch_mmq_fp8_gemm_gfx1201(
         // Fused act-quant (fp16 in, e4m3 in A_tile during staging).
         dim3 block(V2_NWARPS * 32);
         dim3 grid((N + V2_BN - 1) / V2_BN, (M + V2_BM - 1) / V2_BM);
-        mmq_fp8_gemm_kernel_v5<<<grid, block, 0, stream>>>(
-            x_h,
-            w_packed.data_ptr<int>(),
-            reinterpret_cast<const __half*>(scales.data_ptr<at::Half>()),
-            w_zeros_ptr,
-            reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
-            M, N, K, group_size);
+        // VLLM_W4A8_DENSE_TILED (opt-in): the gemm_tiled_kernel re-expression over
+        // the DenseWmmaFp8 MMA policy. PROVEN bit-exact to v5 (max|diff|==0, 32/32)
+        // and perf-neutral. NOT the default: bit-exact == zero runtime upside, and
+        // dense has no second backend (unlike grouped-MoE's SWMMAC), so v5 stays the
+        // served kernel and the policy path is the validated, ready alternative.
+        if (std::getenv("VLLM_W4A8_DENSE_TILED")) {
+            gemm_tiled_kernel<DenseWmmaFp8, V2_BM, V2_BN><<<grid, block, 0, stream>>>(
+                x_h,
+                w_packed.data_ptr<int>(),
+                reinterpret_cast<const __half*>(scales.data_ptr<at::Half>()),
+                w_zeros_ptr,
+                reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
+                M, N, K, group_size);
+        } else {
+            mmq_fp8_gemm_kernel_v5<<<grid, block, 0, stream>>>(
+                x_h,
+                w_packed.data_ptr<int>(),
+                reinterpret_cast<const __half*>(scales.data_ptr<at::Half>()),
+                w_zeros_ptr,
+                reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
+                M, N, K, group_size);
+        }
     } else if (dk == DK::RocwmmaPipe) {  // v4
         // v4: single-buffer staging + kt-level fragment pipelining.
         dim3 block(V2_NWARPS * 32);
