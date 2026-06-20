@@ -1593,8 +1593,11 @@ __global__ void __launch_bounds__(NWARPS * 32) mmq_fp8_gemm_kernel_v10(
 // chunks (v4i = 4 int32 = 32 fp8/lane), expand int4->fp8 in-register, multiply by
 // the staged activations, accumulate with the per-group weight scale. Activations
 // (M,K) fp8 are staged once into LDS (needs M*K <= ~64KB, i.e. small M). M
-// accumulators per lane; warp-reduce -> out[m][n]. Requires K % 1024 == 0 (warp
-// step = 32 lanes * 32 k) and group_size % 32 == 0.
+// accumulators per lane; warp-reduce -> out[m][n]. A warp-step consumes 32 lanes *
+// 32 k = 1024 k; the chunk loop clamps the final chunk (ck=min(BK,K-kc)) and the
+// step loop tiles any ck that is a multiple of 32 k (4xint32 b128/lane), so K only
+// needs K % 512 == 0 (a 512-k tail = 16 active lanes) -- not K % 1024. group_size %
+// 32 == 0.
 // ============================================================
 template <int NWARPS, int MMAX>
 __global__ void __launch_bounds__(NWARPS * 32) mmq_fp8_gemv_kernel_v11(
@@ -2485,7 +2488,7 @@ void launch_mmq_fp8_gemm_gfx1201(
     TORCH_CHECK(group_size % WMMA_DIM == 0 && group_size <= MAX_GROUP_SIZE,
                 "group_size must be a multiple of 16 and <= 128; got ", group_size);
 
-    hipStream_t stream = at::cuda::getCurrentCUDAStream();
+    hipStream_t stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
 
     // The dispatched WMMA path (v5/v10) FUSES the activation fp8-quant into the
     // GEMM prologue (per-row amax + e4m3 expand in-kernel), so it consumes the
@@ -2618,7 +2621,13 @@ void launch_mmq_fp8_gemm_gfx1201(
             reinterpret_cast<__half*>(out.data_ptr<at::Half>()), ne);
     } else if (version == 11) {
         // v11: decode GEMV, K-TILED. one warp per output column; streams weights.
-        TORCH_CHECK(K % 1024 == 0, "v11 needs K % 1024 == 0; got ", K);
+        // K % 512 (was 1024): BK is a multiple of 1024 and the final chunk is
+        // clamped (ck=min(BK,K-kc)); the inner warp-step tiles by a 32-k (4xint32
+        // b128/lane) granularity, so a 512-k tail chunk (e.g. down_proj K=8704 =
+        // 8*1024+512 after TP=2 sharding of intermediate 17408) is consumed exactly
+        // by 16 lanes. 512 keeps the (N,K/8) row int32-offset 16-byte aligned
+        // (K/8 % 4 == 0) for the b128 weight load on every output column n.
+        TORCH_CHECK(K % 512 == 0, "v11 needs K % 512 == 0; got ", K);
         TORCH_CHECK(group_size % 32 == 0, "v11 needs group_size % 32; got ", group_size);
         TORCH_CHECK(M <= 16, "v11 is decode-only (M <= 16); got M=", M);
         int nw = 16;
@@ -2913,7 +2922,7 @@ void launch_mmq_fp8_gemm_v15_gfx1201(
     const int M = x.size(0);
     const int K = x.size(1);
     const int group_size = K / scales.size(1);
-    hipStream_t stream = at::cuda::getCurrentCUDAStream();
+    hipStream_t stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
     auto x_fp8 = at::empty({M, K}, x.options().dtype(at::kByte));
     auto act_scales = at::empty({M}, x.options().dtype(at::kFloat));
    hipLaunchKernelGGL(( compute_act_fp8_and_scales_kernel), dim3(dim3(M)), dim3(dim3(ACTQUANT_BLOCK)), 0, stream, 
@@ -2960,7 +2969,7 @@ void launch_mmq_fp8_gemm_v16_gfx1201(
     const int M = x.size(0);
     const int K = x.size(1);
     const int group_size = K / scales.size(1);
-    hipStream_t stream = at::cuda::getCurrentCUDAStream();
+    hipStream_t stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
     auto x_fp8 = at::empty({M, K}, x.options().dtype(at::kByte));
     auto act_scales = at::empty({M}, x.options().dtype(at::kFloat));
    hipLaunchKernelGGL(( compute_act_fp8_and_scales_kernel), dim3(dim3(M)), dim3(dim3(ACTQUANT_BLOCK)), 0, stream, 
@@ -3008,7 +3017,7 @@ void launch_mmq_w4a16_gemm_v17_gfx1201(
     const int M = x.size(0);
     const int K = x.size(1);
     const int group_size = K / scales.size(1);
-    hipStream_t stream = at::cuda::getCurrentCUDAStream();
+    hipStream_t stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
     const int* wz = (w_zeros.defined() && w_zeros.numel() > 0) ? w_zeros.data_ptr<int>() : nullptr;
     int bn = 64, nw = 4, splitk = 1;
     if (const char* e = std::getenv("VLLM_W4A8_V17_CFG")) {
