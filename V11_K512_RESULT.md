@@ -26,8 +26,16 @@ down_proj on **v10 (WMMA, pads M=1→16)** instead of the v11 GEMV.
   Matches the live trace (v10 ~360 µs/launch, v11 ~54 µs/launch). v10@M=1 read weights at
   ~76 GB/s; v11 at 479 GB/s.
 
-## Not yet measured
-End-to-end serve tok/s A/B. down_proj was a top decode consumer in the trace, and it also
-shortens rank0's critical path (so the TP bubble should shrink too) — direction is a real
-decode speedup + power cut, but the magnitude needs a full TP=2 serve A/B (warm cache now
-covers the 27B). Branch: `feat/v11-k512-tail` (uncommitted).
+## End-to-end serve A/B (MEASURED 2026-06-20, TP=2, single-stream, profiler OFF, 3 reps)
+stock = `:combined-pre-v11k512` (K%1024), fixed = `:combined` (K%512). Same warm cache/config.
+
+| | stock (down_proj→v10 WMMA) | fixed (down_proj→v11 GEMV) |
+|---|---|---|
+| decode tok/s (median ITL) | **25.1** (39.8 ms) | **43.1** (23.2 ms) |
+| power (pkg W) | 238 med / 299 max | 242 med / 293 max |
+
+**+72% (1.72×) single-stream decode, −16.6 ms/token, at the same power** (pure throughput,
+better perf/watt). The ~16.6 ms saved matches the expected down_proj v10→v11 saving
+(~285 µs/call × 64 layers ≈ 18 ms). This corrects the earlier "the wall is the TP collective
+bubble, big wins aren't here" read: v10 down_proj was on rank0's critical path, so removing it
+both shortened the path AND shrank rank1's idle-wait. The fix is a real, large decode win.
