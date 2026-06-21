@@ -63,18 +63,22 @@ def mmq_fp8_gemm(
     scales: torch.Tensor,
     kernel: str = "reference_scalar",
     w_zeros: torch.Tensor | None = None,
+    weight_is_e2m1: bool = False,
 ) -> torch.Tensor:
     """W4A8-FP8 MMQ kernel for gfx1201 (RDNA4).
 
     Args:
         x: (M, K) fp16 activations.
-        w_packed: (N, K/8) int32 weights, 8 uint4b8 per int32, low nibble first.
+        w_packed: (N, K/8) int32 weights, 8 4-bit codes per int32, low nibble first.
         scales: (N, K/32) fp16 per-group weight scales.
         kernel: descriptive dense-kernel name (see _DENSE_KERNELS); default
                 "reference_scalar" (the scalar fp8 golden). Served names are
                 "prefill_wmma" / "prefill_wmma_ashuffle" / "decode_gemv".
         w_zeros: optional (N/8, K/32) int32 packed per-group zero points for
                  asymmetric (AWQ) quant; None for symmetric uint4b8 (zp=8).
+        weight_is_e2m1: when True the 4-bit codes are decoded as mxfp4 (OCP E2M1)
+                 instead of uniform int4; scales are the E8M0 group exponents folded
+                 to fp16 (see mxfp4/convert.py), and w_zeros must be None (symmetric).
 
     Returns:
         (M, N) fp16 output.
@@ -82,7 +86,7 @@ def mmq_fp8_gemm(
     if w_zeros is None:
         w_zeros = torch.empty(0, dtype=torch.int32, device=x.device)
     return torch.ops.w4a8_fp8_wmma.mmq_fp8_gemm(
-        x, w_packed, scales, w_zeros, _resolve_dense_kernel(kernel))
+        x, w_packed, scales, w_zeros, _resolve_dense_kernel(kernel), weight_is_e2m1)
 
 
 def mmq_fp8_moe_gemm(
@@ -96,6 +100,7 @@ def mmq_fp8_moe_gemm(
     block_m: int,
     kernel: str = "wmma",
     w_zeros: torch.Tensor | None = None,
+    weight_is_e2m1: bool = False,
 ) -> torch.Tensor:
     """Grouped (MoE) W4A8-FP8 GEMM for gfx1201.
 
@@ -124,7 +129,8 @@ def mmq_fp8_moe_gemm(
         w_zeros = torch.empty(0, dtype=torch.int32, device=x.device)
     return torch.ops.w4a8_fp8_wmma.mmq_fp8_moe_gemm(
         x, w_packed, scales, w_zeros, sorted_token_ids, expert_ids,
-        num_tokens_post_padded, top_k, block_m, _resolve_moe_kernel(kernel))
+        num_tokens_post_padded, top_k, block_m, _resolve_moe_kernel(kernel),
+        weight_is_e2m1)
 
 
 def mmq_fp8_moe_gemm1_silu(
@@ -138,6 +144,7 @@ def mmq_fp8_moe_gemm1_silu(
     block_m: int,
     kernel: str = "wmma",
     w_zeros: torch.Tensor | None = None,
+    weight_is_e2m1: bool = False,
 ) -> torch.Tensor:
     """Fused gemm1 + silu_and_mul for the gated MoE (gfx1201).
 
@@ -167,7 +174,8 @@ def mmq_fp8_moe_gemm1_silu(
         w_zeros = torch.empty(0, dtype=torch.int32, device=x.device)
     return torch.ops.w4a8_fp8_wmma.mmq_fp8_moe_gemm1_silu(
         x, w_packed, scales, w_zeros, sorted_token_ids, expert_ids,
-        num_tokens_post_padded, top_k, block_m, _resolve_moe_kernel(kernel))
+        num_tokens_post_padded, top_k, block_m, _resolve_moe_kernel(kernel),
+        weight_is_e2m1)
 
 
 def mmq_fp8_moe_gemm_scatter(
@@ -183,6 +191,7 @@ def mmq_fp8_moe_gemm_scatter(
     block_m: int,
     kernel: str = "wmma",
     w_zeros: torch.Tensor | None = None,
+    weight_is_e2m1: bool = False,
 ) -> None:
     """Fused gemm2 + topk-weight + indirect atomic scatter (gfx1201).
 
@@ -206,7 +215,7 @@ def mmq_fp8_moe_gemm_scatter(
     torch.ops.w4a8_fp8_wmma.mmq_fp8_moe_gemm_scatter(
         x, w_packed, scales, w_zeros, sorted_token_ids, expert_ids,
         num_tokens_post_padded, topk_weights, output, top_k, block_m,
-        _resolve_moe_kernel(kernel))
+        _resolve_moe_kernel(kernel), weight_is_e2m1)
 
 
 def mmq_fp8_moe_gather_reduce(out2, sorted_token_ids, topk_weights,
@@ -246,7 +255,7 @@ def mmq_fp8_moe_gather_reduce(out2, sorted_token_ids, topk_weights,
 _register_fake = getattr(getattr(torch, "library", None), "register_fake", None)
 if _register_fake is not None:  # torch >= 2.4 (base is 2.10)
     @_register_fake("w4a8_fp8_wmma::mmq_fp8_gemm")
-    def _fake_mmq_fp8_gemm(x, w_packed, scales, w_zeros, kernel):
+    def _fake_mmq_fp8_gemm(x, w_packed, scales, w_zeros, kernel, weight_is_e2m1=False):
         return x.new_empty((x.shape[0], w_packed.shape[0]), dtype=torch.float16)
 
     @_register_fake("w4a8_fp8_wmma::mmq_regdirect_fp8")
@@ -264,21 +273,21 @@ if _register_fake is not None:  # torch >= 2.4 (base is 2.10)
     @_register_fake("w4a8_fp8_wmma::mmq_fp8_moe_gemm")
     def _fake_mmq_fp8_moe_gemm(x, w_packed, scales, w_zeros, sorted_token_ids,
                                expert_ids, num_tokens_post_padded, top_k,
-                               block_m, kernel):
+                               block_m, kernel, weight_is_e2m1=False):
         return x.new_empty((sorted_token_ids.shape[0], w_packed.shape[1]),
                            dtype=torch.float16)
 
     @_register_fake("w4a8_fp8_wmma::mmq_fp8_moe_gemm1_silu")
     def _fake_mmq_fp8_moe_gemm1_silu(x, w_packed, scales, w_zeros, sorted_token_ids,
                                      expert_ids, num_tokens_post_padded, top_k,
-                                     block_m, kernel):
+                                     block_m, kernel, weight_is_e2m1=False):
         return x.new_empty((sorted_token_ids.shape[0], w_packed.shape[1] // 2),
                            dtype=torch.float16)
 
     @_register_fake("w4a8_fp8_wmma::mmq_fp8_moe_gemm_scatter")
     def _fake_mmq_fp8_moe_gemm_scatter(x, w_packed, scales, w_zeros, sorted_token_ids,
                                        expert_ids, num_tokens_post_padded, topk_weights,
-                                       output, top_k, block_m, kernel):
+                                       output, top_k, block_m, kernel, weight_is_e2m1=False):
         return None  # in-place accumulate into `output`; nothing returned
 
     @_register_fake("w4a8_fp8_wmma::mmq_fp8_moe_gather_reduce")

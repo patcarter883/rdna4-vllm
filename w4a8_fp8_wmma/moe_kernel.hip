@@ -64,6 +64,24 @@ __device__ __forceinline__ unsigned char int4_signed_to_e4m3(int signed_val) {
     return f32_to_e4m3(static_cast<float>(signed_val));
 }
 
+// mxfp4 (OCP E2M1) weight decode for the global-namespace grouped kernels (scalar v0, decode GEMV
+// v7, fused gemm1+silu). The 4-bit code is a non-uniform float {0,.5,1,1.5,2,3,4,6}+sign, exact in
+// e4m3, so it's a different decode table through the SAME hardware convert. WEIGHT operand only --
+// the activation-quant path is untouched (composes with activation-side rotation). e2m1=false ->
+// int4 (subtract zp); true -> mxfp4 (zp ignored, symmetric). The tiled WMMA path uses the
+// w4a8_tile:: twin in tile_config.h. (Mirror of w4a8_fp8_wmma_kernel.hip's helpers.)
+__device__ __forceinline__ float e2m1_lut_f32(int code) {
+    const float LUT[16] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+                           -0.0f,-0.5f,-1.0f,-1.5f,-2.0f,-3.0f,-4.0f,-6.0f };
+    return LUT[code & 0xF];
+}
+__device__ __forceinline__ unsigned char decode_w4_to_e4m3(int code4, int zp, bool e2m1) {
+    return e2m1 ? f32_to_e4m3(e2m1_lut_f32(code4)) : int4_signed_to_e4m3(code4 - zp);
+}
+__device__ __forceinline__ float decode_w4_to_f32(int code4, int zp, bool e2m1) {
+    return e2m1 ? e2m1_lut_f32(code4) : (float)(code4 - zp);
+}
+
 // ---- per-token activation fp8 quant (one block per token row, T rows) ----
 constexpr int ACTQUANT_BLOCK = 256;
 __global__ void moe_compute_act_fp8_kernel(
@@ -127,7 +145,7 @@ __global__ void moe_gemm_v0_kernel(
     int num_valid_tokens,
     float*               __restrict__ output_scatter,  // (M, N) fp32 scatter
     const float*         __restrict__ topk_weights,    // (M*top_k,) scatter
-    int out_top_k) {
+    int out_top_k, bool weight_is_e2m1) {
 
     const int row_pad = blockIdx.y * MV0_BM + threadIdx.y;
     const int col = blockIdx.x * MV0_BN + threadIdx.x;
@@ -161,8 +179,8 @@ __global__ void moe_gemm_v0_kernel(
         for (int kk = 0; kk < group_size; ++kk) {
             const int k = kb + kk;
             const int word = wq_e[col * ppr + (k / PACK_FACTOR)];
-            const int ws = ((word >> ((k % PACK_FACTOR) * 4)) & 0xF) - zp;
-            const float wf = e4m3_to_f32(int4_signed_to_e4m3(ws));
+            const int code4 = (word >> ((k % PACK_FACTOR) * 4)) & 0xF;
+            const float wf = decode_w4_to_f32(code4, zp, weight_is_e2m1);
             const float af = e4m3_to_f32(x_fp8[src * K + k]);
             gacc += wf * af;
         }
@@ -558,7 +576,7 @@ __global__ void __launch_bounds__(MV5_MAX_WARPS * 32) moe_gemm1_silu_v5_kernel(
     const int*           __restrict__ num_tokens_post_padded,
     __half*              __restrict__ out,       // (P, inter)
     int T, int N, int K, int group_size, int top_k, int block_m,
-    int num_valid_tokens, int inter) {
+    int num_valid_tokens, int inter, bool weight_is_e2m1) {
 
     constexpr int NFRAG = BN / WMMA_DIM;
     const int block_idx = blockIdx.y;
@@ -631,8 +649,8 @@ __global__ void __launch_bounds__(MV5_MAX_WARPS * 32) moe_gemm1_silu_v5_kernel(
             unsigned char* du = &Bu_tile[n * LDSBK + k8 * PACK_FACTOR];
             #pragma unroll
             for (int jj = 0; jj < PACK_FACTOR; ++jj) {
-                dg[jj] = (ang < inter) ? int4_signed_to_e4m3(((wg >> (jj * 4)) & 0xF) - zg) : 0;
-                du[jj] = (ang < inter) ? int4_signed_to_e4m3(((wu >> (jj * 4)) & 0xF) - zu) : 0;
+                dg[jj] = (ang < inter) ? decode_w4_to_e4m3((wg >> (jj * 4)) & 0xF, zg, weight_is_e2m1) : 0;
+                du[jj] = (ang < inter) ? decode_w4_to_e4m3((wu >> (jj * 4)) & 0xF, zu, weight_is_e2m1) : 0;
             }
         }
         __syncthreads();
@@ -707,7 +725,7 @@ __global__ void __launch_bounds__(MV5_MAX_WARPS * 32) moe_gemm1_silu_v6_kernel(
     const int*           __restrict__ num_tokens_post_padded,
     __half*              __restrict__ out,       // (P, inter)
     int T, int N, int K, int group_size, int top_k, int block_m,
-    int num_valid_tokens, int gtile, int inter) {
+    int num_valid_tokens, int gtile, int inter, bool weight_is_e2m1) {
 
     constexpr int NFRAG = BN / WMMA_DIM;
     const int block_idx = blockIdx.y;
@@ -878,7 +896,7 @@ __global__ void __launch_bounds__(NWARPS * 32) moe_gemv_v7_kernel(
     int num_valid_tokens,
     float*               __restrict__ output_scatter,
     const float*         __restrict__ topk_weights,
-    int out_top_k, int BK) {
+    int out_top_k, int BK, bool weight_is_e2m1) {
 
     const int block_idx = blockIdx.y;
     const int row0 = block_idx * block_m;
@@ -978,7 +996,8 @@ __global__ void __launch_bounds__(NWARPS * 32) moe_gemv_v7_kernel(
                     float wf[32];
                     #pragma unroll
                     for (int t = 0; t < 32; ++t)
-                        wf[t] = (float)(((wvc[t >> 3] >> ((t & 7) * 4)) & 0xF) - zp);
+                        wf[t] = decode_w4_to_f32((wvc[t >> 3] >> ((t & 7) * 4)) & 0xF, zp,
+                                                 weight_is_e2m1);
                     for (int r = 0; r < M_real; ++r) {
                         const unsigned int* ar4 =
                             reinterpret_cast<const unsigned int*>(v7_a + r * ck + k0);
@@ -1066,7 +1085,7 @@ static void run_moe_gemm(
     const at::Tensor& expert_ids, const at::Tensor& num_tokens_post_padded,
     __half* out, int N, int num_valid_tokens, int top_k, int block_m,
     int version, float* output_scatter, const float* topk_weights,
-    int out_top_k) {
+    int out_top_k, bool weight_is_e2m1) {
     const int T = x.size(0);
     const int K = x.size(1);
     const int group_size = K / scales.size(2);
@@ -1112,13 +1131,13 @@ static void run_moe_gemm(
         if (!cfg.A_IN_LDS) {   // default: A via warp-shuffle gather, B-only LDS (former v6)
             #define TV6(BN_T) w4a8_tile::moe_gemm_tiled_v6_kernel<WmmaFp8, SCATTER, BN_T><<<grid, block, smem6, stream>>>( \
                 xf, asc, wq, wsc, wz, sti, eid, ntp, out, T, N, K, group_size, \
-                top_k, block_m, num_valid_tokens, output_scatter, topk_weights, out_top_k, gt6)
+                top_k, block_m, num_valid_tokens, output_scatter, topk_weights, out_top_k, gt6, weight_is_e2m1)
             if (bn == 128) TV6(128); else TV6(MV5_BN);
             #undef TV6
         } else {               // A staged in LDS (former v5)
             #define TV5(BN_T) w4a8_tile::moe_gemm_tiled_kernel<WmmaFp8, SCATTER, BN_T><<<grid, block, smem5, stream>>>( \
                 xf, asc, wq, wsc, wz, sti, eid, ntp, out, T, N, K, group_size, \
-                top_k, block_m, num_valid_tokens, output_scatter, topk_weights, out_top_k)
+                top_k, block_m, num_valid_tokens, output_scatter, topk_weights, out_top_k, weight_is_e2m1)
             if (bn == 128) TV5(128); else TV5(MV5_BN);
             #undef TV5
         }
@@ -1157,7 +1176,7 @@ static void run_moe_gemm(
             <<<grid, dim3(NW * 32), smem7, stream>>>( \
             xf, asc, wq, wsc, wz, sti, eid, ntp, out, T, N, K, group_size, \
             top_k, block_m, num_valid_tokens, output_scatter, topk_weights, \
-            out_top_k, bk)
+            out_top_k, bk, weight_is_e2m1)
         #define GEMV7_CO(NW, MM) do { \
             if (cols == 8) GEMV7(NW, MM, 8); \
             else if (cols == 4) GEMV7(NW, MM, 4); \
@@ -1184,7 +1203,7 @@ static void run_moe_gemm(
         moe_gemm_v0_kernel<SCATTER><<<grid, block, 0, stream>>>(
             xf, asc, wq, wsc, wz, sti, eid, ntp, out, T, N, K, group_size,
             top_k, block_m, num_valid_tokens, output_scatter, topk_weights,
-            out_top_k);
+            out_top_k, weight_is_e2m1);
     }
 }
 
@@ -1235,7 +1254,7 @@ static void run_moe_gemm1_silu(
     const int* wz, const at::Tensor& sorted_token_ids,
     const at::Tensor& expert_ids, const at::Tensor& num_tokens_post_padded,
     __half* out, int N, int inter, int num_valid_tokens, int top_k, int block_m,
-    int version) {
+    int version, bool weight_is_e2m1) {
     using namespace w4a8_fp8_moe;
     const int T = x.size(0);
     const int K = x.size(1);
@@ -1275,14 +1294,14 @@ static void run_moe_gemm1_silu(
         const size_t smem6 = per_grp * gt6;  // 2 slabs (gate|up) x gtile groups
         #define G1SILU_V6(BN_T) moe_gemm1_silu_v6_kernel<BN_T><<<grid, block, smem6, stream>>>( \
             xf, asc, wq, wsc, wz, sti, eid, ntp, out, T, N, K, group_size, \
-            top_k, block_m, num_valid_tokens, gt6, inter)
+            top_k, block_m, num_valid_tokens, gt6, inter, weight_is_e2m1)
         if (bn == 128) G1SILU_V6(128); else G1SILU_V6(MV5_BN);
         #undef G1SILU_V6
     } else {  // former v5: A+B LDS, gate + up B slabs + A tile
         const size_t smem5 = (size_t)(block_m + 2 * bn) * (group_size + LDS_PAD);
         #define G1SILU_V5(BN_T) moe_gemm1_silu_v5_kernel<BN_T><<<grid, block, smem5, stream>>>( \
             xf, asc, wq, wsc, wz, sti, eid, ntp, out, T, N, K, group_size, \
-            top_k, block_m, num_valid_tokens, inter)
+            top_k, block_m, num_valid_tokens, inter, weight_is_e2m1)
         if (bn == 128) G1SILU_V5(128); else G1SILU_V5(MV5_BN);
         #undef G1SILU_V5
     }
@@ -1302,7 +1321,7 @@ void launch_mmq_fp8_moe_gemm1_silu_gfx1201(
     const at::Tensor& expert_ids,        // (P/block_m,) int32
     const at::Tensor& num_tokens_post_padded,  // (1,) int32
     at::Tensor& out,                     // (P, inter) fp16
-    int64_t top_k, int64_t block_m, int64_t kernel) {
+    int64_t top_k, int64_t block_m, int64_t kernel, bool weight_is_e2m1) {
 
     using namespace w4a8_fp8_moe;
     const int N = w_packed.size(1);           // 2*inter (gate|up)
@@ -1321,7 +1340,7 @@ void launch_mmq_fp8_moe_gemm1_silu_gfx1201(
         x, w_packed, scales, wz, sorted_token_ids, expert_ids,
         num_tokens_post_padded,
         reinterpret_cast<__half*>(out.data_ptr<at::Half>()), N, inter,
-        num_valid_tokens, (int)top_k, (int)block_m, (int)kernel);
+        num_valid_tokens, (int)top_k, (int)block_m, (int)kernel, weight_is_e2m1);
 }
 
 void launch_mmq_fp8_moe_gemm_gfx1201(
@@ -1333,7 +1352,7 @@ void launch_mmq_fp8_moe_gemm_gfx1201(
     const at::Tensor& expert_ids,        // (P/block_m,) int32
     const at::Tensor& num_tokens_post_padded,  // (1,) int32
     at::Tensor& out,                     // (P, N) fp16
-    int64_t top_k, int64_t block_m, int64_t kernel) {
+    int64_t top_k, int64_t block_m, int64_t kernel, bool weight_is_e2m1) {
 
     using namespace w4a8_fp8_moe;
     const int N = w_packed.size(1);
@@ -1356,7 +1375,8 @@ void launch_mmq_fp8_moe_gemm_gfx1201(
         num_tokens_post_padded,
         reinterpret_cast<__half*>(out.data_ptr<at::Half>()), N,
         num_valid_tokens, (int)top_k, (int)block_m, (int)kernel,
-        /*output_scatter=*/nullptr, /*topk_weights=*/nullptr, /*out_top_k=*/0);
+        /*output_scatter=*/nullptr, /*topk_weights=*/nullptr, /*out_top_k=*/0,
+        weight_is_e2m1);
 }
 
 // Fused gemm2 + topk-weight + indirect atomic scatter into the final (M,N) fp32
@@ -1373,7 +1393,7 @@ void launch_mmq_fp8_moe_gemm_scatter_gfx1201(
     const at::Tensor& num_tokens_post_padded,  // (1,) int32
     const at::Tensor& topk_weights,      // (M*top_k,) fp32
     at::Tensor& output,                  // (M, N) fp32, pre-zeroed
-    int64_t top_k, int64_t block_m, int64_t kernel) {
+    int64_t top_k, int64_t block_m, int64_t kernel, bool weight_is_e2m1) {
 
     using namespace w4a8_fp8_moe;
     const int N = w_packed.size(1);
@@ -1396,7 +1416,8 @@ void launch_mmq_fp8_moe_gemm_scatter_gfx1201(
         x, w_packed, scales, wz, sorted_token_ids, expert_ids,
         num_tokens_post_padded, /*out=*/nullptr, N, num_valid_tokens,
         (int)top_k, (int)block_m, (int)kernel,
-        output.data_ptr<float>(), topk_weights.data_ptr<float>(), (int)top_k);
+        output.data_ptr<float>(), topk_weights.data_ptr<float>(), (int)top_k,
+        weight_is_e2m1);
 }
 
 // Contention-free MoE reduce (replaces the gemm2 atomic scatter at scale).

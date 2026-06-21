@@ -72,6 +72,32 @@ __device__ __forceinline__ unsigned char int4_signed_to_e4m3(int signed_val) {
     return f32_to_e4m3(static_cast<float>(signed_val));
 }
 
+// mxfp4 (OCP E2M1) weight decode. Unlike AWQ/GPTQ int4 (a uniform integer), the 4-bit code is a
+// non-uniform float {0,.5,1,1.5,2,3,4,6}+sign, so it can't reuse the subtract-zp integer path --
+// but every magnitude is exact in e4m3, so we feed the codebook value through the SAME hardware
+// f32->e4m3 and the downstream fp8 WMMA core is identical & bit-exact. Index = raw 4-bit code
+// (matches vLLM _FP4_E2M1_LUT / tile_config.h::e2m1_to_e4m3).
+__device__ __forceinline__ float e2m1_lut_f32(int code) {
+    const float LUT[16] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+                           -0.0f,-0.5f,-1.0f,-1.5f,-2.0f,-3.0f,-4.0f,-6.0f };
+    return LUT[code & 0xF];
+}
+__device__ __forceinline__ unsigned char e2m1_to_e4m3(int code) {
+    return f32_to_e4m3(e2m1_lut_f32(code));
+}
+
+// Unified 4-bit weight-nibble decode, selected by a per-CTA-uniform runtime flag (decode is
+// memory-bound, so the branch is free). e2m1=false -> int4 (subtract zp); true -> mxfp4 E2M1 (zp
+// ignored, symmetric). WEIGHT operand only -- the activation-quant path is untouched, so this
+// composes with activation-side changes (e.g. a pre-quant rotation). Two forms: ..._e4m3 for the
+// WMMA staging paths (byte into LDS), ..._f32 for the scalar-dot paths (v0 ref, decode GEMV).
+__device__ __forceinline__ unsigned char decode_w4_to_e4m3(int code4, int zp, bool e2m1) {
+    return e2m1 ? e2m1_to_e4m3(code4) : int4_signed_to_e4m3(code4 - zp);
+}
+__device__ __forceinline__ float decode_w4_to_f32(int code4, int zp, bool e2m1) {
+    return e2m1 ? e2m1_lut_f32(code4) : (float)(code4 - zp);
+}
+
 // ============================================================
 // v0: scalar reference (one thread per output element)
 // ============================================================
@@ -85,7 +111,7 @@ __global__ void mmq_fp8_gemm_kernel_v0(
     const __half*        __restrict__ w_scales,
     const int*           __restrict__ w_zeros_packed,  // (N/8, K/gs) or nullptr
     __half*              __restrict__ out,
-    int M, int N, int K, int group_size) {
+    int M, int N, int K, int group_size, bool weight_is_e2m1) {
 
     const int row = blockIdx.y * V0_BLOCK_M + threadIdx.y;
     const int col = blockIdx.x * V0_BLOCK_N + threadIdx.x;
@@ -108,8 +134,8 @@ __global__ void mmq_fp8_gemm_kernel_v0(
         for (int kk = 0; kk < group_size; ++kk) {
             const int k = k_base + kk;
             const int word = w_packed[col * packed_per_row + (k / PACK_FACTOR)];
-            const int w_signed = ((word >> ((k % PACK_FACTOR) * 4)) & 0xF) - zp;
-            const float w_f = e4m3_to_f32(int4_signed_to_e4m3(w_signed));
+            const int code4 = (word >> ((k % PACK_FACTOR) * 4)) & 0xF;
+            const float w_f = decode_w4_to_f32(code4, zp, weight_is_e2m1);
             const float a_f = e4m3_to_f32(x_fp8[row * K + k]);
             group_acc += w_f * a_f;
         }
@@ -656,7 +682,7 @@ __global__ void __launch_bounds__(V2_NWARPS * 32) mmq_fp8_gemm_kernel_v5(
     const __half*        __restrict__ w_scales,
     const int*           __restrict__ w_zeros_packed,
     __half*              __restrict__ out,
-    int M, int N, int K, int group_size) {
+    int M, int N, int K, int group_size, bool weight_is_e2m1) {
 
     const int block_m = blockIdx.y * V2_BM;
     const int block_n = blockIdx.x * V2_BN;
@@ -719,7 +745,7 @@ __global__ void __launch_bounds__(V2_NWARPS * 32) mmq_fp8_gemm_kernel_v5(
             #pragma unroll
             for (int jj = 0; jj < PACK_FACTOR; ++jj)
                 dst[jj] = (an < N)
-                    ? int4_signed_to_e4m3(((word >> (jj * 4)) & 0xF) - zp) : 0;
+                    ? decode_w4_to_e4m3((word >> (jj * 4)) & 0xF, zp, weight_is_e2m1) : 0;
         }
         __syncthreads();
 
@@ -1444,7 +1470,7 @@ __global__ void __launch_bounds__(NWARPS * 32) mmq_fp8_gemm_kernel_v10(
     const __half*        __restrict__ w_scales,
     const int*           __restrict__ w_zeros_packed,
     __half*              __restrict__ out,
-    int M, int N, int K, int group_size, int swiz) {
+    int M, int N, int K, int group_size, int swiz, bool weight_is_e2m1) {
 
     constexpr int NFRAG = BN / WMMA_DIM;
     constexpr int LDS_PAD = 8;
@@ -1514,7 +1540,7 @@ __global__ void __launch_bounds__(NWARPS * 32) mmq_fp8_gemm_kernel_v10(
             #pragma unroll
             for (int jj = 0; jj < PACK_FACTOR; ++jj)
                 dst[jj] = (an < N)
-                    ? int4_signed_to_e4m3(((word >> (jj * 4)) & 0xF) - zp) : 0;
+                    ? decode_w4_to_e4m3((word >> (jj * 4)) & 0xF, zp, weight_is_e2m1) : 0;
         }
         for (int i = tid; i < BN; i += nthreads) {
             const int an = block_n + i;
@@ -1608,7 +1634,7 @@ __global__ void __launch_bounds__(NWARPS * 32) mmq_fp8_gemv_kernel_v11(
     const __half*        __restrict__ w_scales, // (N, K/g)
     const int*           __restrict__ w_zeros,  // (N/8, K/g) or null
     __half*              __restrict__ out,       // (M, N)
-    int M, int N, int K, int group_size, int BK) {  // BK: K-chunk staged in LDS
+    int M, int N, int K, int group_size, int BK, bool weight_is_e2m1) {  // BK: K-chunk staged in LDS
 
     const int tid = threadIdx.x;
     const int warp_id = tid >> 5;
@@ -1659,7 +1685,8 @@ __global__ void __launch_bounds__(NWARPS * 32) mmq_fp8_gemv_kernel_v11(
                 float wf[32];
                 #pragma unroll
                 for (int t = 0; t < 32; ++t)
-                    wf[t] = (float)(((wv[t >> 3] >> ((t & 7) * 4)) & 0xF) - zp);
+                    wf[t] = decode_w4_to_f32((wv[t >> 3] >> ((t & 7) * 4)) & 0xF, zp,
+                                             weight_is_e2m1);
                 for (int m = 0; m < M; ++m) {
                     const unsigned int* ar4 =
                         reinterpret_cast<const unsigned int*>(v11_a + m * ck + k0);
@@ -2483,7 +2510,8 @@ void launch_mmq_fp8_gemm_gfx1201(
     const at::Tensor& scales,
     const at::Tensor& w_zeros,
     at::Tensor& out,
-    int64_t kernel) {
+    int64_t kernel,
+    bool weight_is_e2m1) {
 
     using namespace w4a8_fp8_wmma;
     using DK = w4a8::DenseKernel;
@@ -2659,7 +2687,8 @@ void launch_mmq_fp8_gemm_gfx1201(
             x_fp8.data_ptr<unsigned char>(), act_scales.data_ptr<float>(),
             w_packed.data_ptr<int>(),
             reinterpret_cast<const __half*>(scales.data_ptr<at::Half>()), w_zeros_ptr,
-            reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, K, group_size, BK); };
+            reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, K, group_size, BK,
+            weight_is_e2m1); };
         if (nw == 8) L(mmq_fp8_gemv_kernel_v11<8, 16>);
         else if (nw == 16) L(mmq_fp8_gemv_kernel_v11<16, 16>);
         else if (nw == 32) L(mmq_fp8_gemv_kernel_v11<32, 16>);
@@ -2694,7 +2723,7 @@ void launch_mmq_fp8_gemm_gfx1201(
                 reinterpret_cast<const __half*>(scales.data_ptr<at::Half>()),
                 w_zeros_ptr,
                 reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
-                M, N, K, group_size, swiz);
+                M, N, K, group_size, swiz, weight_is_e2m1);
         };
         #define V10_L(BM, BN, G) do { \
             if (db) { \
@@ -2891,7 +2920,7 @@ void launch_mmq_fp8_gemm_gfx1201(
                 reinterpret_cast<const __half*>(scales.data_ptr<at::Half>()),
                 w_zeros_ptr,
                 reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
-                M, N, K, group_size);
+                M, N, K, group_size, weight_is_e2m1);
         }
     } else if (dk == DK::RocwmmaPipe) {  // v4
         // v4: single-buffer staging + kt-level fragment pipelining.
@@ -2940,7 +2969,7 @@ void launch_mmq_fp8_gemm_gfx1201(
             reinterpret_cast<const __half*>(scales.data_ptr<at::Half>()),
             w_zeros_ptr,
             reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
-            M, N, K, group_size);
+            M, N, K, group_size, weight_is_e2m1);
     }
 }
 

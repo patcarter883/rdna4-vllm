@@ -44,6 +44,32 @@ __device__ __forceinline__ unsigned char int4_signed_to_e4m3(int signed_val) {
     return f32_to_e4m3(static_cast<float>(signed_val));
 }
 
+// ---- mxfp4 (OCP E2M1) weight decode -------------------------------------------------------------
+// mxfp4 packs a 4-bit *float* (E2M1) per weight, NOT a uniform integer like AWQ/GPTQ int4. The 16
+// codes map to the non-uniform codebook {0,.5,1,1.5,2,3,4,6} (+ sign), so the int4_signed_to_e4m3
+// integer path CANNOT represent them (they aren't consecutive integers). BUT every one of those 8
+// magnitudes is *exactly* representable in fp8 e4m3, so the decode is just a different 16-entry
+// table fed through the SAME hardware f32->e4m3 used by the int4 path -> the downstream fp8 WMMA
+// core is identical and bit-exact at the decode step. The per-group E8M0 scale is folded in at load
+// time as the existing fp16 group-scale (see mxfp4/convert.py), so the kernel epilogue is unchanged.
+//
+// LUT index = the raw 4-bit code (bit3 = sign, bits2-1 = exp, bit0 = mantissa), matching vLLM's
+// _FP4_E2M1_LUT ordering. Decode is on the WEIGHT (B) operand only; the activation (A) quant path is
+// untouched, so this composes with activation-side changes (e.g. pre-quant rotation).
+__device__ __forceinline__ unsigned char e2m1_to_e4m3(int code) {
+    const float LUT[16] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+                           -0.0f,-0.5f,-1.0f,-1.5f,-2.0f,-3.0f,-4.0f,-6.0f };
+    return f32_to_e4m3(LUT[code & 0xF]);
+}
+
+// Unified 4-bit weight-nibble -> e4m3 byte, selected by a per-CTA-uniform runtime flag (decode is
+// memory-bound, so the branch is free). e2m1=false -> int4 (subtract zp); true -> mxfp4 E2M1 (zp
+// ignored, symmetric). WEIGHT operand only; the grouped-MoE WMMA staging (moe_gemm_tiled.h) calls
+// this when staging B into LDS.
+__device__ __forceinline__ unsigned char decode_w4_to_e4m3(int code4, int zp, bool e2m1) {
+    return e2m1 ? e2m1_to_e4m3(code4) : int4_signed_to_e4m3(code4 - zp);
+}
+
 // ============================================================================
 // MMA policy concept. A backend provides:
 //   using AFrag, BFrag, CFrag;            // per-lane operand / accumulator fragments

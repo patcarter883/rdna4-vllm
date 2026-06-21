@@ -201,7 +201,7 @@ __global__ void __launch_bounds__(NWARPS * 32) gemm_tiled_ashuffle_kernel(
     const __half*        __restrict__ w_scales,
     const int*           __restrict__ w_zeros_packed,
     __half*              __restrict__ out,
-    int M, int N, int K, int group_size, int swiz) {
+    int M, int N, int K, int group_size, int swiz, bool weight_is_e2m1) {
 
     constexpr int NFRAG = BN / WMMA_DIM;
     constexpr int LDS_PAD = 8;
@@ -263,7 +263,7 @@ __global__ void __launch_bounds__(NWARPS * 32) gemm_tiled_ashuffle_kernel(
             #pragma unroll
             for (int jj = 0; jj < PACK_FACTOR; ++jj)
                 dst[jj] = (an < N)
-                    ? int4_signed_to_e4m3(((word >> (jj * 4)) & 0xF) - zp) : 0;
+                    ? decode_w4_to_e4m3((word >> (jj * 4)) & 0xF, zp, weight_is_e2m1) : 0;
         }
         for (int i = tid; i < BN; i += nthreads) {
             const int an = block_n + i;

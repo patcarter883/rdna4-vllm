@@ -25,7 +25,8 @@ void launch_mmq_fp8_gemm_gfx1201(
     const at::Tensor& scales,
     const at::Tensor& w_zeros,
     at::Tensor& out,
-    int64_t kernel);
+    int64_t kernel,
+    bool weight_is_e2m1);
 
 void launch_mmq_regdirect_fp8_gfx1201(
     const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
@@ -50,7 +51,8 @@ void launch_mmq_fp8_moe_gemm_gfx1201(
     at::Tensor& out,
     int64_t top_k,
     int64_t block_m,
-    int64_t version);
+    int64_t version,
+    bool weight_is_e2m1);
 
 void launch_mmq_fp8_moe_gemm1_silu_gfx1201(
     const at::Tensor& x,
@@ -63,7 +65,8 @@ void launch_mmq_fp8_moe_gemm1_silu_gfx1201(
     at::Tensor& out,
     int64_t top_k,
     int64_t block_m,
-    int64_t version);
+    int64_t version,
+    bool weight_is_e2m1);
 
 void launch_mmq_fp8_moe_gemm_scatter_gfx1201(
     const at::Tensor& x,
@@ -77,7 +80,8 @@ void launch_mmq_fp8_moe_gemm_scatter_gfx1201(
     at::Tensor& output,
     int64_t top_k,
     int64_t block_m,
-    int64_t version);
+    int64_t version,
+    bool weight_is_e2m1);
 
 void launch_moe_gather_reduce_gfx1201(
     const at::Tensor& out2,
@@ -96,7 +100,8 @@ at::Tensor mmq_fp8_gemm_forward(
     const at::Tensor& w_packed,
     const at::Tensor& scales,
     const at::Tensor& w_zeros,
-    int64_t kernel) {
+    int64_t kernel,
+    bool weight_is_e2m1) {
 
     TORCH_CHECK(x.is_cuda() && w_packed.is_cuda() && scales.is_cuda(),
                 "x, w_packed, scales must be CUDA");
@@ -127,6 +132,7 @@ at::Tensor mmq_fp8_gemm_forward(
                 "Names live above the torch ABI in __init__.py.");
 
     if (w_zeros.defined() && w_zeros.numel() > 0) {
+        TORCH_CHECK(!weight_is_e2m1, "mxfp4 (E2M1) weights are symmetric; w_zeros must be empty");
         TORCH_CHECK(w_zeros.is_cuda() && w_zeros.scalar_type() == at::kInt,
                     "w_zeros must be CUDA int32 (packed)");
         TORCH_CHECK(w_zeros.dim() == 2 && w_zeros.size(0) * 8 == N && w_zeros.size(1) == scales.size(1),
@@ -135,7 +141,7 @@ at::Tensor mmq_fp8_gemm_forward(
     }
 
     auto out = at::empty({M, N}, x.options());
-    launch_mmq_fp8_gemm_gfx1201(x, w_packed, scales, w_zeros, out, kernel);
+    launch_mmq_fp8_gemm_gfx1201(x, w_packed, scales, w_zeros, out, kernel, weight_is_e2m1);
     return out;
 }
 
@@ -179,7 +185,8 @@ at::Tensor mmq_fp8_moe_gemm_forward(
     const at::Tensor& num_tokens_post_padded,
     int64_t top_k,
     int64_t block_m,
-    int64_t kernel) {
+    int64_t kernel,
+    bool weight_is_e2m1) {
 
     TORCH_CHECK(x.is_cuda() && w_packed.is_cuda() && scales.is_cuda(),
                 "x, w_packed, scales must be CUDA");
@@ -216,7 +223,7 @@ at::Tensor mmq_fp8_moe_gemm_forward(
     auto out = at::empty({P, N}, x.options());
     launch_mmq_fp8_moe_gemm_gfx1201(
         x, w_packed, scales, w_zeros, sorted_token_ids, expert_ids,
-        num_tokens_post_padded, out, top_k, block_m, kernel);
+        num_tokens_post_padded, out, top_k, block_m, kernel, weight_is_e2m1);
     return out;
 }
 
@@ -235,7 +242,8 @@ at::Tensor mmq_fp8_moe_gemm1_silu_forward(
     const at::Tensor& num_tokens_post_padded,
     int64_t top_k,
     int64_t block_m,
-    int64_t kernel) {
+    int64_t kernel,
+    bool weight_is_e2m1) {
 
     TORCH_CHECK(x.is_cuda() && w_packed.is_cuda() && scales.is_cuda(),
                 "x, w_packed, scales must be CUDA");
@@ -274,7 +282,7 @@ at::Tensor mmq_fp8_moe_gemm1_silu_forward(
     auto out = at::empty({P, inter}, x.options());
     launch_mmq_fp8_moe_gemm1_silu_gfx1201(
         x, w_packed, scales, w_zeros, sorted_token_ids, expert_ids,
-        num_tokens_post_padded, out, top_k, block_m, kernel);
+        num_tokens_post_padded, out, top_k, block_m, kernel, weight_is_e2m1);
     return out;
 }
 
@@ -294,7 +302,8 @@ void mmq_fp8_moe_gemm_scatter_forward(
     at::Tensor& output,
     int64_t top_k,
     int64_t block_m,
-    int64_t kernel) {
+    int64_t kernel,
+    bool weight_is_e2m1) {
 
     TORCH_CHECK(x.is_cuda() && w_packed.is_cuda() && scales.is_cuda(),
                 "x, w_packed, scales must be CUDA");
@@ -340,7 +349,7 @@ void mmq_fp8_moe_gemm_scatter_forward(
 
     launch_mmq_fp8_moe_gemm_scatter_gfx1201(
         x, w_packed, scales, w_zeros, sorted_token_ids, expert_ids,
-        num_tokens_post_padded, topk_weights, output, top_k, block_m, kernel);
+        num_tokens_post_padded, topk_weights, output, top_k, block_m, kernel, weight_is_e2m1);
 }
 
 // Contention-free MoE reduce: gemm2 NON-scatter (P,N) -> weighted gather-reduce
@@ -377,7 +386,7 @@ at::Tensor mmq_fp8_moe_gather_reduce_forward(
 // "unsupported operator: w4a8_fp8_wmma.*" the moment the kernel actually engages).
 // The matching fake/meta kernels (output-shape inference) live in __init__.py.
 TORCH_LIBRARY(w4a8_fp8_wmma, m) {
-    m.def("mmq_fp8_gemm(Tensor x, Tensor w_packed, Tensor scales, Tensor w_zeros, int kernel) -> Tensor",
+    m.def("mmq_fp8_gemm(Tensor x, Tensor w_packed, Tensor scales, Tensor w_zeros, int kernel, bool weight_is_e2m1=False) -> Tensor",
           {at::Tag::pt2_compliant_tag});
     m.def("mmq_regdirect_fp8(Tensor x, Tensor w_rep, Tensor scales, Tensor w_zeros, int N) -> Tensor",
           {at::Tag::pt2_compliant_tag});
@@ -387,16 +396,16 @@ TORCH_LIBRARY(w4a8_fp8_wmma, m) {
           {at::Tag::pt2_compliant_tag});
     m.def("mmq_fp8_moe_gemm(Tensor x, Tensor w_packed, Tensor scales, Tensor w_zeros, "
           "Tensor sorted_token_ids, Tensor expert_ids, Tensor num_tokens_post_padded, "
-          "int top_k, int block_m, int kernel) -> Tensor",
+          "int top_k, int block_m, int kernel, bool weight_is_e2m1=False) -> Tensor",
           {at::Tag::pt2_compliant_tag});
     m.def("mmq_fp8_moe_gemm1_silu(Tensor x, Tensor w_packed, Tensor scales, Tensor w_zeros, "
           "Tensor sorted_token_ids, Tensor expert_ids, Tensor num_tokens_post_padded, "
-          "int top_k, int block_m, int kernel) -> Tensor",
+          "int top_k, int block_m, int kernel, bool weight_is_e2m1=False) -> Tensor",
           {at::Tag::pt2_compliant_tag});
     m.def("mmq_fp8_moe_gemm_scatter(Tensor x, Tensor w_packed, Tensor scales, "
           "Tensor w_zeros, Tensor sorted_token_ids, Tensor expert_ids, "
           "Tensor num_tokens_post_padded, Tensor topk_weights, Tensor(a!) output, "
-          "int top_k, int block_m, int kernel) -> ()",
+          "int top_k, int block_m, int kernel, bool weight_is_e2m1=False) -> ()",
           {at::Tag::pt2_compliant_tag});
     m.def("mmq_fp8_moe_gather_reduce(Tensor out2, Tensor sorted_token_ids, "
           "Tensor topk_weights, Tensor num_tokens_post_padded, int top_k) -> Tensor",

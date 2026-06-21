@@ -37,7 +37,7 @@ __global__ void __launch_bounds__(MAX_THREADS) moe_gemm_tiled_kernel(
     int num_valid_tokens,
     float*               __restrict__ output_scatter,   // (M, N) fp32 scatter
     const float*         __restrict__ topk_weights,     // (M*top_k,) scatter
-    int out_top_k) {
+    int out_top_k, bool weight_is_e2m1) {
 
     static_assert(BN % WMMA_DIM == 0, "BN must be a multiple of WMMA_DIM");
     constexpr int NFRAG = BN / WMMA_DIM;             // independent accumulators per warp
@@ -110,7 +110,7 @@ __global__ void __launch_bounds__(MAX_THREADS) moe_gemm_tiled_kernel(
             #pragma unroll
             for (int jj = 0; jj < PACK_FACTOR; ++jj)
                 dst[jj] = (an < N)
-                    ? int4_signed_to_e4m3(((word >> (jj * 4)) & 0xF) - zp) : 0;
+                    ? decode_w4_to_e4m3((word >> (jj * 4)) & 0xF, zp, weight_is_e2m1) : 0;
         }
         __syncthreads();
 
@@ -195,7 +195,7 @@ __global__ void __launch_bounds__(MAX_THREADS) moe_gemm_tiled_v6_kernel(
     int num_valid_tokens,
     float*               __restrict__ output_scatter,
     const float*         __restrict__ topk_weights,
-    int out_top_k, int gtile) {
+    int out_top_k, int gtile, bool weight_is_e2m1) {
 
     static_assert(BN % WMMA_DIM == 0, "BN must be a multiple of WMMA_DIM");
     constexpr int NFRAG = BN / WMMA_DIM;
@@ -265,7 +265,7 @@ __global__ void __launch_bounds__(MAX_THREADS) moe_gemm_tiled_v6_kernel(
                 #pragma unroll
                 for (int jj = 0; jj < PACK_FACTOR; ++jj)
                     dst[jj] = (an < N)
-                        ? int4_signed_to_e4m3(((word >> (jj * 4)) & 0xF) - zp) : 0;
+                        ? decode_w4_to_e4m3((word >> (jj * 4)) & 0xF, zp, weight_is_e2m1) : 0;
             }
         }
         __syncthreads();
