@@ -494,7 +494,7 @@ def _run_grouped_moe(x, w1, w2, w1_s, w2_s, w1_zp, w2_zp,
                      topk_weights, topk_ids, activation,
                      global_num_experts, expert_map,
                      apply_router_weight_on_input, kernel, out_dtype=None,
-                     weight_is_e2m1=False):
+                     weight_is_e2m1=False, w1_bias=None, w2_bias=None):
     """Compose the whole gated MoE from the one grouped FP8-WMMA op and return
     the final ``(M, K)`` output (already topk-weighted + reduced).
 
@@ -539,7 +539,7 @@ def _run_grouped_moe(x, w1, w2, w1_s, w2_s, w1_zp, w2_zp,
                 x[lo:hi], w1, w2, w1_s, w2_s, w1_zp, w2_zp,
                 topk_weights[lo:hi], topk_ids[lo:hi], activation,
                 global_num_experts, expert_map, False, kernel, out_dtype,
-                weight_is_e2m1=weight_is_e2m1)
+                weight_is_e2m1=weight_is_e2m1, w1_bias=w1_bias, w2_bias=w2_bias)
         return out
 
     # The op requires fp16 scales; convert defensively (no-op if already fp16).
@@ -562,6 +562,17 @@ def _run_grouped_moe(x, w1, w2, w1_s, w2_s, w1_zp, w2_zp,
     # contention-free at decode). Gated by M<=GEMV_MAX_M; "scalar" (golden) opts out.
     gemv_max = int(os.environ.get("VLLM_ROCM_W4A8_FP8_WMMA_MOE_GEMV_MAX_M", "96"))
     use_gemv = kernel != "scalar" and M <= gemv_max
+    # Per-expert biases (gpt-oss mxfp4) need the materialised gemm2 (P,N) buffer to add w2_bias
+    # before the topk gather-reduce, and an unfused gemm1 to add w1_bias before the activation —
+    # neither the fused-silu kernel nor the gemv scatter epilogue exposes those. So force the
+    # unfused gather path when biases are present. (Correctness first; biased decode is rare.)
+    has_bias = w1_bias is not None or w2_bias is not None
+    if has_bias:
+        use_gemv = False
+
+    def _expand_bias(bias, P_):  # (E, N) per-expert -> (P, N) per padded-sorted row by expert
+        eids = expert_ids.clamp(min=0).long()
+        return bias[eids].repeat_interleave(block_m, dim=0)[:P_]
     # GEMV uses block_m=8 (not a WMMA multiple -- it doesn't tile): caps real
     # rows/block at 8 so the acc[COLS][MMAX] register footprint stays small
     # (MMAX=8) even at batched decode M=16-32, where block_m=16 oversized MMAX
@@ -599,7 +610,7 @@ def _run_grouped_moe(x, w1, w2, w1_s, w2_s, w1_zp, w2_zp,
     # v5/v6 A-residence kernels, selected in C++ by VLLM_W4A8_MOE_A_IN_LDS.
     fuse_silu = os.environ.get(
         "VLLM_ROCM_W4A8_FP8_WMMA_MOE_FUSE_SILU", "1") == "1"
-    can_fuse = (fuse_silu and not use_gemv and gver == "wmma"
+    can_fuse = (fuse_silu and not use_gemv and gver == "wmma" and w1_bias is None
                 and activation.is_gated and activation == MoEActivation.SILU)
     if can_fuse:
         buf2 = w4a8_fp8_wmma.mmq_fp8_moe_gemm1_silu(
@@ -611,6 +622,8 @@ def _run_grouped_moe(x, w1, w2, w1_s, w2_s, w1_zp, w2_zp,
         out1 = mmq(x16, w1, w1_s, sorted_ids, expert_ids, ntp,
                    top_k, block_m, kernel=gver, w_zeros=w1_zp,
                    weight_is_e2m1=weight_is_e2m1)
+        if w1_bias is not None:                       # gpt-oss: bias before the (nonlinear) act
+            out1 = out1 + _expand_bias(w1_bias, out1.size(0)).to(out1.dtype)
         # gate * up -> (P, inter)
         act_dim = out1.size(1) // 2 if activation.is_gated else out1.size(1)
         buf2 = torch.empty((P, act_dim), dtype=torch.float16, device=dev)
@@ -645,6 +658,8 @@ def _run_grouped_moe(x, w1, w2, w1_s, w2_s, w1_zp, w2_zp,
     out2 = mmq(buf2.contiguous(), w2, w2_s, ident, expert_ids, ntp, 1, block_m,
                kernel=kernel, w_zeros=w2_zp,
                weight_is_e2m1=weight_is_e2m1)                         # (P, K) fp16
+    if w2_bias is not None:           # gpt-oss: bias on the expert output; gather-reduce weights it
+        out2 = out2 + _expand_bias(w2_bias, out2.size(0)).to(out2.dtype)
     acc = w4a8_fp8_wmma.mmq_fp8_moe_gather_reduce(
         out2.contiguous(), sorted_ids, tw_flat, ntp, top_k)           # (M, K) fp32
     return acc.to(out_dtype)
@@ -1323,4 +1338,113 @@ def register_moe_wna16(verbose: bool = True) -> bool:
     if verbose:
         print("[w4a8_fp8_wmma] WNA16 MoE hook installed (gfx12x): int4 AWQ/GPTQ "
               "fallback experts -> grouped FP8-WMMA; Marlin untouched")
+    return True
+
+
+# --------------------------------------------------------------------------- #
+# mxfp4 (OCP E2M1) MoE — gpt-oss
+# --------------------------------------------------------------------------- #
+_MOE_MXFP4_REGISTERED = False
+_MXFP4_OVERRIDE_LOGGED = False
+
+
+def register_moe_mxfp4(verbose: bool = True) -> bool:
+    """Route gpt-oss mxfp4 (E2M1) experts through the grouped FP8-WMMA op on gfx12x.
+
+    vLLM's gfx1201 mxfp4-MoE auto-backend is AITER_MXFP4_BF16, which needs `aiter` (not installed),
+    so there is no native RDNA4 path -- this provides one. Patches GptOssMxfp4MoEMethod's
+    process_weights (E2M1/E8M0 uint8 -> our (E,N,K//8) int32 + fp16 group scale via convert_mxfp4_moe)
+    and apply (the unfused gemm1 + bias + swigluoai activation + gemm2 + bias + topk gather-reduce in
+    _run_grouped_moe, with weight_is_e2m1=True). Per-expert biases are handled; shared_experts are
+    left to the layer (matching register_moe_ct).
+
+    WEIGHT DECODE is GPU bit-exact (test_mxfp4_moe_gpu.py). The END-TO-END path is UNVALIDATED:
+    needs a gpt-oss serve smoke + the A8-activation PPL gate (mxfp4 ref is W4A16; we add fp8 act
+    quant). If boot fails inside GptOssMxfp4MoEMethod.__init__ (backend/experts_cls selection without
+    aiter), an __init__ patch forcing self.moe_kernel=None is the follow-up.
+    """
+    global _MOE_MXFP4_REGISTERED
+    if _MOE_MXFP4_REGISTERED:
+        return True
+    _raise_if_removed_moe_env()
+    if not _on_gfx12x():
+        if verbose:
+            print("[w4a8_fp8_wmma] mxfp4 MoE hook skipped (not gfx12x)")
+        return False
+    if not _moe_enabled():
+        if verbose:
+            print("[w4a8_fp8_wmma] mxfp4 MoE hook disabled via env")
+        return False
+    try:
+        from vllm.model_executor.layers.quantization.mxfp4 import GptOssMxfp4MoEMethod
+        from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+        from mxfp4.convert import convert_mxfp4_moe
+    except Exception as e:  # pragma: no cover - defensive
+        if verbose:
+            print(f"[w4a8_fp8_wmma] mxfp4 MoE hook: import failed ({e})")
+        return False
+
+    _orig_process = GptOssMxfp4MoEMethod.process_weights_after_loading
+    _orig_apply = GptOssMxfp4MoEMethod.apply
+
+    def _patched_process(self, layer):
+        try:
+            dev = layer.w13_weight.device
+            c13 = convert_mxfp4_moe(layer.w13_weight.data.cpu(),
+                                    layer.w13_weight_scale.data.cpu())
+            c2 = convert_mxfp4_moe(layer.w2_weight.data.cpu(),
+                                   layer.w2_weight_scale.data.cpu())
+        except Exception as e:  # not the expected E2M1 layout -> stock path
+            self._w4a8_mxfp4 = False
+            if verbose:
+                print(f"[w4a8_fp8_wmma] mxfp4 MoE convert failed, stock path: {e}")
+            return _orig_process(self, layer)
+        layer._w4a8_mx_w13 = c13["w_packed"].to(dev)
+        layer._w4a8_mx_w2 = c2["w_packed"].to(dev)
+        layer._w4a8_mx_w13_s = c13["scales"].to(dev)
+        layer._w4a8_mx_w2_s = c2["scales"].to(dev)
+        b13 = getattr(layer, "w13_bias", None)
+        b2 = getattr(layer, "w2_bias", None)
+        layer._w4a8_mx_w13_b = b13.data if b13 is not None else None
+        layer._w4a8_mx_w2_b = b2.data if b2 is not None else None
+        self._w4a8_mxfp4 = True
+        # Free the source uint8 weights/scales (we hold converted copies); keep the
+        # Parameter objects registered so param iteration doesn't crash.
+        for nm in ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"):
+            p = getattr(layer, nm, None)
+            if p is not None and hasattr(p, "data"):
+                p.data = torch.empty(0, dtype=p.dtype, device=p.device)
+        if not (c13["scale_info"]["fp16_range_ok"] and c2["scale_info"]["fp16_range_ok"]):
+            print("[w4a8_fp8_wmma] WARN mxfp4 MoE E8M0 scales exceed the fp16 group-scale "
+                  "store; results may be wrong (needs an fp32 group-scale path)")
+        global _MXFP4_OVERRIDE_LOGGED
+        if verbose and not _MXFP4_OVERRIDE_LOGGED:
+            _MXFP4_OVERRIDE_LOGGED = True
+            print("[w4a8_fp8_wmma] mxfp4 MoE (gpt-oss) -> grouped FP8-WMMA "
+                  "(E2M1 decode, A8 act); native backend bypassed")
+
+    def _patched_apply(self, layer, x, topk_weights, topk_ids,
+                       shared_experts=None, shared_experts_input=None, **kw):
+        if not getattr(self, "_w4a8_mxfp4", False):
+            return _orig_apply(self, layer, x, topk_weights, topk_ids,
+                               shared_experts, shared_experts_input, **kw)
+        act = layer.activation
+        if not isinstance(act, MoEActivation):
+            act = MoEActivation.from_str(str(act))
+        x2 = x.reshape(-1, x.shape[-1])
+        out = _run_grouped_moe(
+            x2, layer._w4a8_mx_w13, layer._w4a8_mx_w2,
+            layer._w4a8_mx_w13_s, layer._w4a8_mx_w2_s, None, None,
+            topk_weights, topk_ids, act, layer.global_num_experts,
+            layer.expert_map, layer.apply_router_weight_on_input,
+            _moe_kernel(), out_dtype=x.dtype, weight_is_e2m1=True,
+            w1_bias=layer._w4a8_mx_w13_b, w2_bias=layer._w4a8_mx_w2_b)
+        return out.reshape(x.shape[:-1] + (out.shape[-1],))
+
+    GptOssMxfp4MoEMethod.process_weights_after_loading = _patched_process
+    GptOssMxfp4MoEMethod.apply = _patched_apply
+    _MOE_MXFP4_REGISTERED = True
+    if verbose:
+        print("[w4a8_fp8_wmma] mxfp4 MoE hook installed (gfx12x, gpt-oss): "
+              "E2M1 experts -> grouped FP8-WMMA")
     return True

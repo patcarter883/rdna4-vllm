@@ -132,6 +132,15 @@ def register(verbose: bool = True) -> bool:
         if verbose:
             print(f"[w4a8_fp8_wmma] GPTQ MoE hook not installed: {e}")
 
+    # mxfp4 (OCP E2M1) MoE — gpt-oss experts -> grouped FP8-WMMA. Separate try/except so a failure
+    # here can't break the AWQ/GPTQ/CT/dense paths. (Weight decode GPU-validated; e2e serve TBD.)
+    try:
+        from w4a8_fp8_wmma.moe_experts import register_moe_mxfp4
+        register_moe_mxfp4(verbose=verbose)
+    except Exception as e:  # pragma: no cover - defensive
+        if verbose:
+            print(f"[w4a8_fp8_wmma] mxfp4 MoE hook not installed: {e}")
+
     # --- cold-boot accelerators (parallel kernel compilation) ----------------
     # These only fire on a COLD Triton cache (dev containers, kernel/.so rebuilds);
     # warm production boots skip autotune entirely, so they are no-ops there. Both
