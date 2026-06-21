@@ -57,7 +57,7 @@ x-combined-common: &combined-common
     #   docker compose --profile serve run --rm --entrypoint python3 serve /workspace/test/bench_tp2.py
     - ./test:/workspace/test:ro
   environment: &combined-env
-    HF_HUB_OFFLINE: "1"
+    HF_HUB_OFFLINE: "0"
     GPU_ARCHS: gfx1201
     ROCM_HOME: /opt/rocm-7.2.1
     PATH: /opt/rocm-7.2.1/lib/llvm/bin:/app/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -101,18 +101,63 @@ services:
       # Proportional het-TP weights = CU counts of the 9070 XT + 9070. Active because the image
       # builds with WITH_HET_TP=1 by default; the helper fail-safes to even if a WITH_HET_TP=0
       # image is run instead. Tune to your cards' CU ratio for a different pair.
-      VLLM_TP_CU_WEIGHTS: "64,56"
+      #VLLM_TP_CU_WEIGHTS: "64,56"
+      VLLM_TP_CU_WEIGHTS: "50,50"
     restart: unless-stopped
     command:                             # entrypoint prepends `vllm serve`
-      - ${VLLM_MODEL_ID:-cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit}
+      - ${VLLM_MODEL_ID:-cyankiwi/Qwen3.6-27B-AWQ-INT4}
       - --host=0.0.0.0
       - --port=8000
       - --tensor-parallel-size=2
       - --limit-mm-per-prompt={"image":0,"video":0}
       - --kv-cache-dtype=fp8
+      - --enable-prefix-caching
       - --reasoning-parser=qwen3
       - --enable-auto-tool-choice
       - --tool-call-parser=qwen3_xml
+      # Keep --max-num-batched-tokens low: the init memory-profiling forward (stock activation
+      # memory) is what OOMs at large batch on 16 GB cards, not the W4A8 MoE apply (bounded by
+      # MOE_APPLY_CHUNK). max-model-len only sizes KV cache.
+      - --max-model-len=${VLLM_MAX_MODEL_LEN:-32000}
+      - --max-num-batched-tokens=${VLLM_MAX_BATCHED:-1568}
+      # GDN/Mamba hybrid: each decode seq needs one Mamba state-cache block, and only ~36 fit at
+      # this memory budget on 16 GB TP=2. Cap concurrency at/below that (vLLM trims cudagraph
+      # capture sizes to <= max_num_seqs automatically). Raise with more VRAM / higher util.
+      - --max-num-seqs=${VLLM_MAX_NUM_SEQS:-2}
+      - --gpu-memory-utilization=${VLLM_GPU_MEMORY_UTIL:-0.75}
+      # Conservative cudagraph capture set for RDNA4/ROCm. The vLLM default (51 sizes up to 512)
+      # under FULL_AND_PIECEWISE stalls/hangs capture on ROCm and wastes VRAM (vLLM #19579/#39010;
+      # AMD/verl tuning guidance) — and these 16 GB cards serve low-batch anyway. Capture only the
+      # batch sizes we actually hit. Override with VLLM_CUDAGRAPH_SIZES.
+      - --compilation-config=${VLLM_CUDAGRAPH_SIZES:-{"cudagraph_capture_sizes":[1,2,4,8,16,32,64]}}
+      - --trust-remote-code
+      - --enable-prompt-tokens-details
+
+  serve-northcode:
+    <<: *combined-common
+    profiles: ["serve-northcode"]
+    container_name: ${LEASE_NAME:-vllm22-w4a8}-northcode   # gpu-lease sets LEASE_NAME so two leases don't collide
+    environment:
+      <<: *combined-env
+      ROCR_VISIBLE_DEVICES: "${LEASE_ROCR_DEVICES:-0,1}"   # gpu-lease injects its leased physical card set
+      HIP_VISIBLE_DEVICES: "${LEASE_HIP_DEVICES:-0,1}"     # …and the 0-based re-index of it
+      CU_NUM: "56"                       # lower of the two cards (conservative even-TP fallback).
+      # Proportional het-TP weights = CU counts of the 9070 XT + 9070. Active because the image
+      # builds with WITH_HET_TP=1 by default; the helper fail-safes to even if a WITH_HET_TP=0
+      # image is run instead. Tune to your cards' CU ratio for a different pair.
+      VLLM_TP_CU_WEIGHTS: "64,56"
+    restart: unless-stopped
+    command:                             # entrypoint prepends `vllm serve`
+      - ${VLLM_MODEL_ID:-CohereLabs/North-Mini-Code-1.0-w4a16}
+      - --host=0.0.0.0
+      - --port=8000
+      - --tensor-parallel-size=2
+      - --limit-mm-per-prompt={"image":0,"video":0}
+      - --kv-cache-dtype=fp8
+      - --enable-prefix-caching
+      - --reasoning-parser=cohere_command4
+      - --enable-auto-tool-choice
+      - --tool-call-parser=cohere_command4
       # Keep --max-num-batched-tokens low: the init memory-profiling forward (stock activation
       # memory) is what OOMs at large batch on 16 GB cards, not the W4A8 MoE apply (bounded by
       # MOE_APPLY_CHUNK). max-model-len only sizes KV cache.
@@ -122,11 +167,48 @@ services:
       # this memory budget on 16 GB TP=2. Cap concurrency at/below that (vLLM trims cudagraph
       # capture sizes to <= max_num_seqs automatically). Raise with more VRAM / higher util.
       - --max-num-seqs=${VLLM_MAX_NUM_SEQS:-8}
-      # Serial scheduling: async scheduling (max_concurrent_batches=2 → step_with_batch_queue)
-      # desyncs the multiproc output buffer under concurrent load on this stack and kills the
-      # EngineCore (scheduler KeyError + multiproc_executor AssertionError). Force serial step().
-      - --no-async-scheduling
-      - --gpu-memory-utilization=${VLLM_GPU_MEMORY_UTIL:-0.96}
+      - --gpu-memory-utilization=${VLLM_GPU_MEMORY_UTIL:-0.90}
+      # Conservative cudagraph capture set for RDNA4/ROCm. The vLLM default (51 sizes up to 512)
+      # under FULL_AND_PIECEWISE stalls/hangs capture on ROCm and wastes VRAM (vLLM #19579/#39010;
+      # AMD/verl tuning guidance) — and these 16 GB cards serve low-batch anyway. Capture only the
+      # batch sizes we actually hit. Override with VLLM_CUDAGRAPH_SIZES.
+      - --compilation-config=${VLLM_CUDAGRAPH_SIZES:-{"cudagraph_capture_sizes":[1,2,4,8,16,32,64]}}
+
+  serve-laguna:
+    <<: *combined-common
+    profiles: ["serve-laguna"]
+    container_name: ${LEASE_NAME:-vllm22-w4a8}-laguna   # gpu-lease sets LEASE_NAME so two leases don't collide
+    environment:
+      <<: *combined-env
+      ROCR_VISIBLE_DEVICES: "${LEASE_ROCR_DEVICES:-0,1}"   # gpu-lease injects its leased physical card set
+      HIP_VISIBLE_DEVICES: "${LEASE_HIP_DEVICES:-0,1}"     # …and the 0-based re-index of it
+      CU_NUM: "56"                       # lower of the two cards (conservative even-TP fallback).
+      # Proportional het-TP weights = CU counts of the 9070 XT + 9070. Active because the image
+      # builds with WITH_HET_TP=1 by default; the helper fail-safes to even if a WITH_HET_TP=0
+      # image is run instead. Tune to your cards' CU ratio for a different pair.
+      VLLM_TP_CU_WEIGHTS: "64,56"
+    restart: unless-stopped
+    command:                             # entrypoint prepends `vllm serve`
+      - ${VLLM_MODEL_ID:-poolside/Laguna-XS.2-INT4}
+      - --host=0.0.0.0
+      - --port=8000
+      - --tensor-parallel-size=2
+      - --limit-mm-per-prompt={"image":0,"video":0}
+      - --kv-cache-dtype=fp8
+      - --enable-prefix-caching
+      - --reasoning-parser=poolside_v1
+      - --enable-auto-tool-choice
+      - --tool-call-parser=poolside_v1
+      # Keep --max-num-batched-tokens low: the init memory-profiling forward (stock activation
+      # memory) is what OOMs at large batch on 16 GB cards, not the W4A8 MoE apply (bounded by
+      # MOE_APPLY_CHUNK). max-model-len only sizes KV cache.
+      - --max-model-len=${VLLM_MAX_MODEL_LEN:-50000}
+      - --max-num-batched-tokens=${VLLM_MAX_BATCHED:-4096}
+      # GDN/Mamba hybrid: each decode seq needs one Mamba state-cache block, and only ~36 fit at
+      # this memory budget on 16 GB TP=2. Cap concurrency at/below that (vLLM trims cudagraph
+      # capture sizes to <= max_num_seqs automatically). Raise with more VRAM / higher util.
+      - --max-num-seqs=${VLLM_MAX_NUM_SEQS:-8}
+      - --gpu-memory-utilization=${VLLM_GPU_MEMORY_UTIL:-0.90}
       # Conservative cudagraph capture set for RDNA4/ROCm. The vLLM default (51 sizes up to 512)
       # under FULL_AND_PIECEWISE stalls/hangs capture on ROCm and wastes VRAM (vLLM #19579/#39010;
       # AMD/verl tuning guidance) — and these 16 GB cards serve low-batch anyway. Capture only the

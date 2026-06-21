@@ -28,12 +28,15 @@
 # `tcclaviger/vllm22:dev` is a mutable tag that can shift under us — and RFP458, the tuned
 # attention, and the whole `/app/vllm` tree our patches target all live in this base, so a
 # silent tag move would bitrot every patch and can break the W4A8 ABI (torch bump) with no
-# detection. The digest below was the `:dev` snapshot as of 2026-06-14.
+# detection. The digest below was the `:dev` snapshot as of 2026-06-18 (RXF quant +
+# auto_gptq_qzeros). Conflict-checked against our patches before bumping: torch/py/triton
+# byte-identical (no W4A8 ABI break, Triton cache stays valid), het-TP + ZAYA + moe_wna16 sed
+# all apply clean, and the changes vs the prior 2026-06-14 base are additive / off our path.
 #   Bump procedure: `docker pull tcclaviger/vllm22:dev` then
 #   `docker inspect tcclaviger/vllm22:dev --format '{{index .RepoDigests 0}}'`, paste the new
 #   `name@sha256:...` here, and re-run the in-image import check (CONTRIBUTING.md) before relying on it.
 # Override with `--build-arg BASE_IMAGE=...` (or COMBINED_BASE_IMAGE in .env) to test a newer base.
-ARG BASE_IMAGE=tcclaviger/vllm22@sha256:e2e5ffcdee14670e183843bfd16d673c6ac7202b91bb3e2b982b324431c170f3
+ARG BASE_IMAGE=tcclaviger/vllm22@sha256:ad046fde24d9233e72790222cbac3fc24f7e47a0d28e3089c2a383422890d67a
 FROM ${BASE_IMAGE}
 
 ARG GPU_ARCHS=gfx1201

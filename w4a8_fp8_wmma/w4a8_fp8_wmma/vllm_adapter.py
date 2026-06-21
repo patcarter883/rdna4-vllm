@@ -295,7 +295,11 @@ def _w4a8_dense_apply(
     # Served dense kernels by NAME (kernel_names.h / __init__._DENSE_KERNELS):
     # decode_gemv (v11), prefill_wmma_ashuffle (v10), prefill_wmma (v5).
     ashuffle_ok = gs in (32, 128)
-    gemv_ok = (K % 1024 == 0) and (gs % 32 == 0) and (M <= 16)
+    # decode_gemv needs K % 512 == 0 (the clamped final chunk handles a 512-k tail) --
+    # this lets the GEMV take down_proj (TP=2 shards intermediate 17408 -> K=8704 =
+    # 8*1024+512), which previously fell to prefill_wmma_ashuffle (v10, pads M=1->16)
+    # every decode token.
+    gemv_ok = (K % 512 == 0) and (gs % 32 == 0) and (M <= 16)
     decode_max = int(os.environ.get("VLLM_ROCM_W4A8_DECODE_MAX_M", "2"))
     prefill_min_env = int(os.environ.get("VLLM_ROCM_W4A8_PREFILL_MIN_M", "256"))
     cached = cached_min_m
