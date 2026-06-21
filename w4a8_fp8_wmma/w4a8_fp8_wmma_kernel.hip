@@ -2707,10 +2707,12 @@ void launch_mmq_fp8_gemm_gfx1201(
         }
         if (const char* e = std::getenv("VLLM_W4A8_V10_DB")) db = std::atoi(e);
         if (const char* e = std::getenv("VLLM_W4A8_V7_SWIZ")) swiz = std::atoi(e);
-        // VLLM_W4A8_DENSE_TILED (opt-in): gemm_tiled_ashuffle_kernel re-expression
-        // over the DenseWmmaFp8 policy, bit-exact to v10 (same template params /
-        // grid/block/smem) + perf-neutral. NOT the default (see PrefillWmma note).
-        const bool use_tiled = std::getenv("VLLM_W4A8_DENSE_TILED") != nullptr;
+        // gemm_tiled_ashuffle_kernel re-expression over the DenseWmmaFp8 policy,
+        // bit-exact to v10 (same template params / grid/block/smem) + perf-neutral.
+        // NOW THE DEFAULT (the tiled TileConfig path is the served kernel moving
+        // forward, matching the grouped-MoE default); opt OUT with
+        // VLLM_W4A8_DENSE_TILED_OFF to fall back to the standalone v10 kernel.
+        const bool use_tiled = std::getenv("VLLM_W4A8_DENSE_TILED_OFF") == nullptr;
         const int LDSBK = group_size + 8;
         const size_t shmem = static_cast<size_t>(db ? 2 : 1) * bn * LDSBK;
         dim3 grid = swiz ? dim3((M + bm - 1) / bm, (N + bn - 1) / bn)
@@ -2900,19 +2902,18 @@ void launch_mmq_fp8_gemm_gfx1201(
         // Fused act-quant (fp16 in, e4m3 in A_tile during staging).
         dim3 block(V2_NWARPS * 32);
         dim3 grid((N + V2_BN - 1) / V2_BN, (M + V2_BM - 1) / V2_BM);
-        // VLLM_W4A8_DENSE_TILED (opt-in): the gemm_tiled_kernel re-expression over
-        // the DenseWmmaFp8 MMA policy. PROVEN bit-exact to v5 (max|diff|==0, 32/32)
-        // and perf-neutral. NOT the default: bit-exact == zero runtime upside, and
-        // dense has no second backend (unlike grouped-MoE's SWMMAC), so v5 stays the
-        // served kernel and the policy path is the validated, ready alternative.
-        if (std::getenv("VLLM_W4A8_DENSE_TILED")) {
+        // gemm_tiled_kernel re-expression over the DenseWmmaFp8 MMA policy. PROVEN
+        // bit-exact to v5 (max|diff|==0, 32/32) and perf-neutral. NOW THE DEFAULT
+        // (tiled TileConfig is the served path moving forward); opt OUT with
+        // VLLM_W4A8_DENSE_TILED_OFF to fall back to the standalone v5 kernel.
+        if (std::getenv("VLLM_W4A8_DENSE_TILED_OFF") == nullptr) {
             gemm_tiled_kernel<DenseWmmaFp8, V2_BM, V2_BN><<<grid, block, 0, stream>>>(
                 x_h,
                 w_packed.data_ptr<int>(),
                 reinterpret_cast<const __half*>(scales.data_ptr<at::Half>()),
                 w_zeros_ptr,
                 reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
-                M, N, K, group_size);
+                M, N, K, group_size, weight_is_e2m1);
         } else {
             mmq_fp8_gemm_kernel_v5<<<grid, block, 0, stream>>>(
                 x_h,

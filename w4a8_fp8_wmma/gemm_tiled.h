@@ -65,7 +65,7 @@ __global__ void __launch_bounds__((BM / 16) * 32) gemm_tiled_kernel(
     const __half*        __restrict__ w_scales,
     const int*           __restrict__ w_zeros_packed,
     __half*              __restrict__ out,
-    int M, int N, int K, int group_size) {
+    int M, int N, int K, int group_size, bool weight_is_e2m1) {
 
     constexpr int NWARPS = BM / 16;
     constexpr int NFRAG  = BN / WMMA_DIM;
@@ -125,7 +125,7 @@ __global__ void __launch_bounds__((BM / 16) * 32) gemm_tiled_kernel(
             #pragma unroll
             for (int jj = 0; jj < PACK_FACTOR; ++jj)
                 dst[jj] = (an < N)
-                    ? int4_signed_to_e4m3(((word >> (jj * 4)) & 0xF) - zp) : 0;
+                    ? decode_w4_to_e4m3((word >> (jj * 4)) & 0xF, zp, weight_is_e2m1) : 0;
         }
         __syncthreads();
 
