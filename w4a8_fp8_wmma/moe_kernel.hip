@@ -800,8 +800,8 @@ __global__ void __launch_bounds__(MV5_MAX_WARPS * 32) moe_gemm1_silu_v6_kernel(
                 unsigned char* du = &Bu[n * LDSBK + k8 * PACK_FACTOR];
                 #pragma unroll
                 for (int jj = 0; jj < PACK_FACTOR; ++jj) {
-                    dg[jj] = (ang < inter) ? int4_signed_to_e4m3(((wg >> (jj * 4)) & 0xF) - zg) : 0;
-                    du[jj] = (ang < inter) ? int4_signed_to_e4m3(((wu >> (jj * 4)) & 0xF) - zu) : 0;
+                    dg[jj] = (ang < inter) ? decode_w4_to_e4m3((wg >> (jj * 4)) & 0xF, zg, weight_is_e2m1) : 0;
+                    du[jj] = (ang < inter) ? decode_w4_to_e4m3((wu >> (jj * 4)) & 0xF, zu, weight_is_e2m1) : 0;
                 }
             }
         }
@@ -1028,10 +1028,10 @@ __global__ void __launch_bounds__(NWARPS * 32) moe_gemv_v7_kernel(
                         const int nb = (q & 1) * 4;     // nibble base within wword
                         const v2f_t lo = __builtin_amdgcn_cvt_pk_f32_fp8(a4, false);  // bytes 0,1
                         const v2f_t hi = __builtin_amdgcn_cvt_pk_f32_fp8(a4, true);   // bytes 2,3
-                        p += lo[0] * (float)(((wword >> ((nb + 0) * 4)) & 0xF) - zp);
-                        p += lo[1] * (float)(((wword >> ((nb + 1) * 4)) & 0xF) - zp);
-                        p += hi[0] * (float)(((wword >> ((nb + 2) * 4)) & 0xF) - zp);
-                        p += hi[1] * (float)(((wword >> ((nb + 3) * 4)) & 0xF) - zp);
+                        p += lo[0] * decode_w4_to_f32((wword >> ((nb + 0) * 4)) & 0xF, zp, weight_is_e2m1);
+                        p += lo[1] * decode_w4_to_f32((wword >> ((nb + 1) * 4)) & 0xF, zp, weight_is_e2m1);
+                        p += hi[0] * decode_w4_to_f32((wword >> ((nb + 2) * 4)) & 0xF, zp, weight_is_e2m1);
+                        p += hi[1] * decode_w4_to_f32((wword >> ((nb + 3) * 4)) & 0xF, zp, weight_is_e2m1);
                     }
                     acc[c][r] += p * wsc;
                 }

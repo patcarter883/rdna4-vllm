@@ -493,7 +493,8 @@ def _supported_group_size(gs: int) -> bool:
 def _run_grouped_moe(x, w1, w2, w1_s, w2_s, w1_zp, w2_zp,
                      topk_weights, topk_ids, activation,
                      global_num_experts, expert_map,
-                     apply_router_weight_on_input, kernel, out_dtype=None):
+                     apply_router_weight_on_input, kernel, out_dtype=None,
+                     weight_is_e2m1=False):
     """Compose the whole gated MoE from the one grouped FP8-WMMA op and return
     the final ``(M, K)`` output (already topk-weighted + reduced).
 
@@ -537,7 +538,8 @@ def _run_grouped_moe(x, w1, w2, w1_s, w2_s, w1_zp, w2_zp,
             out[lo:hi] = _run_grouped_moe(
                 x[lo:hi], w1, w2, w1_s, w2_s, w1_zp, w2_zp,
                 topk_weights[lo:hi], topk_ids[lo:hi], activation,
-                global_num_experts, expert_map, False, kernel, out_dtype)
+                global_num_experts, expert_map, False, kernel, out_dtype,
+                weight_is_e2m1=weight_is_e2m1)
         return out
 
     # The op requires fp16 scales; convert defensively (no-op if already fp16).
@@ -602,11 +604,13 @@ def _run_grouped_moe(x, w1, w2, w1_s, w2_s, w1_zp, w2_zp,
     if can_fuse:
         buf2 = w4a8_fp8_wmma.mmq_fp8_moe_gemm1_silu(
             x16, w1, w1_s, sorted_ids, expert_ids, ntp,
-            top_k, block_m, kernel=gver, w_zeros=w1_zp)     # (P, inter)
+            top_k, block_m, kernel=gver, w_zeros=w1_zp,
+            weight_is_e2m1=weight_is_e2m1)                  # (P, inter)
     else:
         # gemm1 (w13): padded-sorted (P, 2*inter)
         out1 = mmq(x16, w1, w1_s, sorted_ids, expert_ids, ntp,
-                   top_k, block_m, kernel=gver, w_zeros=w1_zp)
+                   top_k, block_m, kernel=gver, w_zeros=w1_zp,
+                   weight_is_e2m1=weight_is_e2m1)
         # gate * up -> (P, inter)
         act_dim = out1.size(1) // 2 if activation.is_gated else out1.size(1)
         buf2 = torch.empty((P, act_dim), dtype=torch.float16, device=dev)
@@ -626,7 +630,8 @@ def _run_grouped_moe(x, w1, w2, w1_s, w2_s, w1_zp, w2_zp,
         output = torch.zeros((M, K), dtype=torch.float32, device=dev)
         w4a8_fp8_wmma.mmq_fp8_moe_gemm_scatter(
             buf2.contiguous(), w2, w2_s, sorted_ids, expert_ids, ntp, tw_flat,
-            output, top_k, block_m, kernel=gver, w_zeros=w2_zp)
+            output, top_k, block_m, kernel=gver, w_zeros=w2_zp,
+            weight_is_e2m1=weight_is_e2m1)
         return output.to(out_dtype)
 
     # gemm2 (w2) + topk-weight + reduce. SINGLE PATH (no adaptive branch): gemm2
@@ -638,7 +643,8 @@ def _run_grouped_moe(x, w1, w2, w1_s, w2_s, w1_zp, w2_zp,
     # behind, <0.3% e2e). HIP-graph safe everywhere (no atomics, static shapes).
     ident = torch.arange(P, dtype=torch.int32, device=dev)
     out2 = mmq(buf2.contiguous(), w2, w2_s, ident, expert_ids, ntp, 1, block_m,
-               kernel=kernel, w_zeros=w2_zp)                          # (P, K) fp16
+               kernel=kernel, w_zeros=w2_zp,
+               weight_is_e2m1=weight_is_e2m1)                         # (P, K) fp16
     acc = w4a8_fp8_wmma.mmq_fp8_moe_gather_reduce(
         out2.contiguous(), sorted_ids, tw_flat, ntp, top_k)           # (M, K) fp32
     return acc.to(out_dtype)
