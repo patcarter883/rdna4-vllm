@@ -86,6 +86,7 @@ x-combined-common: &combined-common
     # env vars, so the FIRST boot after any env/config change re-tunes once, then subsequent boots
     # hit it. This is the "use the cache next start" guarantee.
     TRITON_CACHE_AUTOTUNING: "${TRITON_CACHE_AUTOTUNING:-1}"
+    VLLM_ROCM_W4A8_LAYOUT: "${VLLM_ROCM_W4A8_LAYOUT:-single}"
 
 services:
   # --- TP=2 combined: tuned attention + W4A8, both Qwen3.6 cards (64+56 CU heterogeneous) ---
@@ -103,6 +104,7 @@ services:
       # image is run instead. Tune to your cards' CU ratio for a different pair.
       #VLLM_TP_CU_WEIGHTS: "64,56"
       VLLM_TP_CU_WEIGHTS: "50,50"
+      VLLM_ROCM_W4A8_LAYOUT: "${VLLM_ROCM_W4A8_LAYOUT:-single}"
     restart: unless-stopped
     command:                             # entrypoint prepends `vllm serve`
       - ${VLLM_MODEL_ID:-cyankiwi/Qwen3.6-27B-AWQ-INT4}
@@ -118,13 +120,13 @@ services:
       # Keep --max-num-batched-tokens low: the init memory-profiling forward (stock activation
       # memory) is what OOMs at large batch on 16 GB cards, not the W4A8 MoE apply (bounded by
       # MOE_APPLY_CHUNK). max-model-len only sizes KV cache.
-      - --max-model-len=${VLLM_MAX_MODEL_LEN:-32000}
-      - --max-num-batched-tokens=${VLLM_MAX_BATCHED:-1568}
+      - --max-model-len=${VLLM_MAX_MODEL_LEN:-50000}
+      - --max-num-batched-tokens=${VLLM_MAX_BATCHED:-4096}
       # GDN/Mamba hybrid: each decode seq needs one Mamba state-cache block, and only ~36 fit at
       # this memory budget on 16 GB TP=2. Cap concurrency at/below that (vLLM trims cudagraph
       # capture sizes to <= max_num_seqs automatically). Raise with more VRAM / higher util.
-      - --max-num-seqs=${VLLM_MAX_NUM_SEQS:-2}
-      - --gpu-memory-utilization=${VLLM_GPU_MEMORY_UTIL:-0.75}
+      - --max-num-seqs=${VLLM_MAX_NUM_SEQS:-8}
+      - --gpu-memory-utilization=${VLLM_GPU_MEMORY_UTIL:-0.95}
       # Conservative cudagraph capture set for RDNA4/ROCm. The vLLM default (51 sizes up to 512)
       # under FULL_AND_PIECEWISE stalls/hangs capture on ROCm and wastes VRAM (vLLM #19579/#39010;
       # AMD/verl tuning guidance) — and these 16 GB cards serve low-batch anyway. Capture only the
