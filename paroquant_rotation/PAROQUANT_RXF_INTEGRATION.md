@@ -320,3 +320,80 @@ Hadamard still is). Calibration is still gated behind `ACT_AWARE_ENABLED=False` 
 - **`--rotation-kind givens` + `--fp16-experts`** is guarded OFF (protected experts still take the
   Hadamard FWHT in `rotate_fp16_weight`).
 - **Per-(layer, activation-group) R** (the higher-ceiling form) — needs the merged-linear-aware loader.
+
+---
+
+## 7. Stage (c) the STRATEGIC PIVOT — activation conditioning — and the FULL CLOSURE (NULL)
+
+Stage (b)'s PPL null implied the objective was wrong: minimizing **weight-quant MSE** does not move
+PPL because Hadamard is already near-optimal for weight incoherence. The pivot (cf. the DFlash result,
+where activation conditioning saved INT4 acceptance) was to fit R to the REAL **per-token int8
+ACTIVATION-quant error** instead — flatten activation outlier spikes before the int8 cast. This was
+implemented and the line was run to a definitive conclusion. **It is a NULL — and, more usefully, the
+whole rotation-tuning line is now closed with mechanistic evidence.**
+
+### What was built (stage c, the activation objective)
+- `quantize_rxf.py`: `_act_int8_quant_mse` (per-block symmetric int8 quant MSE, mirrors the runtime
+  `_rxf_rotate_quant_int8_kernel`); `fit_givens_rotation(score="activation")` (the SAME Hadamard-init
+  Givens descent, but the line-search minimizes the activation int8 error on real activation blocks);
+  `collect_activations(collect_blocks=True)` now pools SIGNED activation blocks for the fit;
+  `ACT_AWARE_ENABLED=True`; `main()` fits R on the activation objective for `givens`+`--act-aware`,
+  isolating the variable (weight-side importance OFF, so the ONLY change vs stage b is R's objective).
+- `sanity_givens_activation.py` (CPU): R orthonormal, cancellation `(Rx)·(Rw)=x·w` holds, the fit is
+  ≤ Hadamard on its own per-block objective (commit-only-improving). **ALL PASS.**
+
+### The DECISIVE measurement — `analyze_act_conditioning.py` (real Qwen3.5-4B activations, 1 GPU pass)
+Per-token int8 activation-quant MSE (the EXACT runtime quant, full-row absmax scale), aggregated over
+249 Linear modules / 31,872 real activation rows, vs the shipped Hadamard-32:
+
+| rotation | per-token int8 act-MSE | vs Had-32 | learned vs fixed-S |
+|---|---|---|---|
+| no-rotate | 1.47e-3 | 0.20× | — |
+| **Hadamard-32** | 2.88e-4 | 1.00× | — |
+| Hadamard-128 | 1.71e-4 | **1.68×** | — |
+| Hadamard-256 | 1.25e-4 | **2.30×** | — |
+| fitted-256 (learned) | 1.39e-4 | 2.07× | **0.90× (WORSE)** |
+
+Two facts fall straight out: (1) the activation-conditioning lever is **SPAN WIDTH** (a wider FIXED
+Hadamard), not learning — wider span monotonically cuts the real activation int8 error up to 2.3×;
+(2) the **LEARNED rotation REGRESSES** the faithful per-token metric at EVERY span (0.79–0.94× vs the
+fixed Hadamard of the same span) — the greedy per-block descent overshoots the per-token full-row
+absmax the runtime actually uses. The learned R loses on both objectives (weight-MSE-PPL in §6, and
+the real activation int8 metric here).
+
+### The PPL verdict — wider fixed Hadamard span (the §4.4 open question), answered: NO
+Quantized `hadamard128` / `hadamard256` (runtime already span-aware; `quant_qwen_hadamard_span.sh`),
+3-way PPL A/B vs the shipped `hadamard32` (`eval_ppl_span.sh`, bundled text, ~1.3k tokens):
+
+| build | W4A8 (int8) PPL | W4A16 (fp16) PPL |
+|---|---|---|
+| **Hadamard-32 (shipped)** | **6.5156** | **6.5311** |
+| Hadamard-128 | 6.5856 (+1.07%) | 6.5795 (+0.74%) |
+| Hadamard-256 | 6.5654 (+0.76%) | 6.5521 (+0.32%) |
+
+A wider span is **WORSE on BOTH arms**. fp16 isolates the weight quant, so the regression is
+**weight-side**: the wider FWHT spreads bulk weight energy across the size-32 scale-group boundaries,
+producing ~86–88k degenerate near-zero scale groups (`fp16-scale-underflow`, vs the per-group MSE
+staying ~4.79e-7) that dequant to ~0. That weight-side damage outweighs the activation-conditioning
+gain — which is itself **PPL-invisible** here: int8 ≈ fp16 PPL at every span (±0.2%), i.e. the int8
+ACTIVATION quant is already near-lossless on this model and has **no PPL headroom** to recover. This is
+exactly the §2(a) "conditional, not free" caveat materializing as a loss.
+
+### The synthesis (why the entire rotation-tuning line is a null on W4A8)
+On this W4A8 model the PPL bottleneck is the **4-bit WEIGHT**, and the shipped **span-32 Hadamard is
+already at/near its optimum** (stage b: learning can't beat it; stage a wider-span: spreading energy
+only adds degenerate groups). The **int8 ACTIVATION** path is already near-lossless (int8 ≈ fp16), so
+activation conditioning — the entire premise of stage c — has nothing to recover. **The shipped
+`hadamard32` default is correct; the learned/wider/importance rotation deltas are all ≤ noise or
+negative.** Where stage c *would* pay is a regime where the ACTIVATION quant is the bottleneck (true
+4-bit activations / NVFP4 draft acceptance — the DFlash regime), not int8. The stage-c machinery is
+kept for that future model, not as a recommended default here.
+
+### Artifacts (this session)
+- `sanity_givens_activation.py` — CPU sanity for the activation objective (ALL PASS).
+- `analyze_act_conditioning.py` — the decisive real-activation per-token int8 MSE analysis (the
+  cheap, pre-PPL gate that should be run before funding any future rotation experiment).
+- `quant_qwen_hadamard_span.sh` / `eval_ppl_span.sh` — wider-span quant + 3-way PPL A/B runners.
+- Calibration data: `~/.cache/huggingface/calib_wikitext.jsonl` (400 wikitext-2 paragraphs).
+- The `hadamard128` / `hadamard256` checkpoints are confirmed-worse throwaways (regenerate from the
+  runner if needed).

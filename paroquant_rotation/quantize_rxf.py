@@ -29,12 +29,13 @@ before every MoE GEMM). config.json quantization_config gains "fp16_experts".
 Output: <input_name>-RXF
 Format: rxf-pack-quantized
 
-NOTE — activation-aware calibration is IN DEVELOPMENT and DISABLED.
-  The `--act-*` flags and `collect_activations()` are retained for development
-  but gated behind the module constant ACT_AWARE_ENABLED (default False). With it
-  False the quantizer always takes the naive (uniform-importance) path: passing
-  `--act-aware` prints a notice and runs naive. Flip ACT_AWARE_ENABLED to re-enable
-  the calibration path during development.
+NOTE — activation-aware calibration (ParoQuant stage c) is ENABLED.
+  `--act-aware <calib>` with `--rotation-kind givens` fits the learned rotation R
+  to minimize the REAL per-token int8 ACTIVATION-quant error on the calibration
+  activations (activation conditioning), the objective stage (b)'s weight-MSE fit
+  could not reach (stage b was a PPL null — Hadamard already near-optimal for
+  weight incoherence). Gated behind ACT_AWARE_ENABLED; collect_activations() runs
+  the calibration forward pass and also pools activation blocks for the R fit.
 """
 import argparse
 import gc
@@ -83,10 +84,15 @@ CODEBOOKS = {"nl": NL_TABLE, "lloyd": LLOYD_TABLE}
 ACTIVE_TABLE = NL_TABLE
 ACTIVE_NAME = "iq4_nl"
 
-# Activation-aware calibration master switch (IN DEVELOPMENT). False forces the
-# naive uniform-importance path regardless of the --act-* flags. See module
-# docstring. Do not flip on in shipped images.
-ACT_AWARE_ENABLED = False
+# Activation-aware calibration master switch. When True, --act-aware runs the
+# calibration forward pass (collect_activations). Its PRIMARY consumer is the
+# LEARNED-Givens stage (c): the rotation R is fit to minimize the REAL per-token
+# int8 activation-quant error on calibration activations (activation conditioning,
+# the DFlash insight), NOT the weight-quant MSE that stage (b) minimized — stage
+# (b) was a measured PPL null precisely because Hadamard is already near-optimal
+# for weight incoherence. With it False, --act-aware prints a notice and runs the
+# naive path. See fit_givens_rotation(score="activation") + main().
+ACT_AWARE_ENABLED = True
 
 
 def set_codebook(name, table):
@@ -249,6 +255,30 @@ def _givens_quant_mse(blocks, nl, imp=None):
     return e2.mean()
 
 
+def _act_int8_quant_mse(blocks, imp=None):
+    """Per-block symmetric int8 activation-quant MSE — the stage-(c) objective.
+    blocks: [G, span] fp32 ACTIVATION blocks (rows of real calibration activation,
+    reshaped to the rotation span). Mirrors the runtime fused rotate+quant
+    (`rxf_kernels._rxf_rotate_quant_int8_kernel`): scale = absmax/127, round to the
+    nearest integer in [-127, 127], dequant, squared error.
+
+    Faithfulness caveat: the runtime int8 scale is PER-TOKEN (absmax over the full
+    K row = max over that row's span-blocks); here it is PER span-BLOCK. A single
+    shared span x span R acts identically on every block, so minimizing the mean
+    per-block absmax-driven error tracks the per-row max it sets — a tight, poolable
+    surrogate. The served PPL A/B is the ground-truth arbiter (the stage-(b) lesson:
+    a moved offline proxy need not move PPL). imp: optional [G, span] rotated-basis
+    importance weighting (default uniform = pure outlier flattening)."""
+    absmax = blocks.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12)
+    scale = absmax / 127.0
+    q = torch.round(blocks / scale).clamp_(-127, 127)
+    deq = q * scale
+    e2 = (blocks - deq) ** 2
+    if imp is not None:
+        e2 = e2 * imp
+    return e2.mean()
+
+
 def _rotated_importance(imp_block, R):
     """Transform per-channel importance into the ROTATED basis (stage c). The
     output error injected by a rotated-weight quant error eps is (R x)·eps, so the
@@ -260,22 +290,34 @@ def _rotated_importance(imp_block, R):
 
 
 def fit_givens_rotation(blocks_all, nl, imp_block=None, span=GROUP, krot=6,
-                        n_angles=33, max_groups=8192, seed=0, init="hadamard"):
+                        n_angles=33, max_groups=8192, seed=0, init="hadamard",
+                        score="weight"):
     """Fit a `span` x `span` orthonormal R from a pool of rotation blocks by
     greedy Givens coordinate descent, INITIALIZED at the fixed Hadamard and
     refined: KROT rounds, each a random perfect matching of the span channels
     into span/2 disjoint pairs; per pair line-search the angle that most reduces
-    the (importance-weighted) post-quant MSE of the rotated blocks, grouped into
-    size-GROUP scale groups. Only strictly-improving angles are committed, so the
-    result is GUARANTEED no worse than the Hadamard it starts from (Hadamard is
-    near-optimal for incoherence; a greedy fit from identity cannot rediscover
-    its full mixing, so we refine FROM it — the QuaRot/SpinQuant move).
+    a quant-error objective on the rotated blocks. Only strictly-improving angles
+    are committed, so the result is GUARANTEED no worse than the Hadamard it starts
+    from (Hadamard is near-optimal for incoherence; a greedy fit from identity
+    cannot rediscover its full mixing, so we refine FROM it — the QuaRot/SpinQuant
+    move).
 
-    blocks_all: [G, span] fp32 — rotation blocks pooled from a SAMPLE of the
-    model's weights (any module with K % span == 0 contributes K/span blocks).
-    nl: [16] codebook. imp_block: optional [span] per-block-position importance
-    (un-rotated basis; the fit transforms it through R). init: 'hadamard' (start
-    at the FWHT) or 'identity'. Returns R [span, span] fp32 with R @ R.T = I."""
+    score: which objective the line-search minimizes —
+      'weight'     (stage b) — blocks_all are WEIGHT rows; minimize the post-quant
+                   IQ4-NL weight-reconstruction MSE grouped into size-GROUP scale
+                   groups (importance via _rotated_importance). Measured a PPL NULL.
+      'activation' (stage c) — blocks_all are real calibration ACTIVATION rows;
+                   minimize the per-block int8 activation-quant MSE
+                   (_act_int8_quant_mse) — activation conditioning, the genuine
+                   edge over data-blind Hadamard (it sees the REAL activation
+                   outlier structure). `nl` is unused on this path.
+
+    blocks_all: [G, span] fp32 — weight rows (weight score) or activation rows
+    (activation score), pooled from a SAMPLE of the model (modules with
+    K % span == 0). nl: [16] codebook (weight score only). imp_block: optional
+    [span] per-block-position importance (un-rotated basis; the fit transforms it
+    through R). init: 'hadamard' (start at the FWHT) or 'identity'. Returns R
+    [span, span] fp32 with R @ R.T = I."""
     dev = blocks_all.device
     blocks_all = blocks_all.float()
     G = blocks_all.shape[0]
@@ -301,7 +343,15 @@ def fit_givens_rotation(blocks_all, nl, imp_block=None, span=GROUP, krot=6,
         R = torch.eye(span, dtype=torch.float32, device=dev)
 
     def _score(b):
-        # group the [B, span] blocks into size-GROUP scale groups for MSE
+        if score == "activation":
+            # stage c: per-block int8 activation-quant MSE on the rotated rows.
+            imp = None
+            if imp_block is not None:
+                ir = _rotated_importance(imp_block, R)               # [span]
+                imp = ir.unsqueeze(0).expand_as(b)
+            return _act_int8_quant_mse(b, imp)
+        # stage b (weight): group the [B, span] blocks into size-GROUP scale
+        # groups and score the IQ4-NL weight-reconstruction MSE.
         bg = b.reshape(-1, GROUP)
         imp = None
         if imp_block is not None:
@@ -691,7 +741,9 @@ def fp8_block_quantize(w, block=(128, 128)):
 # ---------------------------------------------------------------------------
 
 def collect_activations(model_path, datasets, proportions, n_samples=512,
-                        seq_len=2048, device="cpu"):
+                        seq_len=2048, device="cpu", span=GROUP,
+                        collect_blocks=False, max_blocks_per_mod=2048,
+                        target_blocks=16384):
     """Run calibration data through the model and collect per-layer
     input activation magnitudes for activation-aware quantization.
 
@@ -702,9 +754,19 @@ def collect_activations(model_path, datasets, proportions, n_samples=512,
         n_samples: total calibration samples
         seq_len: sequence length per sample
         device: device to run calibration on
+        span: rotation span; SIGNED activation rows are reshaped to [*, span]
+              blocks for the stage-(c) Givens fit.
+        collect_blocks: also pool a stratified sample of SIGNED activation blocks
+              (for fit_givens_rotation(score="activation")).
+        max_blocks_per_mod: cap of pooled blocks PER Linear module (bounds memory).
+        target_blocks: total pooled-block budget across all modules.
 
     Returns:
-        act_scales: dict mapping weight tensor name -> [N, K] importance tensor
+        (act_scales, act_blocks):
+          act_scales: dict weight name -> [K] per-channel importance (mean |x|,
+                      normalized to mean 1.0).
+          act_blocks: pooled SIGNED activation blocks [G, span] fp32 (CPU), or
+                      None when collect_blocks is False / nothing eligible.
     """
     from transformers import AutoModelForCausalLM, AutoTokenizer
     import datasets as hf_datasets
@@ -762,11 +824,14 @@ def collect_activations(model_path, datasets, proportions, n_samples=512,
     # ── Hook linear layers to capture input activations ──
     act_sums = {}
     act_counts = {}
+    act_blocks_buf = {}          # name -> list of [g, span] cpu fp32 (signed)
+    act_blocks_count = {}        # name -> blocks pooled so far (cap guard)
     hooks = []
 
     def make_hook(name):
         def hook_fn(module, input, output):
-            x = input[0].detach().float().abs()
+            xin = input[0].detach().float()
+            x = xin.abs()
             # x: [batch, seq, hidden] — average over batch and seq
             act_mean = x.mean(dim=(0, 1))  # [hidden] = [K] for this layer
             if name not in act_sums:
@@ -775,6 +840,18 @@ def collect_activations(model_path, datasets, proportions, n_samples=512,
             else:
                 act_sums[name] += act_mean
                 act_counts[name] += 1
+            # Pool a STRIDED sample of SIGNED activation blocks for the stage-(c)
+            # Givens fit (per-module cap → no single big layer dominates the pool).
+            if collect_blocks and xin.shape[-1] % span == 0:
+                have = act_blocks_count.get(name, 0)
+                if have < max_blocks_per_mod:
+                    blk = xin.reshape(-1, span)           # [tokens*nB, span]
+                    take = min(max_blocks_per_mod - have, blk.shape[0])
+                    if take < blk.shape[0]:
+                        sel = torch.linspace(0, blk.shape[0] - 1, take).long()
+                        blk = blk.index_select(0, sel.to(blk.device))
+                    act_blocks_buf.setdefault(name, []).append(blk.cpu())
+                    act_blocks_count[name] = have + blk.shape[0]
         return hook_fn
 
     for name, module in model.named_modules():
@@ -802,13 +879,29 @@ def collect_activations(model_path, datasets, proportions, n_samples=512,
         avg_act = avg_act / (avg_act.mean() + 1e-8)
         act_scales[name] = avg_act.to(torch.float16).cpu()
 
+    # ── Pool the SIGNED activation blocks (stratified, equal per module) ──
+    act_blocks = None
+    if collect_blocks and act_blocks_buf:
+        mods = sorted(act_blocks_buf)
+        per_mod = max(1, target_blocks // len(mods))
+        pool = []
+        for name in mods:
+            b = torch.cat(act_blocks_buf[name], 0)        # [g, span]
+            if b.shape[0] > per_mod:                      # even strided slice
+                sel = torch.linspace(0, b.shape[0] - 1, per_mod).long()
+                b = b.index_select(0, sel)
+            pool.append(b)
+        act_blocks = torch.cat(pool, 0).float()           # [G, span] cpu
+        print(f"    Pooled {act_blocks.shape[0]} activation blocks "
+              f"(span={span}) from {len(mods)} modules for the Givens fit")
+
     del model
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
     print(f"    Collected activations for {len(act_scales)} layers")
-    return act_scales
+    return act_scales, act_blocks
 
 
 # ---------------------------------------------------------------------------
@@ -1167,14 +1260,17 @@ def main():
                     default="hadamard",
                     help="rotation FAMILY. 'hadamard' (default) = the fixed "
                          "data-blind Sylvester FWHT (ParoQuant stage a). 'givens' "
-                         "= a LEARNED per-module orthonormal R (ParoQuant stage "
-                         "b/c), fit by Givens coordinate descent to minimize the "
-                         "post-quant weight MSE; with --act-aware it folds "
-                         "activation importance into the fit IN THE ROTATED BASIS "
-                         "(the edge the fixed Hadamard structurally cannot reach). "
-                         "Emits rotation=givens<S> + a per-module weight_rotation "
-                         "tensor; the runtime applies the matching activation "
-                         "rotation externally. See PAROQUANT_RXF_INTEGRATION.md.")
+                         "= a LEARNED model-wide orthonormal R (ParoQuant stage "
+                         "b/c), fit by Hadamard-init Givens coordinate descent: "
+                         "data-blind it minimizes the post-quant weight MSE (stage "
+                         "b); with --act-aware <calib> it minimizes the REAL "
+                         "per-token int8 ACTIVATION-quant error on calibration "
+                         "activations (stage c, activation conditioning). Emits "
+                         "rotation=givens<S> + an inline rotation_matrix. "
+                         "MEASURED A NULL/REGRESSION on Qwen3.5-4B (see "
+                         "PAROQUANT_RXF_INTEGRATION.md §7): the learned R loses to "
+                         "the fixed Hadamard on both objectives; kept for the "
+                         "record + future models, not a recommended default.")
     args = ap.parse_args()
     if args.gpu_all or args.gpu_stream:
         args.gpu = True
@@ -1209,11 +1305,12 @@ def main():
 
     fp16_experts = parse_fp16_experts(args.fp16_experts)
 
-    # ── Activation-aware calibration (IN DEVELOPMENT — gated, see module docstring) ──
+    # ── Activation-aware calibration (ParoQuant stage c — see module docstring) ──
     act_scales = {}
+    act_blocks = None
     if args.act_aware and not ACT_AWARE_ENABLED:
-        print("  NOTE: activation-aware calibration is in development and "
-              "disabled (ACT_AWARE_ENABLED=False); using naive path.")
+        print("  NOTE: activation-aware calibration is disabled "
+              "(ACT_AWARE_ENABLED=False); using naive path.")
     if args.act_aware and ACT_AWARE_ENABLED:
         datasets = args.act_aware
         if len(datasets) > 10:
@@ -1232,12 +1329,26 @@ def main():
         print("Activation-aware calibration:")
         for ds, p in zip(datasets, proportions):
             print(f"  {p*100:.0f}%  {ds}")
-        act_scales = collect_activations(
+        # Stage (c): for the learned-Givens path, pool SIGNED activation blocks so
+        # R can be fit to the real int8 activation-quant error (activation
+        # conditioning). Other paths only need the per-channel importance.
+        want_blocks = (rotation_kind == "givens")
+        act_scales_collected, act_blocks = collect_activations(
             args.input, datasets, proportions,
             n_samples=args.act_samples,
             seq_len=args.act_seq_len,
             device=args.act_device,
+            span=rotation_span,
+            collect_blocks=want_blocks,
         )
+        # ISOLATE THE VARIABLE: when fitting R on the activation objective, leave
+        # weight-side importance OFF so the ONLY change vs stage (b) is R's
+        # objective (a clean A/B). Otherwise keep the legacy per-channel weight
+        # importance path.
+        if want_blocks and act_blocks is not None:
+            act_scales = {}
+        else:
+            act_scales = act_scales_collected
 
     src = args.input
     dst = args.output or src.parent / f"{src.name}-RXF"
@@ -1388,21 +1499,49 @@ def main():
     # activation rotation (set into config.json as rotation_matrix). ──
     rotation_matrix = None
     if rotate and rotation_kind == "givens":
-        fit_dev = "cuda:0" if (use_gpu and n_gpus > 0) else "cpu"
-        print(f"  fitting model-wide learned Givens R (span={ROTATION_SPAN}, "
-              f"importance={'on' if act_scales else 'off (uniform)'}) "
-              f"on {fit_dev} ...", flush=True)
-        nl_fit = ACTIVE_TABLE.to(fit_dev)
-        blocks, imp_block = pool_rotation_blocks(
-            plan, src, idx, spec, ROTATION_SPAN, act_scales, device=fit_dev)
-        R = fit_givens_rotation(blocks, nl_fit, imp_block=imp_block,
-                                span=ROTATION_SPAN).cpu()
-        set_givens_rotation(R)
-        rotation_matrix = R.tolist()
-        eye = torch.eye(ROTATION_SPAN)
-        ortho = (R @ R.t() - eye).abs().max().item()
-        print(f"  learned R: pooled {blocks.shape[0]} blocks, "
-              f"R·Rᵀ−I max={ortho:.2e}", flush=True)
+        if act_blocks is not None and act_blocks.numel():
+            # ── Stage (c): fit R to the REAL per-token int8 ACTIVATION-quant error
+            # on calibration activations (activation conditioning — the DFlash
+            # insight; the genuine edge over data-blind Hadamard). The fit runs on
+            # CPU: the descent is cheap and the GPU large-M small-K matmul flake
+            # (PAROQUANT_RXF_INTEGRATION.md §6) does not bite there. ──
+            print(f"  fitting model-wide learned Givens R (span={ROTATION_SPAN}, "
+                  f"objective=ACTIVATION int8-quant error, stage c) on cpu ...",
+                  flush=True)
+            ab = act_blocks.float().cpu()
+            # Hadamard baseline (the init) vs fitted R, on the SAME blocks.
+            H = _fwht_rows(torch.eye(ROTATION_SPAN, dtype=torch.float32),
+                           ROTATION_SPAN)
+            mse_had = _act_int8_quant_mse(_apply_rotation_rows(ab, H)).item()
+            R = fit_givens_rotation(ab, ACTIVE_TABLE, span=ROTATION_SPAN,
+                                    score="activation").cpu()
+            mse_fit = _act_int8_quant_mse(_apply_rotation_rows(ab, R)).item()
+            set_givens_rotation(R)
+            rotation_matrix = R.tolist()
+            eye = torch.eye(ROTATION_SPAN)
+            ortho = (R @ R.t() - eye).abs().max().item()
+            gain = mse_had / mse_fit if mse_fit > 0 else float("inf")
+            print(f"  learned R (activation obj): {ab.shape[0]} blocks, "
+                  f"int8 act-MSE Hadamard={mse_had:.4e} -> fit={mse_fit:.4e} "
+                  f"({gain:.4f}x), R·Rᵀ−I max={ortho:.2e}", flush=True)
+        else:
+            # ── Stage (b): data-blind weight-quant MSE objective (measured null). ──
+            fit_dev = "cuda:0" if (use_gpu and n_gpus > 0) else "cpu"
+            print(f"  fitting model-wide learned Givens R (span={ROTATION_SPAN}, "
+                  f"objective=weight-quant MSE, stage b; "
+                  f"importance={'on' if act_scales else 'off (uniform)'}) "
+                  f"on {fit_dev} ...", flush=True)
+            nl_fit = ACTIVE_TABLE.to(fit_dev)
+            blocks, imp_block = pool_rotation_blocks(
+                plan, src, idx, spec, ROTATION_SPAN, act_scales, device=fit_dev)
+            R = fit_givens_rotation(blocks, nl_fit, imp_block=imp_block,
+                                    span=ROTATION_SPAN).cpu()
+            set_givens_rotation(R)
+            rotation_matrix = R.tolist()
+            eye = torch.eye(ROTATION_SPAN)
+            ortho = (R @ R.t() - eye).abs().max().item()
+            print(f"  learned R: pooled {blocks.shape[0]} blocks, "
+                  f"R·Rᵀ−I max={ortho:.2e}", flush=True)
 
     # ==================================================================
     # Quantization pass
