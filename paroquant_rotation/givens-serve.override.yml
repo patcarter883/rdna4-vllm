@@ -1,0 +1,17 @@
+# Compose override: serve a Givens-rotated RXF checkpoint on the `single` profile
+# with the WORKTREE runtime (rxf.py + rxf_kernels.py, which carry the learned
+# Givens path) bind-mounted over the baked image. Volumes here are APPENDED to the
+# anchor's (HF cache + Triton cache), so the warm cache is still mounted.
+#
+# Usage (from main checkout, leased; export HF_HOME, VLLM_HOST_TRITON_CACHE,
+# VLLM_SINGLE_MODEL_ID first):
+#   scripts/gpu-lease.sh -n 1 --detach --name rxfgiv -- \
+#     docker compose -f docker-compose.yml \
+#       -f <pq>/givens-serve.override.yml --profile single up -d
+services:
+  single:
+    environment:
+      RXF_ACT_DTYPE: "${RXF_ACT_DTYPE:-int8}"
+    volumes:
+      - /home/pat/code/vllm-gfx1201-paroquant-rotation/paroquant_rotation/rxf.py:/app/vllm/vllm/model_executor/layers/quantization/rxf.py:ro
+      - /home/pat/code/vllm-gfx1201-paroquant-rotation/paroquant_rotation/rxf_kernels.py:/app/vllm/vllm/model_executor/layers/quantization/utils/rxf_kernels.py:ro
