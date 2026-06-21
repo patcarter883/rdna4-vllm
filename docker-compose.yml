@@ -18,7 +18,7 @@ x-combined-common: &combined-common
     args:
       # Pinned by digest (not the moving `:dev` tag) — see Dockerfile.combined's header for the
       # rationale + bump procedure. Override with COMBINED_BASE_IMAGE in .env to test a newer base.
-      BASE_IMAGE: ${COMBINED_BASE_IMAGE:-tcclaviger/vllm22@sha256:e2e5ffcdee14670e183843bfd16d673c6ac7202b91bb3e2b982b324431c170f3}
+      BASE_IMAGE: ${COMBINED_BASE_IMAGE:-tcclaviger/vllm22@sha256:ad046fde24d9233e72790222cbac3fc24f7e47a0d28e3089c2a383422890d67a}
       GPU_ARCHS: gfx1201
       # Heterogeneous-TP proportional sharding (64:56). ON by default -- GPU-validated:
       # byte-identical to the even split, all-reduce imbalance ~75% smaller (see DIARY Act XI
