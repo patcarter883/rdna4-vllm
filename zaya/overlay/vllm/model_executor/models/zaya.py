@@ -957,13 +957,18 @@ class ZayaForCausalLM(nn.Module, HasInnerState, IsHybrid):
                     )
                     continue
 
-                kind = parts[-1]  # "weight" or "weight_scale"
-                if kind not in ("weight", "weight_scale"):
+                # "weight" (bf16/fp8) | "weight_scale" | "weight_packed" (RXF
+                # 4-bit codes). RXF registers w13/w2_weight_packed + _weight_scale
+                # on the FusedMoE; the gate/up dim-0 split + shard-aware
+                # weight_loader below work unchanged for the packed codes.
+                kind = parts[-1]
+                if kind not in ("weight", "weight_scale", "weight_packed"):
                     logger.warning(
                         "Unknown expert tensor kind in %s", chkpt_weight_name
                     )
                     continue
-                suffix = "_scale" if kind == "weight_scale" else ""
+                suffix = {"weight": "", "weight_scale": "_scale",
+                          "weight_packed": "_packed"}[kind]
 
                 if parts[-2] == "linear_fc1":
                     param_name = f"{fused_moe_prefix}.w13_weight{suffix}"
