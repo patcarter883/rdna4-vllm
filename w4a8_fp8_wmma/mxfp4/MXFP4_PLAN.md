@@ -46,10 +46,28 @@ Verified bit-exactly on CPU (`mxfp4/test_mxfp4_decode.py`, run in the image venv
   (`max|diff|=0`) for all dense kernels + decode_gemv at M=4/16/64, and an fp8 oracle confirms the
   non-integer 0.5/1.5 values decode through the live kernels. int4 path unchanged (regression guard).
 
+**DONE — vLLM DENSE dispatch (runtime monkeypatch, CPU-smoke validated):**
+- `w4a8_fp8_wmma/mxfp4_linear.py`: `RocmW4A8MxFp4LinearKernel(MxFp4LinearKernel)` — converts the
+  scheme's E2M1/E8M0 weights (`layer.weight` uint8 (N,K//2) + `layer.weight_scale` uint8 (N,K//32))
+  at load via `convert_mxfp4_weight`, and `apply_weights` routes through
+  `mmq_fp8_gemm(..., weight_is_e2m1=True)` (decode_gemv for M≤16/K%512, else prefill_wmma_ashuffle).
+- `register.py`: registers it into vLLM's `_POSSIBLE_MXFP4_KERNELS[ROCM]` via `register_linear_kernel`
+  (best-effort, like the other hooks). This makes the UNMODIFIED `CompressedTensorsW4A4Mxfp4` scheme
+  work on gfx1201 (it otherwise crashes at construct — no ROCm mxfp4 kernel exists). No base-image
+  patch. Smoke: valid subclass (no leftover abstract methods), registers, can_implement=True.
+
 **REMAINING:**
-- MoE GPU equivalence test (`test_mxfp4_kernel_gpu.py` covers dense; MoE kernels compile + share the
-  identical threaded helper — add the e2m1==int4 MoE check).
-- vLLM dispatch wiring (next §) + image build + serve smoke.
+- **vLLM MoE dispatch (gpt-oss — the real win).** Seam = `GptOssMxfp4MoEMethod` in base-image
+  `quantization/mxfp4.py`: its `apply()` delegates to `self.moe_kernel.apply(...)`; per-expert 3D
+  uint8 weights are `w13_weight (E,2I,H//2)` / `w2_weight (E,H,I//2)` + `*_weight_scale (…,/32)`.
+  Plan: monkeypatch (like `moe_experts.py::register_moe_ct`) to (a) `convert_mxfp4_moe` w13/w2 at
+  `process_weights_after_loading`, (b) override `apply` to run our `mmq_fp8_moe_gemm1_silu` (gemm1)
+  + `mmq_fp8_moe_gemm_scatter` (gemm2) with `weight_is_e2m1=True`, reusing the moe_align + two-GEMM
+  orchestration already in `moe_experts.py`. (gfx1201 auto-backend today = AITER_MXFP4_BF16, which
+  needs aiter — not installed — so there's no competing path.)
+- MoE GPU equivalence test (e2m1==int4) — dense GPU test passes; MoE kernels compile + share helper.
+- Image build (`vllm22-w4a8:mxfp4`) + serve smoke (a real CT-mxfp4 dense model first, then gpt-oss)
+  + the A8 PPL gate.
 
 ## Coexistence with the activation-rotation work — orthogonal by construction
 

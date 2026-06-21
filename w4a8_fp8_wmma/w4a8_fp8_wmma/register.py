@@ -74,6 +74,25 @@ def register(verbose: bool = True) -> bool:
         print("[w4a8_fp8_wmma] registered at _POSSIBLE_KERNELS[ROCM][0]:",
               [k.__name__ for k in lst])
 
+    # mxfp4 (OCP E2M1) DENSE hook — registers our kernel into vLLM's SEPARATE mxfp4 linear-kernel
+    # registry (_POSSIBLE_MXFP4_KERNELS, distinct from _POSSIBLE_KERNELS above). vLLM ships no ROCm
+    # entry there, so CompressedTensorsW4A4Mxfp4 otherwise crashes at construct on gfx1201; this lets
+    # the unmodified scheme route E2M1 dense linears through the W4A8 op. Best-effort.
+    try:
+        from vllm.model_executor.kernels.linear import register_linear_kernel
+        from vllm.platforms import PlatformEnum as _PE
+        from w4a8_fp8_wmma.mxfp4_linear import RocmW4A8MxFp4LinearKernel
+        from vllm.model_executor.kernels.linear import _POSSIBLE_MXFP4_KERNELS
+        if RocmW4A8MxFp4LinearKernel not in _POSSIBLE_MXFP4_KERNELS.get(_PE.ROCM, []):
+            register_linear_kernel(RocmW4A8MxFp4LinearKernel, _PE.ROCM, kernel_type="mxfp4")
+        if verbose:
+            print("[w4a8_fp8_wmma] mxfp4 dense kernel registered at "
+                  "_POSSIBLE_MXFP4_KERNELS[ROCM]:",
+                  [k.__name__ for k in _POSSIBLE_MXFP4_KERNELS.get(_PE.ROCM, [])])
+    except Exception as e:  # pragma: no cover - defensive
+        if verbose:
+            print(f"[w4a8_fp8_wmma] mxfp4 dense hook not installed: {e}")
+
     # MoE (fused experts) hook — patches the WNA16 MoE oracle so AWQ-4bit expert
     # layers on gfx12x route to our grouped FP8-WMMA kernel. Best-effort: failures
     # here must not break the (already-registered) dense path.
