@@ -419,3 +419,214 @@ services:
       - --rsa-k=${RSA_K:-4}
       - --rsa-t=${RSA_T:-2}
       - --rsa-tail-tokens=${RSA_TAIL:-4096}
+
+  # --- ZAYA DFlash speculative decoding (M1 plumbing bring-up). ---
+  # Layers the non-causal-triton dflash image + our edited zaya.py (aux-hidden-
+  # state exposure) + a RANDOM-WEIGHT stub drafter to validate the spec path
+  # end-to-end. Acceptance is ~random by design; the real CCA-aware drafter is M2.
+  #   scripts/gpu-lease.sh -n 1 --detach --name zaya-dflash -- \
+  #     docker compose --profile zaya-dflash up -d
+  zaya-dflash:
+    <<: *combined-common
+    image: vllm22-w4a8:dflash-rxf          # has the non-causal triton_attn patch + RXF + zaya overlay
+    profiles: ["zaya-dflash"]
+    container_name: ${LEASE_NAME:-vllm22}-zaya-dflash
+    volumes:
+      - ${HF_HOME:-./.hf-cache}:/root/.cache/huggingface
+      - ${ZAYA_MODELS_DIR:-~/models}:/models:ro
+      - ${ZAYA_DFLASH_MODELS_DIR:-/home/pat/code/_models}:/dflash-models:ro
+      - ${VLLM_HOST_TRITON_CACHE:-./.triton-cache-combined}:/root/.triton
+      # M1 fast-iteration: overlay the aux-hidden-state edit without an image rebuild.
+      # Fold into the image (Dockerfile) once M1 is validated.
+      - /home/pat/code/vllm-gfx1201-zaya-dflash/zaya/overlay/vllm/model_executor/models/zaya.py:/app/vllm/vllm/model_executor/models/zaya.py:ro
+    ports:
+      - "${ZAYA_HOST_PORT:-8000}:8000"
+    environment:
+      <<: *combined-env
+      ROCR_VISIBLE_DEVICES: "${LEASE_ROCR_DEVICES:-0,1}"
+      HIP_VISIBLE_DEVICES: "${LEASE_HIP_DEVICES:-0,1}"
+      VLLM_ROCM_USE_W4A8_FP8_WMMA: "${ZAYA_USE_W4A8:-1}"
+      # Under spec decode the fused CCA decode kernel auto-disables (needs num_spec==0);
+      # the eager CCA verify path runs. Leave prefill HIP on.
+      ZAYA_CCA_HIP: "${ZAYA_CCA_HIP:-1}"
+      ZAYA_CCA_HIP_PREFILL: "${ZAYA_CCA_HIP_PREFILL:-1}"
+    command:
+      - ${ZAYA_MODEL_ID:-/models/ZAYA1-8B-fp8}
+      - --served-model-name=model
+      - --host=0.0.0.0
+      - --port=8000
+      - --trust-remote-code
+      - --dtype=bfloat16
+      - --tensor-parallel-size=1
+      - --max-model-len=${ZAYA_MAX_MODEL_LEN:-8192}
+      - --max-num-seqs=${ZAYA_MAX_NUM_SEQS:-8}
+      - --max-num-batched-tokens=${ZAYA_MAX_BATCHED:-8192}
+      - --mamba-cache-dtype=float32
+      - --enforce-eager                    # DFlash bring-up is eager (matches FINDINGS.md)
+      - --gpu-memory-utilization=${ZAYA_GPU_MEMORY_UTIL:-0.90}
+      - --speculative-config=${ZAYA_DFLASH_SPEC:-{"model":"/dflash-models/ZAYA1-8B-DFlash-stub","num_speculative_tokens":4,"method":"dflash","attention_backend":"TRITON_ATTN"}}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=3).status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 40
+      start_period: 60s
+
+  # --- ZAYA DFlash + 'all'-mode bit-lossless rollback (M5 bring-up). ---
+  # Adds the runner patch (threads num_accepted_tokens / prev_last_scheduled_idx to
+  # the CCA backend) + 'all' mamba-cache-mode (block-16) so the CCA verify path can
+  # roll conv/temporal state to the last-accepted token. ZAYA_SPEC_DEBUG=1 logs a
+  # one-shot confirmation that the rollback fields now arrive non-None.
+  #   scripts/gpu-lease.sh -n 1 --detach --name zaya-dflash-all -- \
+  #     docker compose --profile zaya-dflash-all up -d
+  zaya-dflash-all:
+    <<: *combined-common
+    image: vllm22-w4a8:dflash-rxf
+    profiles: ["zaya-dflash-all"]
+    container_name: ${LEASE_NAME:-vllm22}-zaya-dflash-all
+    volumes:
+      - ${HF_HOME:-./.hf-cache}:/root/.cache/huggingface
+      - ${ZAYA_MODELS_DIR:-~/models}:/models:ro
+      - ${ZAYA_DFLASH_MODELS_DIR:-/home/pat/code/_models}:/dflash-models:ro
+      - ${VLLM_HOST_TRITON_CACHE:-./.triton-cache-combined}:/root/.triton
+      # M5 fast-iteration overlays (fold into the image once validated):
+      - /home/pat/code/vllm-gfx1201-zaya-dflash/zaya/overlay/vllm/model_executor/models/zaya.py:/app/vllm/vllm/model_executor/models/zaya.py:ro
+      - /home/pat/code/vllm-gfx1201-zaya-dflash/zaya/overlay/vllm/model_executor/layers/mamba/cca.py:/app/vllm/vllm/model_executor/layers/mamba/cca.py:ro
+      - /home/pat/code/_models/cca_all_mode/gpu_model_runner.py:/app/vllm/vllm/v1/worker/gpu_model_runner.py:ro
+    ports:
+      - "${ZAYA_HOST_PORT:-8000}:8000"
+    environment:
+      <<: *combined-env
+      ROCR_VISIBLE_DEVICES: "${LEASE_ROCR_DEVICES:-0,1}"
+      HIP_VISIBLE_DEVICES: "${LEASE_HIP_DEVICES:-0,1}"
+      VLLM_ROCM_USE_W4A8_FP8_WMMA: "${ZAYA_USE_W4A8:-1}"
+      ZAYA_CCA_HIP: "${ZAYA_CCA_HIP:-1}"
+      ZAYA_CCA_HIP_PREFILL: "${ZAYA_CCA_HIP_PREFILL:-1}"
+      ZAYA_SPEC_ALL: "1"             # make ZayaForCausalLM advertise mamba prefix caching -> 'all' mode
+      ZAYA_SPEC_DEBUG: "1"           # one-shot log: are the rollback fields non-None now?
+    command:
+      - ${ZAYA_MODEL_ID:-/models/ZAYA1-8B-fp8}
+      - --served-model-name=model
+      - --host=0.0.0.0
+      - --port=8000
+      - --trust-remote-code
+      - --dtype=bfloat16
+      - --tensor-parallel-size=1
+      - --max-model-len=${ZAYA_MAX_MODEL_LEN:-8192}
+      - --max-num-seqs=${ZAYA_MAX_NUM_SEQS:-8}
+      - --max-num-batched-tokens=${ZAYA_MAX_BATCHED:-8192}
+      - --mamba-cache-dtype=float32
+      - --enable-prefix-caching
+      - --mamba-cache-mode=all
+      - --mamba-block-size=16
+      - --enforce-eager
+      - --gpu-memory-utilization=${ZAYA_GPU_MEMORY_UTIL:-0.90}
+      - --speculative-config=${ZAYA_DFLASH_SPEC:-{"model":"/dflash-models/ZAYA1-8B-DFlash-stub","num_speculative_tokens":4,"method":"dflash","attention_backend":"TRITON_ATTN"}}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=3).status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 40
+      start_period: 60s
+
+  # --- Bit-identity BASELINE: 'all' mamba-cache-mode, num_spec=0 (NO speculative-config). ---
+  # Same code path as zaya-dflash-all (all/block-16/prefix-caching/eager, the cca.py rollback +
+  # runner-patch overlays) but with speculation OFF. This is the reference the ngram-spec run is
+  # diffed against (zaya/dflash/bitident_client.py): identical greedy token ids => the CCA
+  # 'all'-mode partial-acceptance rollback is bit-lossless. Also exercises the 'all'-mode prefill
+  # column-0 slot-write at num_spec=0 (cca.py:319) so a first-token offset would show as a diff.
+  #   scripts/gpu-lease.sh -n 1 --detach --name zaya-bi-all -- \
+  #     docker compose --profile zaya-bi-all-nospec up -d
+  zaya-bi-all-nospec:
+    <<: *combined-common
+    image: vllm22-w4a8:dflash-rxf
+    profiles: ["zaya-bi-all-nospec"]
+    container_name: ${LEASE_NAME:-vllm22}-zaya-bi-all-nospec
+    volumes:
+      - ${HF_HOME:-./.hf-cache}:/root/.cache/huggingface
+      - ${ZAYA_MODELS_DIR:-~/models}:/models:ro
+      - ${ZAYA_DFLASH_MODELS_DIR:-/home/pat/code/_models}:/dflash-models:ro
+      - ${VLLM_HOST_TRITON_CACHE:-./.triton-cache-combined}:/root/.triton
+      - /home/pat/code/vllm-gfx1201-zaya-dflash/zaya/overlay/vllm/model_executor/models/zaya.py:/app/vllm/vllm/model_executor/models/zaya.py:ro
+      - /home/pat/code/vllm-gfx1201-zaya-dflash/zaya/overlay/vllm/model_executor/layers/mamba/cca.py:/app/vllm/vllm/model_executor/layers/mamba/cca.py:ro
+      - /home/pat/code/_models/cca_all_mode/gpu_model_runner.py:/app/vllm/vllm/v1/worker/gpu_model_runner.py:ro
+    ports:
+      - "${ZAYA_HOST_PORT:-8000}:8000"
+    environment:
+      <<: *combined-env
+      ROCR_VISIBLE_DEVICES: "${LEASE_ROCR_DEVICES:-0,1}"
+      HIP_VISIBLE_DEVICES: "${LEASE_HIP_DEVICES:-0,1}"
+      VLLM_ROCM_USE_W4A8_FP8_WMMA: "${ZAYA_USE_W4A8:-1}"
+      ZAYA_CCA_HIP: "${ZAYA_CCA_HIP:-1}"
+      ZAYA_CCA_HIP_PREFILL: "${ZAYA_CCA_HIP_PREFILL:-1}"
+      ZAYA_SPEC_ALL: "1"             # advertise mamba prefix caching -> 'all' mode (same as spec run)
+    command:
+      - ${ZAYA_MODEL_ID:-/models/ZAYA1-8B-fp8}
+      - --served-model-name=model
+      - --host=0.0.0.0
+      - --port=8000
+      - --trust-remote-code
+      - --dtype=bfloat16
+      - --tensor-parallel-size=1
+      - --max-model-len=${ZAYA_MAX_MODEL_LEN:-8192}
+      - --max-num-seqs=${ZAYA_MAX_NUM_SEQS:-8}
+      - --max-num-batched-tokens=${ZAYA_MAX_BATCHED:-8192}
+      - --mamba-cache-dtype=float32
+      - --enable-prefix-caching
+      - --mamba-cache-mode=all
+      - --mamba-block-size=16
+      - --enforce-eager
+      - --gpu-memory-utilization=${ZAYA_GPU_MEMORY_UTIL:-0.90}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=3).status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 40
+      start_period: 60s
+
+  # --- Bit-identity REFERENCE: align mamba-cache-mode, num_spec=0 (NO speculative-config). ---
+  # Canonical greedy ZAYA in the same eager/TP=1 shape but the DEFAULT align cache mode (no 'all',
+  # no prefix caching, no runner patch). Diffing this vs zaya-bi-all-nospec closes the
+  # cca-all-mode-spec-plan "prereq decision 1" gate: block-size-16 'all' == align greedy.
+  #   scripts/gpu-lease.sh -n 1 --detach --name zaya-bi-align -- \
+  #     docker compose --profile zaya-bi-align-nospec up -d
+  zaya-bi-align-nospec:
+    <<: *combined-common
+    image: vllm22-w4a8:dflash-rxf
+    profiles: ["zaya-bi-align-nospec"]
+    container_name: ${LEASE_NAME:-vllm22}-zaya-bi-align-nospec
+    volumes:
+      - ${HF_HOME:-./.hf-cache}:/root/.cache/huggingface
+      - ${ZAYA_MODELS_DIR:-~/models}:/models:ro
+      - ${VLLM_HOST_TRITON_CACHE:-./.triton-cache-combined}:/root/.triton
+      - /home/pat/code/vllm-gfx1201-zaya-dflash/zaya/overlay/vllm/model_executor/models/zaya.py:/app/vllm/vllm/model_executor/models/zaya.py:ro
+      - /home/pat/code/vllm-gfx1201-zaya-dflash/zaya/overlay/vllm/model_executor/layers/mamba/cca.py:/app/vllm/vllm/model_executor/layers/mamba/cca.py:ro
+    ports:
+      - "${ZAYA_HOST_PORT:-8000}:8000"
+    environment:
+      <<: *combined-env
+      ROCR_VISIBLE_DEVICES: "${LEASE_ROCR_DEVICES:-0,1}"
+      HIP_VISIBLE_DEVICES: "${LEASE_HIP_DEVICES:-0,1}"
+      VLLM_ROCM_USE_W4A8_FP8_WMMA: "${ZAYA_USE_W4A8:-1}"
+      ZAYA_CCA_HIP: "${ZAYA_CCA_HIP:-1}"
+      ZAYA_CCA_HIP_PREFILL: "${ZAYA_CCA_HIP_PREFILL:-1}"
+    command:
+      - ${ZAYA_MODEL_ID:-/models/ZAYA1-8B-fp8}
+      - --served-model-name=model
+      - --host=0.0.0.0
+      - --port=8000
+      - --trust-remote-code
+      - --dtype=bfloat16
+      - --tensor-parallel-size=1
+      - --max-model-len=${ZAYA_MAX_MODEL_LEN:-8192}
+      - --max-num-seqs=${ZAYA_MAX_NUM_SEQS:-8}
+      - --max-num-batched-tokens=${ZAYA_MAX_BATCHED:-8192}
+      - --mamba-cache-dtype=float32
+      - --enforce-eager
+      - --gpu-memory-utilization=${ZAYA_GPU_MEMORY_UTIL:-0.90}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=3).status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 40
+      start_period: 60s

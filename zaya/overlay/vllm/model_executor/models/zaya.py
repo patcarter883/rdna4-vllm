@@ -40,7 +40,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.zaya import ZayaConfig
 
-from .interfaces import HasInnerState, IsHybrid
+from .interfaces import EagleModelMixin, HasInnerState, IsHybrid, SupportsEagle3
 from .utils import make_empty_intermediate_tensors_factory, maybe_prefix
 
 logger = logging.getLogger(__name__)
@@ -608,7 +608,7 @@ class ZayaDecoderMLPLayer(nn.Module):
 
 
 @support_torch_compile
-class ZayaModel(nn.Module):
+class ZayaModel(nn.Module, EagleModelMixin):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
 
@@ -711,6 +711,18 @@ class ZayaModel(nn.Module):
         hidden_states = inputs_embeds
         prev_router_hidden_states = None
 
+        # EAGLE3/DFlash auxiliary hidden states: when a drafter has requested
+        # intermediate-layer taps (set_aux_hidden_state_layers), collect the
+        # residual-stream value at each tapped depth and return it alongside the
+        # final hidden state. Empty + no-op on the normal serving path (the
+        # branch is constant per compiled instance — aux layers are fixed at
+        # load time). Semantics match LlamaModel: index 0 = embeddings, index
+        # i+1 = output of layer i (hidden_states + residual).
+        collect_aux = bool(self.aux_hidden_state_layers)
+        aux_hidden_states: list[torch.Tensor] = []
+        if collect_aux:
+            self._maybe_add_hidden_state(aux_hidden_states, 0, inputs_embeds, None)
+
         for layer_n, decoder_layer in enumerate(self.layers):
             hidden_states, residual, prev_router_hidden_states = decoder_layer(
                 hidden_states,
@@ -719,6 +731,10 @@ class ZayaModel(nn.Module):
                 layer_n,
                 prev_router_hidden_states,
             )
+            if collect_aux:
+                self._maybe_add_hidden_state(
+                    aux_hidden_states, layer_n + 1, hidden_states, residual
+                )
 
         if self.config.scale_residual_merge:
             residual, hidden_states = self.res_scale(residual, hidden_states)
@@ -735,10 +751,12 @@ class ZayaModel(nn.Module):
             self.final_norm, hidden_states, final_input_dtype
         )
 
+        if collect_aux:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
 
-class ZayaForCausalLM(nn.Module, HasInnerState, IsHybrid):
+class ZayaForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsEagle3):
     # EXPERIMENTAL, opt-in via env: claiming mamba-prefix-caching support makes
     # vLLM select mamba_cache_mode='all' (the only mode that populates the spec
     # cross-step rollback metadata: block_idx_last_computed/scheduled_token,
@@ -866,10 +884,12 @@ class ZayaForCausalLM(nn.Module, HasInnerState, IsHybrid):
         inputs_embeds: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor | IntermediateTensors:
-        hidden_states = self.model(
+        # Returns either the final hidden state, or (when a DFlash/EAGLE3 drafter
+        # has requested aux taps) a (hidden_states, aux_hidden_states) tuple. The
+        # gpu_model_runner unpacks the tuple before compute_logits.
+        return self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
-        return hidden_states
 
     def compute_logits(
         self,

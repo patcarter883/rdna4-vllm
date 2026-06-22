@@ -314,8 +314,13 @@ class CCA(MambaBase, CustomOp):
             state_indices_tensor_p = attn_metadata.state_indices_tensor_p
             # In 'all' mamba_cache_mode the prefill state-index tensor is the full
             # 2D block table [num_prefills, max_blocks]; this non-'all' CCA prefill
-            # path expects a single base slot per sequence, so collapse to column 0.
+            # path expects a single base slot per sequence, so collapse to column 0
+            # for READS (initial states). The end-of-prefill WRITE, however, must go
+            # to the block_idx_last_scheduled_token column so the first verify step's
+            # seed read (blk_scheduled_prev + num_accepted-1) finds it — see the
+            # prefill write below. Keep the 2D form to compute that write column.
             # No-op in align/none mode, where state_indices_tensor_p is already 1D.
+            state_indices_tensor_p_2d = state_indices_tensor_p
             if (
                 state_indices_tensor_p is not None
                 and state_indices_tensor_p.dim() > 1
@@ -526,6 +531,30 @@ class CCA(MambaBase, CustomOp):
             device = hs.device
 
             req_idx = torch.arange(num_prefills, device=device)
+            # 'all' mamba_cache_mode: write the end-of-prefill conv/temporal state
+            # to each request's block_idx_last_scheduled_token block, NOT the
+            # collapsed column-0 slot. The first spec-verify step seeds from
+            # state_indices_2d[row, blk_scheduled_prev + (num_accepted-1)], and
+            # blk_scheduled_prev for that step is the prefill's last scheduled
+            # block — so the prefill must deposit its state there or the first
+            # verify reads an empty/wrong slot (token-1 divergence). In align/none
+            # mode state_indices_tensor_p is 1D and this falls back to it (no-op).
+            prefill_write_slots = state_indices_tensor_p
+            if (
+                self.num_spec > 0
+                and state_indices_tensor_p_2d is not None
+                and state_indices_tensor_p_2d.dim() > 1
+                and blk_scheduled_d is not None
+            ):
+                # num_spec>0: ALL decode (incl. single-token) goes through the
+                # verify path, which reads its seed from the block_idx column (never
+                # column 0). So the prefill end-state must live at that column.
+                # num_spec==0 keeps column 0 (single-token decode reads [:,0]) —
+                # which is why the align/all num_spec=0 paths are already bit-clean.
+                blk_sched_p = blk_scheduled_d[
+                    num_decodes : num_decodes + num_prefills
+                ].to(torch.long)
+                prefill_write_slots = state_indices_tensor_p_2d[req_idx, blk_sched_p]
             seq_lens_p = query_start_loc_p[1:] - query_start_loc_p[:-1]
             token_req = torch.repeat_interleave(
                 req_idx, seq_lens_p, output_size=num_prefill_tokens
@@ -607,7 +636,7 @@ class CCA(MambaBase, CustomOp):
                     .reshape(self.in_out_ch, num_prefills, tp_pad)
                     .permute(1, 0, 2)
                 )
-                conv_states[state_indices_tensor_p] = new_states.to(
+                conv_states[prefill_write_slots] = new_states.to(
                     device=conv_states.device, dtype=conv_states.dtype
                 )
 
@@ -624,7 +653,7 @@ class CCA(MambaBase, CustomOp):
             )
             hs2_prefill[query_start_loc_p[:-1]] = init_hs.unsqueeze(1)
 
-            prev_hs[state_indices_tensor_p] = hs_p[query_start_loc_p[1:] - 1, 0, :].to(
+            prev_hs[prefill_write_slots] = hs_p[query_start_loc_p[1:] - 1, 0, :].to(
                 device=prev_hs.device, dtype=prev_hs.dtype
             )
 
@@ -882,23 +911,69 @@ class CCA(MambaBase, CustomOp):
             and blk_scheduled_prev is not None
             and num_accepted is not None
         )
+        # Per-step diagnostic (M5/task-A): log the first N verify calls so we can
+        # see whether all_avail is False only on step 1 (no previous step) or
+        # throughout (runner not threading rollback fields). Logs num_accepted /
+        # seq_lens values too, to tell a within-block conv bug from a cross-step
+        # rollback bug. Gated; default off => zero hot-path cost. Set
+        # ZAYA_SPEC_DEBUG_N to change the count (default 40); only layer 0 logs.
+        if os.environ.get("ZAYA_SPEC_DEBUG", "0") == "1":
+            cls = type(self)
+            # Latch the first CCA layer instance to reach this point as the sole
+            # logger (avoids 40 layers x N steps of spam).
+            if getattr(cls, "_spec_dbg_owner", None) is None:
+                cls._spec_dbg_owner = id(self)
+            if cls._spec_dbg_owner == id(self):
+                _dbgN = int(os.environ.get("ZAYA_SPEC_DEBUG_N", "40"))
+                _c = getattr(self, "_spec_dbg_count", 0)
+                if _c < _dbgN:
+                    self._spec_dbg_count = _c + 1
+                    _na = (
+                        num_accepted[:num_decode_seqs].tolist()
+                        if num_accepted is not None
+                        else None
+                    )
+                    logging.getLogger(__name__).info(
+                        "ZAYA CCA verify[%d]: all_avail=%s seqs=%s seq_lens=%s "
+                        "num_accepted=%s blk_sched=%s blk_sched_prev=%s",
+                        _c,
+                        all_avail,
+                        num_decode_seqs,
+                        seq_lens[:num_decode_seqs].tolist(),
+                        _na,
+                        (blk_scheduled[:num_decode_seqs].tolist()
+                         if blk_scheduled is not None else None),
+                        (blk_scheduled_prev[:num_decode_seqs].tolist()
+                         if blk_scheduled_prev is not None else None),
+                    )
         max_col = state_indices_2d.shape[1] - 1
 
         # Cross-step rollback: read the committed conv/temporal state from the
         # slot ending at the last accepted token, and write verify position j to
         # its own slot. The previous step's acceptance advances the pointer, so
         # the next step reads the state ending at the last accepted token.
+        # 'all' cache mode is active whenever the block_idx pointers are threaded.
+        # Single-token decode steps (ngram proposed nothing -> seq_len 1) arrive
+        # with num_accepted/blk_scheduled_prev None (vLLM treats them as non-spec
+        # decodes) but blk_scheduled/blk_computed present.
+        all_mode = blk_scheduled is not None and blk_computed is not None
         row = torch.arange(s, device=device)
         if all_avail:
-            # 'all' mode: the previous verify step wrote its 1+num_spec outputs to
-            # FULL block-table columns [prev .. prev+num_spec]; the committed start
-            # is column prev + (num_accepted-1). Mirrors mamba2 selective_state_
-            # update's init_token_idx = num_accepted-1. Do NOT clamp to p-1 — that
-            # is the compact-layout assumption that corrupts the block column here.
+            # 'all' mode verify: the previous verify step wrote its 1+num_spec
+            # outputs to FULL block-table columns [prev .. prev+num_spec]; the
+            # committed start is column prev + (num_accepted-1). Mirrors mamba2
+            # selective_state_update's init_token_idx = num_accepted-1. Do NOT
+            # clamp to p-1 — that compact-layout assumption corrupts the column.
             na = num_accepted[:s].clamp(min=1).to(torch.long)
             read_col = (blk_scheduled_prev[:s].to(torch.long) + (na - 1)).clamp(
                 min=0, max=max_col
             )
+        elif all_mode:
+            # 'all' mode single-token decode: read the committed block, mamba2's
+            # num_spec==0 path (mamba_mixer2.py:978-984). Full block table, so
+            # clamp to max_col (NOT p-1, which aliased into the spec window and
+            # left consecutive single-token steps reading a stale slot).
+            read_col = blk_computed[:s].clamp(min=0, max=max_col).to(torch.long)
         elif blk_computed is not None:
             read_col = blk_computed[:s].clamp(min=0, max=p - 1).to(torch.long)
         else:
@@ -967,11 +1042,22 @@ class CCA(MambaBase, CustomOp):
         # state ending at the last accepted token. Fall back to column j when no
         # pointer is delivered (plain single-token / no rollback metadata).
         if all_avail:
-            # 'all' mode (DRAFT): verify position j -> full block-table column
+            # 'all' mode verify: verify position j -> full block-table column
             # (blk_scheduled + j); next step reads (blk_scheduled + num_accepted-1).
             write_col = (
                 blk_scheduled[:s].unsqueeze(1).to(torch.long) + pos.unsqueeze(0)
             ).clamp(min=0, max=max_col)  # [s, p]
+        elif all_mode:
+            # 'all' mode single-token decode: write the committed state to the
+            # scheduled block (mamba2 num_spec==0 output = gather(blk_scheduled)).
+            # In-place within a block, new block at a boundary. Only pos 0 is valid
+            # (seq_len 1) via write_ok, so broadcasting blk_scheduled is correct.
+            # The old read_col+1 wrote one column ahead, so the next step's
+            # read (blk_computed) saw a stale slot -> conv-state staleness ->
+            # divergence after a couple of tokens.
+            write_col = (
+                blk_scheduled[:s].unsqueeze(1).to(torch.long).clamp(min=0, max=max_col)
+            ).expand(s, p)  # [s, p]
         elif blk_computed is not None:
             write_col = (read_col.unsqueeze(1) + 1 + pos.unsqueeze(0)).clamp(
                 min=0, max=p - 1
@@ -979,6 +1065,31 @@ class CCA(MambaBase, CustomOp):
         else:
             write_col = pos.unsqueeze(0).expand(s, p)
         write_slot = state_indices_2d.gather(1, write_col)  # [s, p] block ids
+        # Comprehensive addressing trace (M5 fix): for the owner layer's first N
+        # verify steps dump read/write columns + the block-table row so the
+        # cross-step slot handoff can be read off directly. Gated; default off.
+        if os.environ.get("ZAYA_SPEC_DEBUG", "0") == "1" and getattr(
+            type(self), "_spec_dbg_owner", None
+        ) == id(self) and getattr(self, "_spec_dbg_count2", 0) < int(
+            os.environ.get("ZAYA_SPEC_DEBUG_N", "40")
+        ):
+            self._spec_dbg_count2 = getattr(self, "_spec_dbg_count2", 0) + 1
+            logging.getLogger(__name__).info(
+                "ZAYA CCA addr[%d]: all_avail=%s seq_lens=%s num_acc=%s "
+                "blk_sched=%s blk_sched_prev=%s blk_computed=%s read_col=%s "
+                "write_col0=%s row0=%s",
+                self._spec_dbg_count2 - 1,
+                all_avail,
+                seq_lens[:s].tolist(),
+                num_accepted[:s].tolist() if num_accepted is not None else None,
+                blk_scheduled[:s].tolist() if blk_scheduled is not None else None,
+                blk_scheduled_prev[:s].tolist()
+                if blk_scheduled_prev is not None else None,
+                blk_computed[:s].tolist() if blk_computed is not None else None,
+                read_col[:s].tolist(),
+                write_col[:s, 0].tolist(),
+                state_indices_2d[0, :12].tolist(),
+            )
         write_ok = (
             pos_valid
             & (~decode_is_pad).unsqueeze(1)
