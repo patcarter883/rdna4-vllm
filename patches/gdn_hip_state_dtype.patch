@@ -1,0 +1,17 @@
+--- a/vllm/model_executor/layers/mamba/mamba_utils.py
++++ b/vllm/model_executor/layers/mamba/mamba_utils.py
+@@ -120,6 +120,14 @@
+         mamba_cache_dtype: MambaDType,
+         mamba_ssm_cache_dtype: MambaDType = "auto",
+     ) -> tuple[torch.dtype, torch.dtype]:
++        import os
++
++        # gdn_hip native kernels read/write the GDN conv+ssm state in place as fp32
++        # (data_ptr<float>); force both fp32 when the native HIP GDN path is enabled. This is the
++        # single allocation site, so the state is fp32 everywhere downstream. Other state types
++        # (mamba2, kda, cca, short_conv) are untouched.
++        if os.environ.get("VLLM_GDN_HIP", "0") == "1":
++            return (torch.float32, torch.float32)
+         return cls._mamba_state_dtype(
+             model_dtype, mamba_cache_dtype, mamba_ssm_cache_dtype
+         )

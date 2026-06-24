@@ -136,4 +136,37 @@ RUN set -eu; \
     else echo "[combined] ZAYA slot present but disabled (build --build-arg WITH_ZAYA=1 to enable)"; fi; \
     rm -rf /tmp/zaya
 
+# --- 5. (optional) Native HIP GDN kernels (gdn_hip) — kill the Triton JIT on the Qwen GDN path ---
+# Routes Qwen3-Next / Qwen3.5 / Qwen3.6 Gated-Delta-Net linear-attention (conv1d + gated-delta-rule
+# + gated RMSNorm) through AOT-compiled torch.ops.gdn_hip.* instead of the fla-Triton kernels, so
+# the GDN layer never JIT/autotunes a Triton kernel again (same motivation as the zaya_cca step).
+# Three additive pieces, mirroring ZAYA/het-TP: the gdn_hip package (cross-compiled in-image — no
+# GPU), a 1-method patch to qwen_gdn_linear_attn.py (gated on VLLM_GDN_HIP=1 at runtime), and a
+# 1-branch patch to mamba_utils.py forcing the GDN conv+ssm state fp32 under the same flag. Default
+# build-arg OFF (kernel newly integrated — flip --build-arg WITH_GDN_HIP=1 once validated); and the
+# runtime is itself gated by VLLM_GDN_HIP (default 0), so even a built image is a no-op until the
+# env is set. Spec-decode keeps the fla-Triton path (gdn_hip is single-token decode / varlen
+# recurrent prefill only); the recurrent prefill trades long-context throughput for zero compiles.
+ARG WITH_GDN_HIP=0
+COPY gdn_hip/ /tmp/gdn_hip_pkg/
+COPY patches/gdn_hip_qwen_gdn.patch patches/gdn_hip_state_dtype.patch /tmp/gdn_hip_patches/
+RUN set -eu; \
+    if [ "$WITH_GDN_HIP" = "1" ]; then \
+      . /app/.venv/bin/activate; \
+      export PATH="/opt/rocm-7.2.1/lib/llvm/bin:/opt/rocm-7.2.1/bin:${PATH}"; \
+      VV=/app/vllm/vllm; \
+      MAMBA="$VV"/model_executor/layers/mamba; \
+      cp -r /tmp/gdn_hip_pkg "$MAMBA"/gdn_hip; \
+      cd "$MAMBA"/gdn_hip; \
+        rm -rf build *.egg-info; find . -name '*.so' -delete; find . -name '*_hip.*' -delete; \
+        GPU_ARCHS=gfx1201 python setup.py build_ext --inplace; \
+        python -c "import torch, glob; torch.ops.load_library(glob.glob('gdn_hip_C*.so')[0]); print('[combined] gdn_hip kernel build + load OK')"; \
+      cd /app/vllm; \
+        patch -p1 < /tmp/gdn_hip_patches/gdn_hip_qwen_gdn.patch; \
+        patch -p1 < /tmp/gdn_hip_patches/gdn_hip_state_dtype.patch; \
+      python -c 'import ast; [ast.parse(open(f).read()) for f in ["/app/vllm/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py", "/app/vllm/vllm/model_executor/layers/mamba/mamba_utils.py"]]; print("[combined] gdn_hip overlay + patched files parse OK")'; \
+      echo "[combined] gdn_hip applied (set VLLM_GDN_HIP=1 at runtime to engage; default off)"; \
+    else echo "[combined] gdn_hip slot present but disabled (build --build-arg WITH_GDN_HIP=1 to enable)"; fi; \
+    rm -rf /tmp/gdn_hip_pkg /tmp/gdn_hip_patches
+
 # Entry point inherited from the base (its tuned-attention vLLM launcher: `vllm serve "$@"`).
