@@ -131,8 +131,30 @@ your serving script.
   numerics). The grouped kernel is named — `wmma` (default) / `scalar` / `gemv`; the old
   numeric `MOE_VERSION` is removed and now hard-errors at boot if set. A-residence
   (formerly v5-vs-v6) is the `VLLM_W4A8_MOE_A_IN_LDS` knob.
+- **Kernel names, not version numbers.** The dispatch table reads as descriptive kernels
+  (`DenseKernel*` / `mmq_regdirect_*` dense, `wmma`/`scalar`/`gemv` MoE), and the two tiled
+  dense kernels are consolidated onto one `TileConfig` policy (`gemm_tiled.h`), now the served
+  dense default.
+- **mxfp4 (OCP E2M1) rides the same path.** Because E2M1 ⊂ e4m3, mxfp4 weight decode is a
+  lossless decode-table swap in the in-register int4→fp8 expansion — no new kernel. vLLM dispatch
+  routes mxfp4 dense linears and gpt-oss E2M1 MoE experts to the grouped FP8-WMMA path
+  (GPU bit-exact); a capability today, since no lab model ships mxfp4 yet.
 
 Confirm it's engaged: the worker logs show `WNA16 MoE -> grouped FP8-WMMA`.
+
+### RXF (the base image's quant path) and the rotation experiment
+
+The base image (`tcclaviger/vllm22:dev`) ships the collaborator's **RXF — "Rotated eXtra Fast"** —
+which does W4A8 as **int8×int8 with an integer (IQ4-NL) codebook** (exact — no fp8 round-trip) plus a
+**FWHT-32 activation rotation**. The one surviving lever we explored on top of it is a **wider / learned
+/ importance-aware rotation** — a *pre-pass-only* change (the K=32 int8 GEMM, the pack format, and the
+per-group scale are untouched). All three stages were built and measured (`paroquant_rotation/`):
+**the shipped span-32 Hadamard is the right default.** A wider fixed span, a learned Givens rotation,
+and activation-conditioning are all ≤ noise or worse on PPL — on this W4A8 model the bottleneck is the
+4-bit *weight*, and the int8 *activation* quant is already near-lossless (int8 ≈ fp16 PPL). The machinery
+is kept for a future regime where the activation quant is the bottleneck (true 4-bit / NVFP4). Cheap
+gate before any future rotation experiment: `paroquant_rotation/analyze_act_conditioning.py` (one GPU
+forward over real activations). See [`DIARY.md`](DIARY.md) Act XVIII for the full closure.
 
 ---
 
@@ -253,6 +275,29 @@ docker compose --profile zaya --profile rsa up
   grouped-mean state break under column-wise sharding). Experts are FP8, so the W4A8 kernel is off
   for this path (`ZAYA_USE_W4A8=0`). Multi-card (DP + expert-parallel) is the next profile. See
   `zaya/ZAYA_HANDOFF.md`. Build a leaner W4A8-only image with `WITH_ZAYA=0`.
+
+---
+
+## In flight (feature branches, not on `main` yet)
+
+Three workstreams are live on their own worktrees; each has a fuller write-up in [`DIARY.md`](DIARY.md)
+(Acts XIX–XXI). Summary of where they stand:
+
+- **DFlash speculative decoding** (`feat/dflash-spec`, `feat/zaya-dflash`). The infrastructure works —
+  a non-causal `TRITON_ATTN` patch (`patches/dflash_triton_noncausal/`, the `vllm22-w4a8:dflash`
+  overlay) lets a diffusion drafter's bidirectional block run on the RDNA4-default attention, boots
+  TP=2, coherent and lossless. The lever is the target's **quant format**: INT4 mis-conditions the
+  drafter (~0.8% accept), but `Laguna-XS.2-NVFP4` (emulates → bf16) recovers it to ~25.7% (pos-0 ~70%).
+  A parallel effort trains our **own** CCA-aware drafter for ZAYA1-8B (sidesteps the format wall).
+- **Titans — test-time neural memory** (`feat/titans`, arXiv 2501.00663). The first *training*
+  workstream: enwik8 trained from scratch (val BPC 1.83), MQAR recall probe PASS-directional, and a
+  5-arm ladder that picked **GDN-2 (decoupled gates)** to provisionally ship while deferring the
+  deep-memory kernel. Next: training-path choice + serving the checkpoint in `minisgl-rdna4`.
+- **`gdn_hip` — native HIP GDN kernels** (`feat/gdn-hip`). A framework-agnostic `torch.ops` extension
+  that replaces the ~15 FLA Triton GDN kernels with AOT-compiled HIP — **the 15–30 min cold GDN
+  compile cliff goes away** (compile once, run any shape). Numeric parity ≤ ~1e-7; serves 4B TP1/TP2
+  and 35B TP2 coherently. Gated `WITH_GDN_HIP` / `VLLM_GDN_HIP=1` (default off). Open work: a
+  WMMA chunked-prefill path (the recurrent one is correct but ~4× slower than a matrix-core form).
 
 ---
 

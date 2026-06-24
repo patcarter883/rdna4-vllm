@@ -890,3 +890,200 @@ on RDNA4 at all.
 
 The old `298 / 1887` headline is retired: it was an older/eager config (current eager is
 510.8 / 1371.6). The shipped serve path is **957 / 2571 stock, 917 / 2464 W4A8** with cudagraphs.
+
+## Act XVI — de-numbering the kernel ladder, and the tiled dense default
+
+The W4A8 kernel grew a ladder of versioned variants — `v5`, `v6`, `v7`, `v10`, `v11`, `v12`,
+`v15/16/17` — each a research rung, the numbers carrying no meaning to anyone who wasn't there.
+This act paid down that debt: every dispatchable kernel got a **descriptive name** and the
+near-duplicate tile kernels collapsed onto one parameterized policy.
+
+- **Dense ladder** → `DenseKernel` names; the register-direct `v15/16/17` family → `mmq_regdirect_*`
+  (the small-shape GEMV regime mapped in the *regdirect wall* finding).
+- **Grouped MoE** → named kernels (`wmma` default / `scalar` golden / `gemv`); the old numeric
+  `MOE_VERSION` env is gone and now **hard-errors at boot** if set, so a stale launch can't silently
+  pick a retired variant.
+- **TileConfig consolidation** (`gemm_tiled.h`): the two tiled dense kernels (the old `v5` LDS-staged
+  and `v10` WMMA paths) became *one* template driven by a `TileConfig` policy — same kernel, different
+  tile shape / residence. Validated bit-exact against both predecessors.
+- It shipped **gated** first (`VLLM_W4A8_DENSE_TILED`, off — zero upside without a second dense
+  backend to dispatch against), then in `f9dede9` the tiled TileConfig kernels became the **served
+  default** for dense, and the grouped MoE tiled TileConfig is the live MoE default. A-residence
+  (formerly the `v5`-vs-`v6` distinction) survives as the `VLLM_W4A8_MOE_A_IN_LDS` knob.
+
+No new math — but the dispatch table now reads as kernels, not version integers, and a wrong knob
+fails loud instead of quiet.
+
+## Act XVII — mxfp4 on the W4A8 kernel: a decode-table swap, not a new kernel
+
+OCP **mxfp4 (E2M1)** turned out to ride the existing W4A8 path for free. The insight: **E2M1 ⊂ e4m3**
+— every 4-bit E2M1 code maps losslessly to an e4m3 byte — so mxfp4 weight decode is a **decode-table
+swap** in the in-register int4→fp8 expansion the kernel already does, not a second GEMM. The
+microscaling block scale (the `mx` in mxfp4) folds into the per-group fp16 scale the kernel already
+carries.
+
+- **Dense** (`9d4d3dd`) then **MoE** (`1e102d0`) E2M1 weight decode, both **GPU bit-exact** against a
+  reference dequant — the e2m1 path threads through `_run_grouped_moe` unchanged downstream of the
+  decode table.
+- vLLM dispatch wired for both: dense E2M1 linear (`83c4ff5`) and **gpt-oss E2M1 MoE experts routed to
+  the grouped FP8-WMMA path** (`81968d6`) — so an mxfp4 checkpoint engages our kernel without a code
+  change to the serving script.
+- It is **orthogonal to the rotation work** (Act XVIII): mxfp4 is a *B-side* (weight) decode format;
+  rotation is an *A-side* (activation) conditioning pass. They compose.
+
+The CPU-proven foundation came in on `feat/mxfp4-w4a8`; the served dispatch landed on `main`. No
+gfx1201 model ships mxfp4 in the lab yet, so this is a *capability* (a model that does will engage the
+kernel), not a measured serving win.
+
+## Act XVIII — RXF supersedes our FP8 angle; the rotation-tuning line, closed as a null
+
+The base image (`tcclaviger/vllm22:dev`, bumped to `ad046fde` this cycle) started shipping **RXF —
+"Rotated eXtra Fast"**, the collaborator's successor to RFP458. RXF reframed our whole quant
+contribution: it already does **W4A8 as int8×int8 with an integer (IQ4-NL) codebook** — which is
+*exact*, no fp8 round-trip — plus a **FWHT-32 rotation** pre-pass to tame activation outliers. That
+**obsoletes our int4→fp8-WMMA angle** except in the non-integer-codebook regime; the surviving lever
+from the ParoQuant line is the **rotation** itself — RXF ships its activation-aware rotation *stalled*
+(`ACT_AWARE_ENABLED = False`, "in development"), and a wider / learned / importance-aware rotation is a
+**pre-pass-only** change: the K=32 int8 GEMM, the pack format, and the per-group fp16 scale are all
+untouched (`(X·R)·(R·W)ᵀ = X·Wᵀ` for any matched span). That is the entire integration surface, and we
+ran it to a conclusion.
+
+**Three stages built, all measured, all null on this W4A8 model:**
+- **(a) wider fixed Hadamard span** — generalized the FWHT from a hard 32 to any power-of-two span;
+  span-32 stays **bit-identical** to shipped. Sanity-proven cancellation for spans 32–512. *PPL: worse
+  on both arms* (`hadamard128` +1.07%, `hadamard256` +0.76% W4A8) — a wider FWHT spreads *bulk* weight
+  energy across the size-32 scale-group boundaries, creating ~86–88k degenerate near-zero scale groups.
+- **(b) learned Givens rotation** — a single **model-wide shared R** (so it survives merged q/k/v,
+  gate/up, and TP shards), built as Hadamard-init greedy Givens coordinate descent (`≥ Hadamard by
+  construction` on weight-MSE; from *identity* is strictly worse). *PPL: +0.32% W4A8* — minimizing
+  weight-quant MSE doesn't move PPL because Hadamard is already near-optimal for incoherence.
+- **(c) activation-conditioning** — the strategic pivot (cf. the DFlash result, where activation
+  conditioning saved INT4 acceptance): fit R to the real **per-token int8 activation-quant error**
+  instead of weight MSE, `ACT_AWARE_ENABLED` flipped, importance carried into the rotated basis via
+  `(R²)·imp`. The decisive cheap gate — `analyze_act_conditioning.py`, real Qwen3.5-4B activations,
+  one GPU forward — showed the lever is **span width, not learning** (wider fixed Hadamard cuts the
+  real activation int8 MSE up to 2.3×; the **learned** R *regresses* it 0.79–0.94× at every span,
+  because the greedy per-block fit overshoots the per-token full-row absmax the runtime actually uses).
+  But that activation gain is **PPL-invisible**: int8 ≈ fp16 PPL at every span, i.e. the int8
+  activation quant is **already near-lossless** on this model and has no headroom to recover.
+
+**The synthesis:** on this W4A8 model the PPL bottleneck is the **4-bit weight**, the shipped
+**span-32 Hadamard is already at/near its optimum**, and the int8 activation path is near-lossless — so
+the entire rotation-tuning premise has nothing to recover. **`hadamard32` is the right default;** every
+learned/wider/importance delta is ≤ noise or negative. Stage (c) would only pay where the *activation*
+quant is the bottleneck (true 4-bit / NVFP4 activations — the DFlash regime), not int8; the machinery
+is kept for that future model, not recommended here. The standing rule that fell out: **run
+`analyze_act_conditioning.py` (one GPU forward, real acts) before funding any future rotation
+experiment** — it would have called this null in an hour instead of a campaign.
+
+**A genuine RDNA4 hardware flake found along the way.** The first GPU quant with `--rotation-kind
+givens` generated garbage ("hydrogen and" → "a 1000.00 mL"). Root cause pinned: the offline rotation
+matmul `[~737k, 32] @ [32, 32]` (large M) **silently zeros ~29 % of its output rows on gfx1201**, while
+the *identical* matmul is exact on CPU. Hadamard dodges it because its FWHT is butterfly add/sub — no
+matmul. **Fix:** run the (cheap) Givens rotation on **CPU**, keep the expensive scale search on GPU →
+0 % zero groups, coherent generation. A standalone large-M small-K ROCm matmul correctness hazard,
+worth remembering independently of the rotation result.
+
+**And ZAYA RXF now serves correctly** (`53cf7de`). RXF garbage on ZAYA traced to the **monolithic RXF
+MoE path ignoring `FusedMoE.custom_routing_function`** — it re-derived `fused_topk` from ZAYA's
+pre-packed router logits instead of honoring the model's custom router. Forwarding
+`custom_routing_function` fixed it (h32 PPL ~41, coherent); folded into the `zaya/` overlay, committed
+to `main`, and baked into `vllm22-w4a8:combined`.
+
+---
+
+# In flight (feature branches, not yet on `main`)
+
+The acts above are landed history. The three workstreams below are live on their own worktrees —
+recorded here so the next session knows where they are and which wall each is against.
+
+## Act XIX — DFlash speculative decoding: the infrastructure works; acceptance is the regime
+
+Two fronts on diffusion speculative decoding, both converging on the same lesson — *the plumbing is
+the easy part; whether the drafter's hidden-state distribution survives the target's quantization is
+the whole game.*
+
+**Front 1 — poolside's DFlash drafter on RDNA4** (`feat/dflash-spec`, `feat/rxf-laguna-dflash`). The
+deliverable that *works*: vLLM's tuned 3D unified `TRITON_ATTN` kernel (the RDNA4 default) hard-asserted
+`causal`, so a DFlash drafter's **bidirectional (non-causal) block** could only fall back to the slower
+`ROCM_ATTN` path. The patch in `patches/dflash_triton_noncausal/` makes `TRITON_ATTN` itself
+non-causal-capable (thread `IS_CAUSAL` through the unified kernel + `supports_non_causal()`), matching
+upstream intent (vLLM #40632 / #42068), plus a PR#40898 SWA backport and a dtype cast — shipped as the
+`vllm22-w4a8:dflash` overlay. DFlash boots end-to-end on TP=2, coherent and lossless.
+- **The acceptance wall, then its resolution.** On `Laguna-XS.2-INT4` (the only target that fits 2×16
+  GB) draft acceptance was **~0.6–0.8%** (pos-0 ~2.3%) vs the speculator card's 70.9% pos-1 — the
+  drafter loads and runs but is **mis-conditioned**, a hidden-state distribution shift. Root cause
+  turned out to be the **coarse INT4 quant *format*, not a code bug**: switching to
+  `Laguna-XS.2-NVFP4` (which emulates → bf16, preserving the distribution the drafter was distilled on)
+  recovers it to **25.7%, pos-0 ~70%**. A separate z-lab 4B drafter reaches **36.5% unquant / 48.3%
+  AWQ / 40.2% TP2** — so DFlash genuinely *works* on RDNA4 when the format keeps the hidden state intact.
+- **The remaining structural cap:** held-out **pos2+ collapse** — a single-pass-mask limitation (later
+  draft positions can't see earlier ones). The fix menu (T-step/dual-pass diffusion vs Hydra
+  sequential heads vs full-AR) is mapped; sequencing is fix the single-pass conditioning first, then a
+  few-step T=2 only if pos1+ stays starved.
+
+**Front 2 — train our *own* CCA-aware drafter for ZAYA1-8B** (`feat/zaya-dflash`,
+`docs/zaya/zaya-dflash-plan.md`). Training the drafter ourselves **dissolves the INT4 acceptance wall**
+(no external distillation to mis-match) and ZAYA's CCA already exposes the target verify path. Phased
+M0–M6; **M0/M1 done** (bring-up + bit-lossless CCA rollback). **M5 reopened (2026-06-22):** an n-gram
+bit-identity gate caught a *real* verify-path bug — spec-greedy ≠ non-spec-greedy at token 1 under
+*partial* acceptance. Cache-mode, rollback plumbing, and the fused kernel were each ruled out; the
+suspect is the `_decode_verify_spec` `all_avail` rollback **column math**. The bit-identity gate
+earning its keep — it found a correctness bug a throughput-only A/B would have shipped.
+
+## Act XX — Titans: test-time neural memory, trained from scratch on RDNA4
+
+A full train-*and*-serve of **Titans** (test-time neural memory, arXiv 2501.00663) on consumer RDNA4
+— the first workstream here that *trains* a model rather than serving someone else's (`feat/titans`,
+image `titans:dev`). The early conceptual correction that shaped everything: Titans' "memory" is a
+**per-sequence recurrent *state*, not optimizer-trained parameters** (two Explore agents got this
+wrong) — and in its linear form it is **≈ the gated delta rule** already running on the GDN
+infrastructure, so it rides FLA/KDA kernels rather than needing a bespoke one.
+
+- **Phase 0 + 1a done:** trained enwik8 (31.5M chars) **from scratch**, val BPC 8.5 → **1.83**;
+  checkpoint round-trips bit-exact; generations are locally-fluent MediaWiki-markup English (globally
+  incoherent, exactly as expected at 1.83 BPC / 31M params).
+- **The recall question, run properly.** enwik8 char-LM is the wrong vehicle to test *memory* recall
+  (inconclusive), so the probe moved to **MQAR** (`mqar_probe.py`): memory-vs-ablated is
+  **PASS-directional** — the ablated arm is at chance beyond the segment boundary while the memory arm
+  is 12–20× chance with lift *growing with distance* — i.e. memory genuinely retains and retrieves
+  across segments on RDNA4 (low absolute accuracy = undertrained, not a ceiling).
+- **The expressiveness ladder → a shipping decision.** A 5-arm ladder (`mqar_ladder.py` +
+  `mem_cells.py::DecoupledGateCell`) confirmed the memory cells work (~0.94 cross-segment vs ablated
+  chance) and that **GDN-2 (decoupled per-channel gates) > scalar gated-delta** when off-ceiling.
+  **Decision (2026-06-24): provisionally SHIP GDN-2, DEFER the deep-memory chunked kernel** — GDN-2 is
+  closed-form so it rides the existing FLA/KDA kernels and sidesteps the Phase-2 deep-mem kernel risk
+  (deep memory never got a fully fair run but is unlikely to clear the payoff gate). Theory backstop:
+  the Miras follow-on (arXiv 2504.13173) unifies Titans/GDN/Mamba/DeltaNet as one associative-memory
+  family and confirms linear ≈ GDN is the long-context lever.
+- **NEXT:** the training-path choice (cold from-scratch vs warm-start-from-Qwen) and serving the
+  checkpoint in `minisgl-rdna4` (pure-torch memory forward first, validate numerics, then swap in
+  kernels). Knobs that matter on this box: `use_accelerated_scan=False`, `flex_attn=False`; the
+  pure-torch `AssocScan` store is memory-hungry (batch 8 OOMs 16 GB; batch 4 fits).
+
+## Act XXI — gdn_hip: native HIP kernels that kill the GDN Triton compile cliff
+
+The single most-cursed wall in this whole diary is the **15–30 minute cold Triton autotune of the
+FLA-GDN linear-attention kernels** — it has been mistaken for a hang (Act II), forced the persistent
+Triton-cache machinery (cold start), and livelocked the parallel-compile on TP=2 (Act XV). `gdn_hip`
+(`feat/gdn-hip`) attacks it at the root: a **standalone, framework-agnostic `torch.ops` extension that
+replaces the ~15 FLA Triton GDN kernels with AOT-compiled HIP** — compile once, run *any* shape, never
+JIT/autotune a GDN Triton kernel again. It's shared by both `minisgl-rdna4` and `vllm-gfx1201` (both
+route GDN through the same fla recurrence): build one `.so`, call `torch.ops.gdn_hip.*` from either.
+
+- **Six ops** replace the decode SSM, `chunk_gated_delta_rule` prefill, the two `causal_conv1d`
+  paths, and `RMSNormGated`. The math is lifted *verbatim* from `fla/ops/fused_recurrent.py` — the
+  rank-1 update `S*=exp(g); v-=S@k; v*=β; S+=outer(v,k); o=S@q` — so correctness is by construction.
+- **Status (2026-06-24):** builds AOT for gfx1201 (hipify-clean), all 6 ops load with valid
+  fake/meta schemas, **numeric parity ≤ ~1e-7** vs torch reference, and — wired into `gdn/layer.py`'s
+  recurrent path — it **serves 4B TP1/TP2 and 35B TP2 coherently** on the two cards. **The Triton GDN
+  compile cliff is gone.** Gated behind `WITH_GDN_HIP` (build) + `VLLM_GDN_HIP=1` (runtime), default off.
+- **The honest limit — and why this *is* the right framing.** The chunked-prefill op
+  (`gdn_prefill_chunked`) is numerically correct but **~4× slower** as a scalar per-row kernel, so the
+  serve uses the recurrent `gdn_prefill`. This is consistent with the earlier finding that GDN
+  recurrent decode is occupancy-limited (~34% roofline, flat to tuning) and a custom kernel wins
+  little on raw decode *throughput*. The win `gdn_hip` actually banks is different and real:
+  **eliminating the cold-compile cliff** (AOT, shape-agnostic) — not faster steady-state decode. The
+  remaining throughput lever is a **WMMA/matrix-core chunked prefill** (the intra-chunk KK/KQ/solve
+  matmuls); that, plus deleting the now-unused Triton GDN tree and a bf16-native state, is the
+  open work.
