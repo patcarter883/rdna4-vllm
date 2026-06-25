@@ -1,0 +1,31 @@
+# Prometheus scrape config for local vLLM metrics capture.
+#
+# vLLM exposes Prometheus metrics at /metrics on its serve port. Our compose serve
+# profiles publish that port on the HOST as ${VLLM_HOST_PORT:-8000}:8000, and gpu-lease
+# sets VLLM_HOST_PORT = 8000 + lowest leased card → 8000 (and 8001 for a second/zaya
+# lease). So we scrape both host ports; whichever serve is up is captured, the other is
+# simply marked down. host.docker.internal resolves to the docker host (extra_hosts:
+# host-gateway in docker-compose.yml).
+#
+# 5s gives ample resolution for production insight (vLLM updates its loggers ~every
+# iteration / ~10s) while keeping the TSDB small over an all-day run. Retention is set on
+# the prometheus command line (--storage.tsdb.retention.time), data persists in the named
+# volume vllm-prom-data — so a serve run's behavior is analyzable AFTER the container is gone.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 30s
+
+scrape_configs:
+  - job_name: vllm
+    metrics_path: /metrics
+    static_configs:
+      # port 8000 = single-card / TP=2 serve (lowest leased card 0); 8001 = a second lease
+      # (e.g. the zaya profile, or a serve that leased starting at card 1).
+      - targets: ['host.docker.internal:8000', 'host.docker.internal:8001']
+    # Tag each series with the host port it came from, so two concurrent serves are
+    # distinguishable beyond the model_name label vLLM already emits.
+    relabel_configs:
+      - source_labels: [__address__]
+        regex: 'host.docker.internal:(\d+)'
+        target_label: serve_port
+        replacement: '${1}'

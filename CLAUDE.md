@@ -164,6 +164,34 @@ silently misbehave. Use a new cache dir (or wipe the per-image one) when:
 Reference runners that already follow all of the above: `patches/run_het_e2e_combined.sh`
 (equivalence), `profiling/run_het_profile.sh` (profiling), `profiling/run_compare.sh`.
 
+## Metrics capture: keep the monitoring stack up alongside any serve (MANDATORY)
+
+vLLM exposes a `/metrics` Prometheus endpoint, but those counters live **in the serve
+process** — they vanish the moment the container stops, and a removed container also loses
+its logs. So if you want to understand how a serve behaved *after the fact* (throughput,
+TTFT/ITL, queue depth, KV-cache utilisation, prefix-cache hit rate, spec-decode acceptance),
+something must be **scraping and retaining** the series while it runs. We lost an all-day
+Laguna run's data exactly this way (the scraping Prometheus was off-box; no local capture).
+
+**Whenever you run a vLLM serve for real inference work, also have the local monitoring stack
+running.** It is CPU-only, takes **no** GPU lease, and scrapes the host serve ports
+(8000/8001) by polling — so it is fully decoupled from the leased serve project. Start it
+once and leave it up; it then auto-captures every serve that comes and goes:
+
+```
+docker compose --profile monitoring up -d        # NOT under gpu-lease — CPU only
+# Prometheus → http://localhost:9090   Grafana → http://localhost:3000 (anon admin)
+```
+
+- TSDB persists in the `vllm-prom-data` named volume with `--storage.tsdb.retention.time`
+  (default 30d), so data survives container recreate and outlives the serve — config in
+  `monitoring/prometheus.yml`, services in `docker-compose.yml`.
+- It scrapes **8000 and 8001**; gpu-lease maps a serve to `8000 + lowest leased card`, and
+  the `serve_port` + vLLM's `model_name` labels distinguish two concurrent serves.
+- After a run, query Prometheus (`http://localhost:9090`) or Grafana for the analysis — do
+  **not** rely on the live `/metrics` endpoint or `docker logs`, which are gone once the
+  serve stops.
+
 ## Trace analysis: TraceLens (MANDATORY after trace collection)
 
 After any profiling run that produces `*.pt.trace.json.gz` files, **run TraceLens before

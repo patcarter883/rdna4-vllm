@@ -235,6 +235,9 @@ services:
   # sizes the profiling forward + the DFlash spec workspace), NOT --max-model-len. Keep it modest.
   #   scripts/gpu-lease.sh -n 2 --detach --name laguna-dflash -- \
   #     docker compose --profile serve-laguna-dflash up -d
+  # For real inference work, ALSO start the metrics-capture stack so the run is analyzable
+  # afterward (the /metrics counters die with the container): see the `monitoring` profile /
+  # `docker compose --profile monitoring up -d` (CPU-only, no gpu-lease). [[CLAUDE.md]]
   serve-laguna-dflash:
     <<: *combined-common
     # RXF native-int8 image by default (production); NVFP4 emulation fallback via LAGUNA_DFLASH_IMAGE.
@@ -496,3 +499,53 @@ services:
       - --rsa-k=${RSA_K:-4}
       - --rsa-t=${RSA_T:-2}
       - --rsa-tail-tokens=${RSA_TAIL:-4096}
+
+  # === Local metrics capture (CPU-only, NO gpu-lease) =========================
+  # Captures + RETAINS the Prometheus time series of any vLLM serve on this box, so a
+  # run's production behavior is analyzable AFTER the serve container is gone. The work
+  # Prometheus that scraped earlier runs isn't reachable from here, and the previous local
+  # stack lost its data (no persistent volume / no retention) — this one fixes both.
+  #
+  # It scrapes by polling the host serve ports (8000/8001 — see monitoring/prometheus.yml),
+  # so it needs NO GPU and is decoupled from the leased serve project. START IT ONCE AND
+  # LEAVE IT RUNNING; it then auto-captures whatever serve comes and goes:
+  #     docker compose --profile monitoring up -d        # (no gpu-lease — CPU only)
+  # Prometheus UI → http://localhost:9090 , Grafana → http://localhost:3000 (anon admin).
+  # Stop: docker compose --profile monitoring down   (data survives in the named volumes).
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: vllm-gfx1201-prometheus
+    profiles: ["monitoring"]
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # reach the host-published vLLM serve port
+    ports:
+      - "${PROM_HOST_PORT:-9090}:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - vllm-prom-data:/prometheus               # persistent TSDB (survives recreate)
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${PROM_RETENTION:-30d}   # keep ~a month of runs
+      - --web.enable-lifecycle                   # POST /-/reload to re-read scrape config
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: vllm-gfx1201-grafana
+    profiles: ["monitoring"]
+    restart: unless-stopped
+    depends_on: [prometheus]
+    ports:
+      - "${GRAFANA_HOST_PORT:-3000}:3000"
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"          # turnkey: open :3000, no login
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD:-admin}"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro   # auto-wires the Prometheus datasource
+      - vllm-grafana-data:/var/lib/grafana
+
+volumes:
+  vllm-prom-data:      # Prometheus TSDB — the captured metrics history
+  vllm-grafana-data:   # Grafana dashboards / state
