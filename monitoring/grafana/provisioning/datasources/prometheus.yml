@@ -6,6 +6,7 @@ apiVersion: 1
 
 datasources:
   - name: Prometheus
+    uid: vllm-prometheus          # fixed uid so provisioned dashboards can reference it
     type: prometheus
     access: proxy
     url: http://prometheus:9090

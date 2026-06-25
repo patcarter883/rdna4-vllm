@@ -1,0 +1,16 @@
+# Auto-load any dashboard JSON dropped in /var/lib/grafana/dashboards (mounted from
+# monitoring/grafana/dashboards). Baked in → no manual import; edits to the JSON show up
+# on Grafana restart. allowUiUpdates lets you tweak live, but the file stays the source.
+apiVersion: 1
+
+providers:
+  - name: vllm-dashboards
+    orgId: 1
+    folder: vLLM
+    type: file
+    disableDeletion: false
+    allowUiUpdates: true
+    updateIntervalSeconds: 15
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

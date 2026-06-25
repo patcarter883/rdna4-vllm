@@ -543,7 +543,8 @@ services:
       GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
       GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD:-admin}"
     volumes:
-      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro   # auto-wires the Prometheus datasource
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro   # auto-wires datasource + dashboard provider
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro    # baked-in dashboard JSON (vLLM + spec-decode)
       - vllm-grafana-data:/var/lib/grafana
 
 volumes:
