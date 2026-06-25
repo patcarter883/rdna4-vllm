@@ -217,6 +217,83 @@ services:
       # batch sizes we actually hit. Override with VLLM_CUDAGRAPH_SIZES.
       - --compilation-config=${VLLM_CUDAGRAPH_SIZES:-{"cudagraph_capture_sizes":[1,2,4,8,16,32,64]}}
 
+  # --- TP=2 Laguna + DFlash diffusion speculative decoding (PRODUCTION) ---
+  # The poolside DFlash drafter (poolside/Laguna-XS.2-speculator.dflash, 0.6B block-diffusion) is
+  # distilled on full-precision hidden states, so the target's quant FORMAT decides whether the
+  # drafter transfers:
+  #   - plain compressed-tensors INT4  -> ~0.8% acceptance (too coarse, NO speedup)
+  #   - NVFP4 (emulated -> bf16)        -> 25.7% acceptance, but runs EMULATED/slow on gfx1201
+  #   - RXF  (native int8 W4A8, inter-layer bf16) -> 24.7% acceptance AND real int8 silicon  <-- default
+  # So this profile defaults to the RXF Laguna build + the :dflash-rxf image (the :dflash overlay
+  # rebuilt on the RXF base; non-causal TRITON_ATTN patch + PR#40898 SWA backport + fc dtype cast).
+  # No-rebuild NVFP4 fallback: LAGUNA_DFLASH_IMAGE=vllm22-w4a8:dflash
+  #   VLLM_MODEL_ID=poolside/Laguna-XS.2-NVFP4.
+  #
+  # Laguna is 10 full-attention + 30 sliding-window(512) attention layers (NOT a Mamba hybrid), 8 KV
+  # heads / head_dim 128, fp8 KV. Only the 10 full layers scale with context, so KV is cheap: ~1.3 GB
+  # per 60k-token seq -> two 60k seqs fit. The real init-OOM lever is --max-num-batched-tokens (it
+  # sizes the profiling forward + the DFlash spec workspace), NOT --max-model-len. Keep it modest.
+  #   scripts/gpu-lease.sh -n 2 --detach --name laguna-dflash -- \
+  #     docker compose --profile serve-laguna-dflash up -d
+  serve-laguna-dflash:
+    <<: *combined-common
+    # RXF native-int8 image by default (production); NVFP4 emulation fallback via LAGUNA_DFLASH_IMAGE.
+    # Run with `up` (NOT `up --build` — the anchor's build context is the combined Dockerfile; the
+    # :dflash-rxf image is built from patches/dflash_triton_noncausal/Dockerfile.dflash on the RXF base).
+    image: ${LAGUNA_DFLASH_IMAGE:-vllm22-w4a8:dflash-rxf}
+    profiles: ["serve-laguna-dflash"]
+    container_name: ${LEASE_NAME:-vllm22-w4a8}-laguna-dflash   # gpu-lease sets LEASE_NAME so two leases don't collide
+    environment:
+      <<: *combined-env
+      ROCR_VISIBLE_DEVICES: "${LEASE_ROCR_DEVICES:-0,1}"   # gpu-lease injects its leased physical card set
+      HIP_VISIBLE_DEVICES: "${LEASE_HIP_DEVICES:-0,1}"     # …and the 0-based re-index of it
+      CU_NUM: "56"
+      VLLM_TP_CU_WEIGHTS: "64,56"
+      # RXF carries its own quantization=rxf int8 path; the compressed-tensors W4A8 HIP kernel must
+      # stay OFF (it adds runtime workspace and is not the path RXF uses).
+      VLLM_ROCM_USE_W4A8_FP8_WMMA: "0"
+      VLLM_ROCM_W4A8_LAYOUT: "${VLLM_ROCM_W4A8_LAYOUT:-single}"
+      VLLM_DFLASH_AUX_SHIFT: "${VLLM_DFLASH_AUX_SHIFT:-0}"   # DFlash aux-layer extraction shift; 0=stock
+      # Reclaims fragmented reserved-but-unallocated memory on the 16 GB×2 knife-edge (both env names:
+      # ROCm reads PYTORCH_HIP_ALLOC_CONF; newer torch the unified PYTORCH_ALLOC_CONF).
+      PYTORCH_ALLOC_CONF: "${PYTORCH_ALLOC_CONF:-expandable_segments:True}"
+      PYTORCH_HIP_ALLOC_CONF: "${PYTORCH_HIP_ALLOC_CONF:-expandable_segments:True}"
+    restart: unless-stopped
+    command:                             # entrypoint prepends `vllm serve`
+      - ${VLLM_MODEL_ID:-/root/.cache/huggingface/Laguna-XS.2-RXF}
+      - --host=0.0.0.0
+      - --port=8000
+      - --tensor-parallel-size=2
+      - --limit-mm-per-prompt={"image":0,"video":0}
+      - --kv-cache-dtype=fp8
+      - --enable-prefix-caching
+      - --reasoning-parser=poolside_v1
+      - --enable-auto-tool-choice
+      - --tool-call-parser=poolside_v1
+      # KV is cheap (only 10 full-attn layers scale) so a large context fits; default sized for the
+      # 40-60k-context target. max-model-len sizes KV; it is NOT the OOM lever.
+      - --max-model-len=${VLLM_MAX_MODEL_LEN:-60000}
+      # The real init-OOM lever + DFlash spec-workspace driver. 512 is the validated-stable value on
+      # 16 GB×2 (the warmup forward + drafter workspace at 2048 OOMs GPU 1 even at util 0.84). Trade:
+      # a 60k prefill chunks into 512-token passes (one-time per unique prompt; prefix-cached after).
+      - --max-num-batched-tokens=${VLLM_MAX_BATCHED:-512}
+      # User target = 2 concurrent requests. Caps KV demand at 2×max-model-len.
+      - --max-num-seqs=${VLLM_MAX_NUM_SEQS:-2}
+      # Headroom for two 60k-token sequences of KV on top of the ~11.6 GB/card RXF weights.
+      # NOTE: util must leave room for the DFlash drafter's POST-KV-profiling warmup forward. The KV
+      # profiler carves out memory WITHOUT fully accounting for that warmup, so too-high util boots
+      # KV fine then OOMs the drafter warmup minutes later (seen at 0.88→0.84). 0.82 (the validated
+      # value) leaves ~320 MiB/card headroom and still yields ~130k KV tokens (>120k = two 60k seqs).
+      - --gpu-memory-utilization=${VLLM_GPU_MEMORY_UTIL:-0.82}
+      # DFlash drafter must run EAGER here (cudagraph capture adds ~1 GiB persistent overhead that
+      # doesn't fit alongside the spec workspace on 16 GB×2).
+      - --enforce-eager
+      # DFlash diffusion drafter: non-causal bidirectional block runs on the patched non-causal
+      # TRITON_ATTN (RDNA4 default). num_speculative_tokens=5 (card spec is 7, but measured per-pos
+      # acceptance [68,40,26,16,11,7,5]% / mean accept len 1.73 means positions 6-7 add ~nil real
+      # speedup while inflating the drafter warmup workspace on 16 GB×2; 5 keeps the speedup, fits).
+      - --speculative-config=${LAGUNA_SPEC_CONFIG:-{"model":"poolside/Laguna-XS.2-speculator.dflash","num_speculative_tokens":5,"method":"dflash","attention_backend":"TRITON_ATTN"}}
+
   # --- TP=2 throughput benchmark: reproduces the published 298 dec / 1887 total tok/s ---
   # One-command repro of the headline figure. Same image/devices/het-TP env as `serve`, but
   # runs test/bench_tp2.py (offline LLM API: warmup generate -> timed generate) instead of
