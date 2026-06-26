@@ -93,6 +93,44 @@ def check_paged(name, B, Hq, Hk, D, ctx_lens, block_size=16, sw=0, tol=4e-3) -> 
     return ok
 
 
+def check_paged_vllm(name, B, Hq, Hk, D, ctx_lens, block_size=16, sw=0, tol=4e-3) -> bool:
+    """vLLM KV layout: a SINGLE [num_blocks, 2, block_size, kv_heads, head_dim] cache; K = [:,0],
+    V = [:,1] are non-contiguous views (block stride = 2*block_size*kv_heads*hd). Validates the
+    kv_block_stride path used by the vLLM wiring."""
+    scale = D ** -0.5
+    S = max(ctx_lens)
+    q = torch.randn(B, Hq, D, device=DEV, dtype=torch.bfloat16)
+    kd = torch.randn(B, S, Hk, D, device=DEV, dtype=torch.bfloat16)
+    vd = torch.randn(B, S, Hk, D, device=DEV, dtype=torch.bfloat16)
+    blocks_per_seq = (S + block_size - 1) // block_size
+    num_blocks = B * blocks_per_seq + 3
+    perm = torch.randperm(num_blocks, device=DEV).int()
+    kv = torch.zeros(num_blocks, 2, block_size, Hk, D, device=DEV, dtype=torch.bfloat16)  # vLLM layout
+    block_table = torch.zeros(B, blocks_per_seq, device=DEV, dtype=torch.int32)
+    ctx = torch.tensor(ctx_lens, device=DEV, dtype=torch.int32)
+    for b in range(B):
+        for lb in range(blocks_per_seq):
+            phys = int(perm[b * blocks_per_seq + lb].item())
+            block_table[b, lb] = phys
+            for off in range(block_size):
+                j = lb * block_size + off
+                if j < S:
+                    kv[phys, 0, off] = kd[b, j]
+                    kv[phys, 1, off] = vd[b, j]
+    k_cache, v_cache = kv.unbind(1)            # non-contiguous views, exactly like vLLM forward
+    stride = 2 * block_size * Hk * D           # elements between consecutive physical blocks
+    got = torch.ops.attn_decode.flash_decode_paged(
+        q, k_cache, v_cache, block_table, ctx, scale, sw, stride).float()
+    ref = torch.empty(B, Hq, D, device=DEV)
+    for b in range(B):
+        cl = ctx_lens[b]
+        ref[b] = ref_decode(q[b:b+1], kd[b:b+1, :cl], vd[b:b+1, :cl], scale, sw)[0]
+    d = (got - ref).abs().max().item()
+    ok = d <= tol
+    print(f"  [{'PASS' if ok else 'FAIL'}] {name:34s} max|Δ|={d:.3e}")
+    return ok
+
+
 def check_paged_fp8(name, B, Hq, Hk, D, ctx_lens, k_descale=1.0, v_descale=1.0,
                     block_size=16, sw=0, tol=8e-3) -> bool:
     """fp8 (e4m3) paged KV. The reference dequantizes the SAME fp8 bytes (* descale) so the only
@@ -153,6 +191,10 @@ def main() -> None:
     ok &= check_paged("paged D128 ctx[100,250,37] mixed", 3, 16, 2, 128, [100, 250, 37])
     ok &= check_paged("paged D128 ctx[1000] bs32", 1, 16, 2, 128, [1000], block_size=32)
     ok &= check_paged("paged SWA=64 ctx[500]", 1, 16, 2, 128, [500], sw=64)
+    print("--- vLLM layout [num_blocks,2,bs,kvh,hd] (kv_block_stride path) ---")
+    ok &= check_paged_vllm("vllm D128 ctx[128] Hq16/Hk2", 1, 16, 2, 128, [128])
+    ok &= check_paged_vllm("vllm D128 ctx[100,250,37] mix", 3, 16, 2, 128, [100, 250, 37])
+    ok &= check_paged_vllm("vllm SWA=64 ctx[500]", 1, 16, 2, 128, [500], sw=64)
     print("--- paged fp8-KV (e4m3) + per-tensor descale fold ---")
     ok &= check_paged_fp8("fp8 D128 ctx[256] descale=1", 1, 16, 2, 128, [256])
     ok &= check_paged_fp8("fp8 D128 ctx[100,250,37] mix", 3, 16, 2, 128, [100, 250, 37])

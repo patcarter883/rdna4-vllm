@@ -15,10 +15,11 @@
 void launch_flash_decode(const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&,
                          double, int64_t);
 void launch_flash_decode_paged(const at::Tensor&, const at::Tensor&, const at::Tensor&,
-                               const at::Tensor&, const at::Tensor&, at::Tensor&, double, int64_t);
+                               const at::Tensor&, const at::Tensor&, at::Tensor&, double, int64_t,
+                               int64_t);
 void launch_flash_decode_paged_fp8(const at::Tensor&, const at::Tensor&, const at::Tensor&,
                                    const at::Tensor&, const at::Tensor&, at::Tensor&, double, double,
-                                   double, int64_t);
+                                   double, int64_t, int64_t);
 
 namespace {
 
@@ -36,7 +37,8 @@ at::Tensor flash_decode(const at::Tensor& q, const at::Tensor& k, const at::Tens
 
 at::Tensor flash_decode_paged(const at::Tensor& q, const at::Tensor& k_cache,
                               const at::Tensor& v_cache, const at::Tensor& block_table,
-                              const at::Tensor& context_lens, double scale, int64_t sliding_window) {
+                              const at::Tensor& context_lens, double scale, int64_t sliding_window,
+                              int64_t kv_block_stride) {
   TORCH_CHECK(q.dim() == 3, "attn_decode: q must be [B, num_q_heads, head_dim]");
   TORCH_CHECK(k_cache.dim() == 4 && v_cache.dim() == 4,
               "attn_decode: k/v_cache must be [num_blocks, block_size, num_kv_heads, head_dim]");
@@ -44,29 +46,30 @@ at::Tensor flash_decode_paged(const at::Tensor& q, const at::Tensor& k_cache,
   TORCH_CHECK(q.scalar_type() == at::kBFloat16, "attn_decode v0 is bf16-only");
   TORCH_CHECK(block_table.scalar_type() == at::kInt && context_lens.scalar_type() == at::kInt,
               "block_table/context_lens must be int32");
-  TORCH_CHECK(q.is_contiguous() && k_cache.is_contiguous() && v_cache.is_contiguous(),
-              "attn_decode v0 expects contiguous inputs");
+  TORCH_CHECK(q.is_contiguous(), "attn_decode: q must be contiguous");
+  // k/v_cache NOT required contiguous: with kv_block_stride!=0 the caller may pass a strided
+  // view (e.g. vLLM's kv_cache.unbind(1) over [num_blocks,2,...]); within-block layout
+  // (block_size,kv_heads,head_dim) must still be contiguous, which those views satisfy.
   auto out = at::empty_like(q);
   launch_flash_decode_paged(q, k_cache, v_cache, block_table, context_lens, out, scale,
-                            sliding_window);
+                            sliding_window, kv_block_stride);
   return out;
 }
 
 at::Tensor flash_decode_paged_fp8(const at::Tensor& q, const at::Tensor& k_cache,
                                   const at::Tensor& v_cache, const at::Tensor& block_table,
                                   const at::Tensor& context_lens, double scale, double k_descale,
-                                  double v_descale, int64_t sliding_window) {
+                                  double v_descale, int64_t sliding_window, int64_t kv_block_stride) {
   TORCH_CHECK(q.dim() == 3 && k_cache.dim() == 4 && v_cache.dim() == 4, "bad q/k/v_cache dims");
   TORCH_CHECK(q.scalar_type() == at::kBFloat16, "attn_decode: q must be bf16");
   TORCH_CHECK(k_cache.scalar_type() == at::kFloat8_e4m3fn && v_cache.scalar_type() == at::kFloat8_e4m3fn,
               "attn_decode fp8: k/v_cache must be float8_e4m3fn");
   TORCH_CHECK(block_table.scalar_type() == at::kInt && context_lens.scalar_type() == at::kInt,
               "block_table/context_lens must be int32");
-  TORCH_CHECK(q.is_contiguous() && k_cache.is_contiguous() && v_cache.is_contiguous(),
-              "attn_decode fp8 expects contiguous inputs");
+  TORCH_CHECK(q.is_contiguous(), "attn_decode: q must be contiguous");  // k/v_cache may be strided
   auto out = at::empty_like(q);
   launch_flash_decode_paged_fp8(q, k_cache, v_cache, block_table, context_lens, out, scale,
-                                k_descale, v_descale, sliding_window);
+                                k_descale, v_descale, sliding_window, kv_block_stride);
   return out;
 }
 
@@ -75,10 +78,10 @@ at::Tensor flash_decode_paged_fp8(const at::Tensor& q, const at::Tensor& k_cache
 TORCH_LIBRARY(attn_decode, m) {
   m.def("flash_decode(Tensor q, Tensor k, Tensor v, float scale, int sliding_window) -> Tensor");
   m.def("flash_decode_paged(Tensor q, Tensor k_cache, Tensor v_cache, Tensor block_table, "
-        "Tensor context_lens, float scale, int sliding_window) -> Tensor");
+        "Tensor context_lens, float scale, int sliding_window, int kv_block_stride=0) -> Tensor");
   m.def("flash_decode_paged_fp8(Tensor q, Tensor k_cache, Tensor v_cache, Tensor block_table, "
-        "Tensor context_lens, float scale, float k_descale, float v_descale, int sliding_window) "
-        "-> Tensor");
+        "Tensor context_lens, float scale, float k_descale, float v_descale, int sliding_window, "
+        "int kv_block_stride=0) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(attn_decode, CUDA, m) {

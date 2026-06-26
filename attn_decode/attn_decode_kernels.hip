@@ -200,6 +200,7 @@ __global__ __launch_bounds__(THREADS) void flash_decode_paged_kernel(
     const unsigned int num_kv_heads,
     const unsigned int block_size,
     const unsigned int max_blocks,
+    const long kv_block_stride,                  // elements between consecutive physical blocks
     const float scale,
     const unsigned int sliding_window) {
     constexpr int D_PER_LANE = HEAD_DIM / WARP;
@@ -230,8 +231,13 @@ __global__ __launch_bounds__(THREADS) void flash_decode_paged_kernel(
 
     for (unsigned int j = warp_id; j < ctx_len; j += NWARPS) {
         if (sliding_window > 0 && (ctx_len - 1 - j) >= sliding_window) continue;
-        const unsigned int phys = (unsigned int)bt[j / block_size] * block_size + (j % block_size);
-        const __hip_bfloat16* k_ptr = K_cache + (size_t)phys * kv_row_stride + kv_head * HEAD_DIM;
+        // block-stride aware: block * kv_block_stride + pos * row_stride. kv_block_stride decouples
+        // the block step from block_size*row_stride, so an interleaved K/V cache (vLLM's
+        // [num_blocks,2,block_size,kv_heads,hd], stride 2*block_size*row_stride) works by passing
+        // the K/V views' base ptrs + the doubled stride.
+        const size_t row = (size_t)(unsigned int)bt[j / block_size] * kv_block_stride
+                           + (size_t)(j % block_size) * kv_row_stride + kv_head * HEAD_DIM;
+        const __hip_bfloat16* k_ptr = K_cache + row;
         float partial = 0.0f;
         #pragma unroll
         for (int i = 0; i < D_PER_LANE; i++)
@@ -241,7 +247,7 @@ __global__ __launch_bounds__(THREADS) void flash_decode_paged_kernel(
         const float m_new = fmaxf(m, score);
         const float correct = __expf(m - m_new);
         const float p = __expf(score - m_new);
-        const __hip_bfloat16* v_ptr = V_cache + (size_t)phys * kv_row_stride + kv_head * HEAD_DIM;
+        const __hip_bfloat16* v_ptr = V_cache + row;
         #pragma unroll
         for (int i = 0; i < D_PER_LANE; i++)
             o_reg[i] = o_reg[i] * correct + p * (float)v_ptr[i * WARP + lane];
@@ -283,7 +289,7 @@ __global__ __launch_bounds__(THREADS) void flash_decode_paged_kernel(
 void launch_flash_decode_paged(const at::Tensor& q, const at::Tensor& k_cache,
                                const at::Tensor& v_cache, const at::Tensor& block_table,
                                const at::Tensor& context_lens, at::Tensor& out, double scale,
-                               int64_t sliding_window) {
+                               int64_t sliding_window, int64_t kv_block_stride) {
     const unsigned int B = q.size(0);
     const unsigned int num_q_heads = q.size(1);
     const unsigned int head_dim = q.size(2);
@@ -291,6 +297,10 @@ void launch_flash_decode_paged(const at::Tensor& q, const at::Tensor& k_cache,
     const unsigned int num_kv_heads = k_cache.size(2);
     const unsigned int max_blocks = block_table.size(1);
     const float sc = (scale > 0) ? (float)scale : 1.0f / sqrtf((float)head_dim);
+    // 0 => contiguous blocks ([num_blocks,block_size,kv_heads,hd]); else the caller's stride
+    // (e.g. vLLM's 2*block_size*kv_heads*hd for the interleaved [num_blocks,2,...] cache).
+    const long kvbs = (kv_block_stride > 0) ? (long)kv_block_stride
+                                            : (long)block_size * num_kv_heads * head_dim;
 
     dim3 grid(num_q_heads, B, 1);
     dim3 block(THREADS, 1, 1);
@@ -305,7 +315,7 @@ void launch_flash_decode_paged(const at::Tensor& q, const at::Tensor& k_cache,
 
 #define LAUNCHP(HD)                                                                          \
     flash_decode_paged_kernel<HD><<<grid, block, 0, stream>>>(                               \
-        qp, kp, vp, bt, cl, op, num_q_heads, num_kv_heads, block_size, max_blocks, sc,       \
+        qp, kp, vp, bt, cl, op, num_q_heads, num_kv_heads, block_size, max_blocks, kvbs, sc, \
         (unsigned)sliding_window);                                                           \
     break
 
@@ -344,6 +354,7 @@ __global__ __launch_bounds__(THREADS) void flash_decode_paged_fp8_kernel(
     const unsigned int num_kv_heads,
     const unsigned int block_size,
     const unsigned int max_blocks,
+    const long kv_block_stride,
     const float scale,
     const float k_descale,
     const float v_descale,
@@ -377,8 +388,9 @@ __global__ __launch_bounds__(THREADS) void flash_decode_paged_fp8_kernel(
 
     for (unsigned int j = warp_id; j < ctx_len; j += NWARPS) {
         if (sliding_window > 0 && (ctx_len - 1 - j) >= sliding_window) continue;
-        const unsigned int phys = (unsigned int)bt[j / block_size] * block_size + (j % block_size);
-        const unsigned char* k_ptr = K_cache + (size_t)phys * kv_row_stride + kv_head * HEAD_DIM;
+        const size_t row = (size_t)(unsigned int)bt[j / block_size] * kv_block_stride
+                           + (size_t)(j % block_size) * kv_row_stride + kv_head * HEAD_DIM;
+        const unsigned char* k_ptr = K_cache + row;
         float partial = 0.0f;
         #pragma unroll
         for (int i = 0; i < D_PER_LANE; i++)
@@ -388,7 +400,7 @@ __global__ __launch_bounds__(THREADS) void flash_decode_paged_fp8_kernel(
         const float m_new = fmaxf(m, score);
         const float correct = __expf(m - m_new);
         const float p = __expf(score - m_new);
-        const unsigned char* v_ptr = V_cache + (size_t)phys * kv_row_stride + kv_head * HEAD_DIM;
+        const unsigned char* v_ptr = V_cache + row;
         #pragma unroll
         for (int i = 0; i < D_PER_LANE; i++)
             o_reg[i] = o_reg[i] * correct + p * e4m3_to_f32(v_ptr[i * WARP + lane]);
@@ -431,7 +443,8 @@ __global__ __launch_bounds__(THREADS) void flash_decode_paged_fp8_kernel(
 void launch_flash_decode_paged_fp8(const at::Tensor& q, const at::Tensor& k_cache,
                                    const at::Tensor& v_cache, const at::Tensor& block_table,
                                    const at::Tensor& context_lens, at::Tensor& out, double scale,
-                                   double k_descale, double v_descale, int64_t sliding_window) {
+                                   double k_descale, double v_descale, int64_t sliding_window,
+                                   int64_t kv_block_stride) {
     const unsigned int B = q.size(0);
     const unsigned int num_q_heads = q.size(1);
     const unsigned int head_dim = q.size(2);
@@ -439,6 +452,8 @@ void launch_flash_decode_paged_fp8(const at::Tensor& q, const at::Tensor& k_cach
     const unsigned int num_kv_heads = k_cache.size(2);
     const unsigned int max_blocks = block_table.size(1);
     const float sc = (scale > 0) ? (float)scale : 1.0f / sqrtf((float)head_dim);
+    const long kvbs = (kv_block_stride > 0) ? (long)kv_block_stride
+                                            : (long)block_size * num_kv_heads * head_dim;
 
     dim3 grid(num_q_heads, B, 1);
     dim3 block(THREADS, 1, 1);
@@ -453,7 +468,7 @@ void launch_flash_decode_paged_fp8(const at::Tensor& q, const at::Tensor& k_cach
 
 #define LAUNCHF(HD)                                                                              \
     flash_decode_paged_fp8_kernel<HD><<<grid, block, 0, stream>>>(                               \
-        qp, kp, vp, bt, cl, op, num_q_heads, num_kv_heads, block_size, max_blocks, sc,           \
+        qp, kp, vp, bt, cl, op, num_q_heads, num_kv_heads, block_size, max_blocks, kvbs, sc,     \
         (float)k_descale, (float)v_descale, (unsigned)sliding_window);                           \
     break
 

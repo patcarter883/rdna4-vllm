@@ -26,13 +26,14 @@ def _flash_decode_fake(q, k, v, scale, sliding_window):
 
 
 @torch.library.register_fake("attn_decode::flash_decode_paged")
-def _flash_decode_paged_fake(q, k_cache, v_cache, block_table, context_lens, scale, sliding_window):
+def _flash_decode_paged_fake(q, k_cache, v_cache, block_table, context_lens, scale, sliding_window,
+                             kv_block_stride=0):
     return torch.empty_like(q)
 
 
 @torch.library.register_fake("attn_decode::flash_decode_paged_fp8")
 def _flash_decode_paged_fp8_fake(q, k_cache, v_cache, block_table, context_lens, scale, k_descale,
-                                 v_descale, sliding_window):
+                                 v_descale, sliding_window, kv_block_stride=0):
     return torch.empty_like(q)
 
 

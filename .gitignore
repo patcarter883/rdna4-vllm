@@ -30,3 +30,6 @@ profiling/
 .vllm-cache*
 # gpu-lease runtime lock/label files (ephemeral; see scripts/gpu-lease.sh)
 .gpu-locks/
+
+# attn_decode vLLM token-diff outputs
+.attndiff/
