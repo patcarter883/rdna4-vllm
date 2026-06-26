@@ -89,6 +89,70 @@ def check(name, specs, Hq, Hk, D, sw=0, block_size=16) -> bool:
     return ok
 
 
+def check_fp8(name, specs, Hq, Hk, D, k_descale=1.0, v_descale=1.0, sw=0, block_size=16) -> bool:
+    """fp8 (e4m3) paged KV + per-tensor descale. The reference dequantizes the SAME fp8 bytes
+    (* descale) — fp8 quant error is in both kernel and ref, so the residual is only bf16 output
+    rounding. Exercises the descale fold (k into the score, v into the output)."""
+    scale = D ** -0.5
+    S = len(specs)
+    ctx = [p + q for p, q in specs]
+    qlens = [q for _, q in specs]
+    total_q = sum(qlens)
+    maxctx = max(ctx)
+    rep = Hq // Hk
+
+    kd = torch.randn(S, maxctx, Hk, D, device=DEV).to(torch.float8_e4m3fn)
+    vd = torch.randn(S, maxctx, Hk, D, device=DEV).to(torch.float8_e4m3fn)
+    q = torch.randn(total_q, Hq, D, device=DEV, dtype=torch.bfloat16)
+
+    bps = (maxctx + block_size - 1) // block_size
+    num_blocks = S * bps + 3
+    perm = torch.randperm(num_blocks, device=DEV).int()
+    k_cache = torch.zeros(num_blocks, block_size, Hk, D, device=DEV, dtype=torch.float8_e4m3fn)
+    v_cache = torch.zeros_like(k_cache)
+    block_table = torch.zeros(S, bps, device=DEV, dtype=torch.int32)
+    for b in range(S):
+        for lb in range(bps):
+            phys = int(perm[b * bps + lb].item())
+            block_table[b, lb] = phys
+            for off in range(block_size):
+                j = lb * block_size + off
+                if j < ctx[b]:
+                    k_cache[phys, off] = kd[b, j]
+                    v_cache[phys, off] = vd[b, j]
+    cu = torch.tensor([0] + list(torch.tensor(qlens).cumsum(0).tolist()), device=DEV, dtype=torch.int32)
+    ctxt = torch.tensor(ctx, device=DEV, dtype=torch.int32)
+
+    got = torch.ops.attn_prefill_paged.flash_prefill_paged_fp8(
+        q, k_cache, v_cache, block_table, cu, ctxt, scale, k_descale, v_descale, 1, sw, max(qlens), 0).float()
+
+    kdq = kd.float() * k_descale
+    vdq = vd.float() * v_descale
+    ref = torch.empty(total_q, Hq, D, device=DEV)
+    for b in range(S):
+        p, ql = specs[b]
+        cl = ctx[b]
+        off = int(cu[b].item())
+        kbe = kdq[b, :cl].repeat_interleave(rep, dim=1)
+        vbe = vdq[b, :cl].repeat_interleave(rep, dim=1)
+        qi = q[off:off + ql].float()
+        scores = torch.einsum("qhd,khd->qhk", qi, kbe) * scale
+        qpos = p + torch.arange(ql, device=DEV)
+        kpos = torch.arange(cl, device=DEV)
+        mask = kpos[None, :] > qpos[:, None]
+        if sw > 0:
+            mask = mask | ((qpos[:, None] - kpos[None, :]) >= sw)
+        scores = scores.masked_fill(mask[:, None, :], float("-inf"))
+        ref[off:off + ql] = torch.einsum("qhk,khd->qhd", F.softmax(scores, dim=-1), vbe)
+
+    ref_b = ref.bfloat16().float()
+    viol = ((got - ref_b).abs() - (ULP_ATOL + ULP_RTOL * ref_b.abs())).clamp(min=0).max().item()
+    cos = F.cosine_similarity(got.flatten(), ref.flatten(), dim=0).item()
+    ok = (cos >= COS_MIN) and (viol <= 1e-6)
+    print(f"  [{'PASS' if ok else 'FAIL'}] {name:34s} cos={cos:.6f}  ulp_viol={viol:.2e}")
+    return ok
+
+
 def main() -> None:
     print("=== attn_prefill_paged parity (vs fp32 SDPA over prefix⧺new, prefix-offset causal) ===")
     ok = True
@@ -100,6 +164,12 @@ def main() -> None:
     ok &= check("MHA prefix64 q48 D128 Hq8/Hk8  ", [(64, 48)], 8, 8, 128)
     ok &= check("D64 prefix30 q30 Hq8/Hk1       ", [(30, 30)], 8, 1, 64)
     ok &= check("long prefix1000 q64 bs32 D128  ", [(1000, 64)], 16, 2, 128, block_size=32)
+    print("--- fp8-KV (e4m3) + per-tensor descale fold ---")
+    ok &= check_fp8("fp8 cold prefix0 q64 D128      ", [(0, 64)], 16, 2, 128)
+    ok &= check_fp8("fp8 extend prefix100 q32 D128  ", [(100, 32)], 16, 2, 128)
+    ok &= check_fp8("fp8 batch [(0,16)(50,40)(128,8)]", [(0, 16), (50, 40), (128, 8)], 16, 2, 128)
+    ok &= check_fp8("fp8 descale k2.0/v0.5 ext200   ", [(200, 32)], 16, 2, 128, k_descale=2.0, v_descale=0.5)
+    ok &= check_fp8("fp8 SWA=64 prefix200 q32       ", [(200, 32)], 16, 2, 128, sw=64)
     print("RESULT:", "ALL PASS" if ok else "FAILURES PRESENT")
 
 
