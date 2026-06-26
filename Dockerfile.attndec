@@ -1,15 +1,19 @@
-# Thin overlay over the canonical stack: native attn_decode HIP decode wired into vLLM's
-# triton_attn backend behind VLLM_ATTN_DECODE_HIP=1 (default off → byte-identical to :combined).
-# Build:  docker build -f Dockerfile.attndec -t vllm22-w4a8:attndec .
+# Thin overlay over the canonical stack: native HIP attention (decode + paged/chunked prefill) wired
+# into vLLM's triton_attn backend behind VLLM_ATTN_DECODE_HIP=1 (default off → byte-identical to
+# :combined). Build:  docker build -f Dockerfile.attndec -t vllm22-w4a8:attndec .
 FROM vllm22-w4a8:combined
 
-# Drop the package into the vLLM tree (mirrors cca_hip at .../mamba/cca_hip/).
-COPY attn_decode /app/vllm/vllm/model_executor/layers/attn_decode
+# Drop both packages into the vLLM tree (mirrors cca_hip at .../mamba/cca_hip/).
+COPY attn_decode         /app/vllm/vllm/model_executor/layers/attn_decode
+COPY attn_prefill_paged  /app/vllm/vllm/model_executor/layers/attn_prefill_paged
 
-# AOT-build the .so for gfx1201 + apply the anchor-based forward patch (idempotent).
+# AOT-build both .so for gfx1201 + apply the anchor-based forward patch (idempotent).
 RUN bash -lc 'source /app/.venv/bin/activate \
+    && for d in attn_decode attn_prefill_paged; do \
+         cd /app/vllm/vllm/model_executor/layers/$d \
+         && rm -rf build *.so \
+         && GPU_ARCHS=gfx1201 python setup.py build_ext --inplace; \
+       done \
     && cd /app/vllm/vllm/model_executor/layers/attn_decode \
-    && rm -rf build *.so \
-    && GPU_ARCHS=gfx1201 python setup.py build_ext --inplace \
     && python apply_vllm_patch.py \
     && python -c "import ast,os,vllm; p=os.path.join(os.path.dirname(vllm.__file__),\"v1/attention/backends/triton_attn.py\"); ast.parse(open(p).read()); print(\"[attndec] triton_attn.py parses OK\")"'

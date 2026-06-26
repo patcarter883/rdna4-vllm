@@ -26,15 +26,16 @@ BLOCK = '''
             _ATTN_DECODE_ROUTE = None
             if _os_ad.environ.get("VLLM_ATTN_DECODE_HIP", "0") == "1":
                 try:
-                    from vllm.model_executor.layers.attn_decode import op as _ad_op  # loads .so
-                    from vllm.model_executor.layers.attn_decode.vllm_route import maybe_hip_decode
-                    _ATTN_DECODE_ROUTE = maybe_hip_decode
-                    print("[attn_decode] native HIP decode ENABLED (bf16 pure-decode path).", flush=True)
+                    from vllm.model_executor.layers.attn_decode import op as _ad_op       # decode .so
+                    from vllm.model_executor.layers.attn_prefill_paged import op as _ap_op  # prefill .so
+                    from vllm.model_executor.layers.attn_decode.vllm_route import maybe_hip_attention
+                    _ATTN_DECODE_ROUTE = maybe_hip_attention
+                    print("[attn_hip] native HIP attention ENABLED (bf16 decode + paged prefill).", flush=True)
                 except Exception as _e_ad:  # build/load failure -> stay on Triton
                     _ATTN_DECODE_ROUTE = None
-                    print("[attn_decode] VLLM_ATTN_DECODE_HIP=1 but load failed:", _e_ad, flush=True)
+                    print("[attn_hip] VLLM_ATTN_DECODE_HIP=1 but load failed:", _e_ad, flush=True)
         if _ATTN_DECODE_ROUTE is not None and _ATTN_DECODE_ROUTE(
-                self, query, kv_cache, attn_metadata, output, output_scale):
+                self, layer, query, kv_cache, attn_metadata, output, output_scale):
             return output
         # ----------------------------------------------------------------------------------
 '''
