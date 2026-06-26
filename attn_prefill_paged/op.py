@@ -26,6 +26,13 @@ def _fake(q, k_cache, v_cache, block_table, cu_seqlens_q, context_lens, scale, c
     return torch.empty_like(q)
 
 
-flash_prefill_paged = torch.ops.attn_prefill_paged.flash_prefill_paged
+@torch.library.register_fake("attn_prefill_paged::flash_prefill_paged_fp8")
+def _fake_fp8(q, k_cache, v_cache, block_table, cu_seqlens_q, context_lens, scale, k_descale,
+              v_descale, causal, sliding_window, max_seqlen_q, kv_block_stride=0):
+    return torch.empty_like(q)
 
-__all__ = ["flash_prefill_paged"]
+
+flash_prefill_paged = torch.ops.attn_prefill_paged.flash_prefill_paged
+flash_prefill_paged_fp8 = torch.ops.attn_prefill_paged.flash_prefill_paged_fp8
+
+__all__ = ["flash_prefill_paged", "flash_prefill_paged_fp8"]
