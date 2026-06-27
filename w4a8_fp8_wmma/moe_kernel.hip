@@ -1123,22 +1123,34 @@ static void run_moe_gemm(
         if (gt6 < 1) gt6 = 1; if (gt6 > ng) gt6 = ng;
         const size_t per_grp = (size_t)bn * (group_size + LDS_PAD);
         while (gt6 > 1 && per_grp * gt6 > 40960) gt6--;
-        dim3 block((block_m / WMMA_DIM) * 32);   // exactly block_m/16 warps
+        // WARPS_N: split BN across extra warps so block_m stays small (minimal padding) while the
+        // block fills the 8-warp WGP budget -> better occupancy + less register pressure. Pick the
+        // largest WARPS_N in {1,2,4} keeping (block_m/16)*WARPS_N <= MAX_WARPS and WARPS_N <= NFRAG.
+        const int nwm = block_m / WMMA_DIM;
+        const int nfrag = bn / WMMA_DIM;
+        int warps_n = w4a8_tile::MAX_WARPS / nwm;
+        if (warps_n > nfrag) warps_n = nfrag;
+        warps_n = (warps_n >= 4) ? 4 : (warps_n >= 2 ? 2 : 1);
+        dim3 block(nwm * warps_n * 32);
         dim3 grid((N + bn - 1) / bn, P / block_m);
         const size_t smem5 = (size_t)(block_m + bn) * (group_size + LDS_PAD);
         const size_t smem6 = (size_t)bn * (group_size + LDS_PAD) * gt6;  // B only, gtile groups
         using w4a8_tile::WmmaFp8;
         if (!cfg.A_IN_LDS) {   // default: A via warp-shuffle gather, B-only LDS (former v6)
-            #define TV6(BN_T) w4a8_tile::moe_gemm_tiled_v6_kernel<WmmaFp8, SCATTER, BN_T><<<grid, block, smem6, stream>>>( \
+            #define TV6(BN_T, WN_T) w4a8_tile::moe_gemm_tiled_v6_kernel<WmmaFp8, SCATTER, BN_T, WN_T><<<grid, block, smem6, stream>>>( \
                 xf, asc, wq, wsc, wz, sti, eid, ntp, out, T, N, K, group_size, \
                 top_k, block_m, num_valid_tokens, output_scatter, topk_weights, out_top_k, gt6, weight_is_e2m1)
-            if (bn == 128) TV6(128); else TV6(MV5_BN);
+            #define TV6_WN(WN_T) do { if (bn == 128) TV6(128, WN_T); else TV6(MV5_BN, WN_T); } while (0)
+            if (warps_n == 4) TV6_WN(4); else if (warps_n == 2) TV6_WN(2); else TV6_WN(1);
+            #undef TV6_WN
             #undef TV6
         } else {               // A staged in LDS (former v5)
-            #define TV5(BN_T) w4a8_tile::moe_gemm_tiled_kernel<WmmaFp8, SCATTER, BN_T><<<grid, block, smem5, stream>>>( \
+            #define TV5(BN_T, WN_T) w4a8_tile::moe_gemm_tiled_kernel<WmmaFp8, SCATTER, BN_T, WN_T><<<grid, block, smem5, stream>>>( \
                 xf, asc, wq, wsc, wz, sti, eid, ntp, out, T, N, K, group_size, \
                 top_k, block_m, num_valid_tokens, output_scatter, topk_weights, out_top_k, weight_is_e2m1)
-            if (bn == 128) TV5(128); else TV5(MV5_BN);
+            #define TV5_WN(WN_T) do { if (bn == 128) TV5(128, WN_T); else TV5(MV5_BN, WN_T); } while (0)
+            if (warps_n == 4) TV5_WN(4); else if (warps_n == 2) TV5_WN(2); else TV5_WN(1);
+            #undef TV5_WN
             #undef TV5
         }
     } else if (mk == w4a8::MoeKernel::Gemv) {

@@ -22,7 +22,11 @@ namespace w4a8_tile {
 // __launch_bounds__(MV5_MAX_WARPS*32)). Omitting it targets the default 1024-thread block ->
 // a smaller per-thread register budget -> possible spill -> a perf regression that is a refactor
 // artifact, not a real difference. Same applies when templating v6/v7 (both carry it).
-template<class MMA, bool SCATTER, int BN>
+// WARPS_N warps split the BN columns (each owns NFRAG/WARPS_N frags) on top of the block_m/16
+// M-warps, so block_m stays small (minimal MoE padding) while the block runs n_warps_m*WARPS_N
+// warps -> fuller WGP occupancy + NFRAG_W (not NFRAG) accumulators/thread (less register pressure).
+// Bit-exact to the WARPS_N=1 kernel: each output element keeps the same per-group accumulation.
+template<class MMA, bool SCATTER, int BN, int WARPS_N = 1>
 __global__ void __launch_bounds__(MAX_THREADS) moe_gemm_tiled_kernel(
     const unsigned char* __restrict__ x_fp8,         // (T, K)
     const float*         __restrict__ act_scales,    // (T,)
@@ -40,7 +44,8 @@ __global__ void __launch_bounds__(MAX_THREADS) moe_gemm_tiled_kernel(
     int out_top_k, bool weight_is_e2m1) {
 
     static_assert(BN % WMMA_DIM == 0, "BN must be a multiple of WMMA_DIM");
-    constexpr int NFRAG = BN / WMMA_DIM;             // independent accumulators per warp
+    constexpr int NFRAG = BN / WMMA_DIM;             // total N accumulators across the N-warps
+    constexpr int NFRAG_W = NFRAG / WARPS_N;         // N accumulators owned by each warp
 
     const int block_idx = blockIdx.y;               // one moe_align block (one expert)
     const int row0 = block_idx * block_m;
@@ -49,14 +54,17 @@ __global__ void __launch_bounds__(MAX_THREADS) moe_gemm_tiled_kernel(
 
     const int block_n = blockIdx.x * BN;
     const int tid = threadIdx.x;
-    const int warp_id = tid >> 5;                    // which 16-row M-subtile
+    const int warp_id = tid >> 5;
     const int lane = tid & 31;
     const int lrow = lane & 15;
     const int khalf = (lane >> 4) * 8;
     const int frag_col = lane & 15;
     const int frag_row0 = (lane >> 4) * 8;
-    const int n_warps = block_m / WMMA_DIM;
-    if (warp_id >= n_warps) return;
+    const int n_warps_m = block_m / WMMA_DIM;
+    const int warp_m = warp_id / WARPS_N;            // which 16-row M-subtile
+    const int warp_n = warp_id % WARPS_N;            // which BN/WARPS_N column slab
+    if (warp_m >= n_warps_m) return;
+    const int nfrag0 = warp_n * NFRAG_W;             // first global N-frag for this warp
 
     const int e = expert_ids[block_idx];
     const int num_groups = K / group_size;
@@ -72,13 +80,13 @@ __global__ void __launch_bounds__(MAX_THREADS) moe_gemm_tiled_kernel(
     unsigned char* A_tile = smem;                   // block_m rows
     unsigned char* B_tile = smem + block_m * LDSBK; // BN cols
 
-    float running[NFRAG][8];
+    float running[NFRAG_W][8];
     #pragma unroll
-    for (int f = 0; f < NFRAG; ++f)
+    for (int f = 0; f < NFRAG_W; ++f)
         #pragma unroll
         for (int ee = 0; ee < 8; ++ee) running[f][ee] = 0.0f;
 
-    const int total_threads = n_warps * 32;
+    const int total_threads = n_warps_m * WARPS_N * 32;
     for (int g = 0; g < num_groups; ++g) {
         const int k0 = g * BK;
 
@@ -114,27 +122,28 @@ __global__ void __launch_bounds__(MAX_THREADS) moe_gemm_tiled_kernel(
         }
         __syncthreads();
 
-        typename MMA::CFrag acc[NFRAG];
+        typename MMA::CFrag acc[NFRAG_W];
         #pragma unroll
-        for (int f = 0; f < NFRAG; ++f) acc[f] = MMA::zero();
+        for (int f = 0; f < NFRAG_W; ++f) acc[f] = MMA::zero();
 
         const int k_sub = BK / WMMA_DIM;
-        const int a_base = (warp_id * WMMA_DIM + lrow) * LDSBK + khalf;
+        const int a_base = (warp_m * WMMA_DIM + lrow) * LDSBK + khalf;
         const int b_base = lrow * LDSBK + khalf;
         for (int kt = 0; kt < k_sub; ++kt) {
             const int ko = kt * WMMA_DIM;
             typename MMA::AFrag a_cur =
                 *reinterpret_cast<const typename MMA::AFrag*>(&A_tile[a_base + ko]);
             #pragma unroll
-            for (int f = 0; f < NFRAG; ++f) {
+            for (int f = 0; f < NFRAG_W; ++f) {
+                const int gf = nfrag0 + f;
                 typename MMA::BFrag b_cur = *reinterpret_cast<const typename MMA::BFrag*>(
-                    &B_tile[b_base + f * WMMA_DIM * LDSBK + ko]);
+                    &B_tile[b_base + gf * WMMA_DIM * LDSBK + ko]);
                 acc[f] = MMA::mma(a_cur, b_cur, acc[f]);
             }
         }
         #pragma unroll
-        for (int f = 0; f < NFRAG; ++f) {
-            const int abs_n = block_n + f * WMMA_DIM + frag_col;
+        for (int f = 0; f < NFRAG_W; ++f) {
+            const int abs_n = block_n + (nfrag0 + f) * WMMA_DIM + frag_col;
             const float wsc = (abs_n < N)
                 ? __half2float(ws_e[abs_n * num_groups + g]) : 0.0f;
             #pragma unroll
@@ -146,7 +155,7 @@ __global__ void __launch_bounds__(MAX_THREADS) moe_gemm_tiled_kernel(
     // ---- epilogue: per-row act scale, then non-scatter store or indirect atomic scatter ----
     #pragma unroll
     for (int ee = 0; ee < 8; ++ee) {
-        const int r = warp_id * WMMA_DIM + frag_row0 + ee;
+        const int r = warp_m * WMMA_DIM + frag_row0 + ee;
         if (r >= block_m) continue;
         const int row_pad = row0 + r;
         const int offs_token = sorted_token_ids[row_pad];
@@ -157,16 +166,16 @@ __global__ void __launch_bounds__(MAX_THREADS) moe_gemm_tiled_kernel(
             const int token = offs_token / out_top_k;
             const float w = topk_weights[offs_token];
             #pragma unroll
-            for (int f = 0; f < NFRAG; ++f) {
-                const int abs_n = block_n + f * WMMA_DIM + frag_col;
+            for (int f = 0; f < NFRAG_W; ++f) {
+                const int abs_n = block_n + (nfrag0 + f) * WMMA_DIM + frag_col;
                 if (abs_n < N)
                     atomicAdd(&output_scatter[(long)token * N + abs_n],
                               w * running[f][ee] * asc);
             }
         } else {
             #pragma unroll
-            for (int f = 0; f < NFRAG; ++f) {
-                const int abs_n = block_n + f * WMMA_DIM + frag_col;
+            for (int f = 0; f < NFRAG_W; ++f) {
+                const int abs_n = block_n + (nfrag0 + f) * WMMA_DIM + frag_col;
                 if (abs_n < N)
                     out[(long)row_pad * N + abs_n] = __float2half(running[f][ee] * asc);
             }
@@ -180,7 +189,7 @@ __global__ void __launch_bounds__(MAX_THREADS) moe_gemm_tiled_kernel(
 // (a_src_lane = 2*(lane&15)+(lane>>4)) is WMMA-fragment-layout-specific — for the SWMMAC backend
 // (K=32, different fragment layout) this gather must change, which is why the SWMMAC port starts
 // from the v5 (A-in-LDS) backbone, not this one. Templated on the MMA policy for uniformity.
-template<class MMA, bool SCATTER, int BN>
+template<class MMA, bool SCATTER, int BN, int WARPS_N = 1>
 __global__ void __launch_bounds__(MAX_THREADS) moe_gemm_tiled_v6_kernel(
     const unsigned char* __restrict__ x_fp8,
     const float*         __restrict__ act_scales,
@@ -199,6 +208,7 @@ __global__ void __launch_bounds__(MAX_THREADS) moe_gemm_tiled_v6_kernel(
 
     static_assert(BN % WMMA_DIM == 0, "BN must be a multiple of WMMA_DIM");
     constexpr int NFRAG = BN / WMMA_DIM;
+    constexpr int NFRAG_W = NFRAG / WARPS_N;
     const int block_idx = blockIdx.y;
     const int row0 = block_idx * block_m;
     if (row0 >= num_tokens_post_padded[0]) return;
@@ -211,8 +221,11 @@ __global__ void __launch_bounds__(MAX_THREADS) moe_gemm_tiled_v6_kernel(
     const int khalf = (lane >> 4) * 8;
     const int frag_col = lane & 15;
     const int frag_row0 = (lane >> 4) * 8;
-    const int n_warps = block_m / WMMA_DIM;
-    if (warp_id >= n_warps) return;
+    const int n_warps_m = block_m / WMMA_DIM;
+    const int warp_m = warp_id / WARPS_N;
+    const int warp_n = warp_id % WARPS_N;
+    if (warp_m >= n_warps_m) return;
+    const int nfrag0 = warp_n * NFRAG_W;
 
     const int e = expert_ids[block_idx];
     const int num_groups = K / group_size;
@@ -228,20 +241,21 @@ __global__ void __launch_bounds__(MAX_THREADS) moe_gemm_tiled_v6_kernel(
     unsigned char* B_tile = smem;                 // B only -- no A in LDS
 
     // hoisted per-lane activation gather (constant across the K loop). WMMA-layout-specific.
-    const int a_my_row = row0 + warp_id * WMMA_DIM + (lane >> 1);
+    // Indexed by warp_m: the WARPS_N warps that share an M-subtile each gather the same A.
+    const int a_my_row = row0 + warp_m * WMMA_DIM + (lane >> 1);
     const int a_offs = sorted_token_ids[a_my_row];
     const bool a_valid = a_offs < num_valid_tokens;
     const int a_src = SCATTER ? a_my_row : (a_offs / top_k);
     const int a_kh = (lane & 1) * 8;
     const int a_src_lane = 2 * (lane & 15) + (lane >> 4);
 
-    float running[NFRAG][8];
+    float running[NFRAG_W][8];
     #pragma unroll
-    for (int f = 0; f < NFRAG; ++f)
+    for (int f = 0; f < NFRAG_W; ++f)
         #pragma unroll
         for (int ee = 0; ee < 8; ++ee) running[f][ee] = 0.0f;
 
-    const int total_threads = n_warps * 32;
+    const int total_threads = n_warps_m * WARPS_N * 32;
     const int k_sub = BK / WMMA_DIM;
     const int b_base = lrow * LDSBK + khalf;
     const int njobs = BN * (BK / PACK_FACTOR);
@@ -273,9 +287,9 @@ __global__ void __launch_bounds__(MAX_THREADS) moe_gemm_tiled_v6_kernel(
         for (int gi = gt; gi < gend; ++gi) {
             const int k0 = gi * BK;
             unsigned char* Bg = B_tile + (long)(gi - gt) * BN * LDSBK;
-            typename MMA::CFrag acc[NFRAG];
+            typename MMA::CFrag acc[NFRAG_W];
             #pragma unroll
-            for (int f = 0; f < NFRAG; ++f) acc[f] = MMA::zero();
+            for (int f = 0; f < NFRAG_W; ++f) acc[f] = MMA::zero();
 
             for (int kt = 0; kt < k_sub; ++kt) {
                 const int gk = k0 + kt * WMMA_DIM + a_kh;
@@ -286,15 +300,16 @@ __global__ void __launch_bounds__(MAX_THREADS) moe_gemm_tiled_v6_kernel(
                 a_cur[0] = __shfl(av[0], a_src_lane);
                 a_cur[1] = __shfl(av[1], a_src_lane);
                 #pragma unroll
-                for (int f = 0; f < NFRAG; ++f) {
+                for (int f = 0; f < NFRAG_W; ++f) {
+                    const int gf = nfrag0 + f;
                     typename MMA::BFrag b_cur = *reinterpret_cast<const typename MMA::BFrag*>(
-                        &Bg[b_base + f * WMMA_DIM * LDSBK + kt * WMMA_DIM]);
+                        &Bg[b_base + gf * WMMA_DIM * LDSBK + kt * WMMA_DIM]);
                     acc[f] = MMA::mma(a_cur, b_cur, acc[f]);
                 }
             }
             #pragma unroll
-            for (int f = 0; f < NFRAG; ++f) {
-                const int abs_n = block_n + f * WMMA_DIM + frag_col;
+            for (int f = 0; f < NFRAG_W; ++f) {
+                const int abs_n = block_n + (nfrag0 + f) * WMMA_DIM + frag_col;
                 const float wsc = (abs_n < N)
                     ? __half2float(ws_e[abs_n * num_groups + gi]) : 0.0f;
                 #pragma unroll
@@ -306,7 +321,7 @@ __global__ void __launch_bounds__(MAX_THREADS) moe_gemm_tiled_v6_kernel(
 
     #pragma unroll
     for (int ee = 0; ee < 8; ++ee) {
-        const int r = warp_id * WMMA_DIM + frag_row0 + ee;
+        const int r = warp_m * WMMA_DIM + frag_row0 + ee;
         if (r >= block_m) continue;
         const int row_pad = row0 + r;
         const int offs_token = sorted_token_ids[row_pad];
@@ -317,16 +332,16 @@ __global__ void __launch_bounds__(MAX_THREADS) moe_gemm_tiled_v6_kernel(
             const int token = offs_token / out_top_k;
             const float w = topk_weights[offs_token];
             #pragma unroll
-            for (int f = 0; f < NFRAG; ++f) {
-                const int abs_n = block_n + f * WMMA_DIM + frag_col;
+            for (int f = 0; f < NFRAG_W; ++f) {
+                const int abs_n = block_n + (nfrag0 + f) * WMMA_DIM + frag_col;
                 if (abs_n < N)
                     atomicAdd(&output_scatter[(long)token * N + abs_n],
                               w * running[f][ee] * asc);
             }
         } else {
             #pragma unroll
-            for (int f = 0; f < NFRAG; ++f) {
-                const int abs_n = block_n + f * WMMA_DIM + frag_col;
+            for (int f = 0; f < NFRAG_W; ++f) {
+                const int abs_n = block_n + (nfrag0 + f) * WMMA_DIM + frag_col;
                 if (abs_n < N)
                     out[(long)row_pad * N + abs_n] = __float2half(running[f][ee] * asc);
             }

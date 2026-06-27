@@ -58,8 +58,11 @@ struct DenseWmmaFp8 {
 // NFRAG=BN/16). Reproduces mmq_fp8_gemm_kernel_v5 line-for-line (only MMA::mma
 // replaces the inline builtin). Static LDS sized for MAX_GROUP_SIZE+LDS_PAD.
 // ============================================================
-template <class MMA, int BM, int BN>
-__global__ void __launch_bounds__((BM / 16) * 32) gemm_tiled_kernel(
+// WARPS_N warps split the BN columns (each owns NFRAG/WARPS_N frags) on top of the BM/16 M-warps,
+// so the block runs (BM/16)*WARPS_N warps with NFRAG_W (not NFRAG) accumulators/thread -> less
+// register pressure -> more blocks/CU. Bit-exact to WARPS_N=1 (same per-element accumulation).
+template <class MMA, int BM, int BN, int WARPS_N = 1>
+__global__ void __launch_bounds__((BM / 16) * WARPS_N * 32) gemm_tiled_kernel(
     const __half*        __restrict__ x,            // (M, K) fp16 activations
     const int*           __restrict__ w_packed,
     const __half*        __restrict__ w_scales,
@@ -67,8 +70,10 @@ __global__ void __launch_bounds__((BM / 16) * 32) gemm_tiled_kernel(
     __half*              __restrict__ out,
     int M, int N, int K, int group_size, bool weight_is_e2m1) {
 
-    constexpr int NWARPS = BM / 16;
+    constexpr int NWARPS_M = BM / 16;
     constexpr int NFRAG  = BN / WMMA_DIM;
+    constexpr int NFRAG_W = NFRAG / WARPS_N;
+    constexpr int THREADS = NWARPS_M * WARPS_N * 32;
 
     const int block_m = blockIdx.y * BM;
     const int block_n = blockIdx.x * BN;
@@ -79,6 +84,9 @@ __global__ void __launch_bounds__((BM / 16) * 32) gemm_tiled_kernel(
     const int khalf = (lane >> 4) * 8;
     const int frag_col = lane & 15;
     const int frag_row0 = (lane >> 4) * 8;
+    const int warp_m = warp_id / WARPS_N;
+    const int warp_n = warp_id % WARPS_N;
+    const int nfrag0 = warp_n * NFRAG_W;
 
     const int BK = group_size;
     const int num_k_groups = K / BK;
@@ -92,25 +100,25 @@ __global__ void __launch_bounds__((BM / 16) * 32) gemm_tiled_kernel(
     __shared__ unsigned char A_tile[BM * (MAX_GROUP_SIZE + LDS_PAD)];
     __shared__ unsigned char B_tile[BN * (MAX_GROUP_SIZE + LDS_PAD)];
     __shared__ float act_scale_s[BM];
-    compute_block_act_scales(x, M, K, block_m, BM, tid, NWARPS * 32, act_scale_s);
+    compute_block_act_scales(x, M, K, block_m, BM, tid, THREADS, act_scale_s);
 
-    float running[NFRAG][8];
+    float running[NFRAG_W][8];
     #pragma unroll
-    for (int f = 0; f < NFRAG; ++f)
+    for (int f = 0; f < NFRAG_W; ++f)
         #pragma unroll
         for (int e = 0; e < 8; ++e) running[f][e] = 0.0f;
 
     for (int g = 0; g < num_k_groups; ++g) {
         const int k0 = g * BK;
 
-        for (int idx = tid * 4; idx < BM * BK; idx += (NWARPS * 32) * 4) {
+        for (int idx = tid * 4; idx < BM * BK; idx += THREADS * 4) {
             const int r = idx / BK, k = idx % BK, am = block_m + r;
             const float inv_scale = 1.0f / act_scale_s[r];
             unsigned int v = stage_act_word(x, M, K, am, k0 + k, inv_scale);
             *reinterpret_cast<unsigned int*>(&A_tile[r * LDSBK + k]) = v;
         }
         const int njobs = BN * (BK / PACK_FACTOR);
-        for (int j = tid; j < njobs; j += NWARPS * 32) {
+        for (int j = tid; j < njobs; j += THREADS) {
             const int n = j / (BK / PACK_FACTOR), k8 = j % (BK / PACK_FACTOR);
             const int an = block_n + n;
             int word = 0, zp = 8;
@@ -129,43 +137,43 @@ __global__ void __launch_bounds__((BM / 16) * 32) gemm_tiled_kernel(
         }
         __syncthreads();
 
-        typename MMA::CFrag acc[NFRAG];
+        typename MMA::CFrag acc[NFRAG_W];
         #pragma unroll
-        for (int f = 0; f < NFRAG; ++f) acc[f] = MMA::zero();
+        for (int f = 0; f < NFRAG_W; ++f) acc[f] = MMA::zero();
 
-        const int a_base = (warp_id * WMMA_DIM + lrow) * LDSBK + khalf;
+        const int a_base = (warp_m * WMMA_DIM + lrow) * LDSBK + khalf;
         const int b_base = lrow * LDSBK + khalf;
         // 2-deep pipeline: prefetch next kt's operands while the current kt's MMAs run.
         typename MMA::AFrag a_cur =
             *reinterpret_cast<const typename MMA::AFrag*>(&A_tile[a_base]);
-        typename MMA::BFrag b_cur[NFRAG];
+        typename MMA::BFrag b_cur[NFRAG_W];
         #pragma unroll
-        for (int f = 0; f < NFRAG; ++f)
+        for (int f = 0; f < NFRAG_W; ++f)
             b_cur[f] = *reinterpret_cast<const typename MMA::BFrag*>(
-                &B_tile[b_base + f * WMMA_DIM * LDSBK]);
+                &B_tile[b_base + (nfrag0 + f) * WMMA_DIM * LDSBK]);
 
         for (int kt = 0; kt < k_sub; ++kt) {
             typename MMA::AFrag a_nx;
-            typename MMA::BFrag b_nx[NFRAG];
+            typename MMA::BFrag b_nx[NFRAG_W];
             if (kt + 1 < k_sub) {
                 const int ko = (kt + 1) * WMMA_DIM;
                 a_nx = *reinterpret_cast<const typename MMA::AFrag*>(&A_tile[a_base + ko]);
                 #pragma unroll
-                for (int f = 0; f < NFRAG; ++f)
+                for (int f = 0; f < NFRAG_W; ++f)
                     b_nx[f] = *reinterpret_cast<const typename MMA::BFrag*>(
-                        &B_tile[b_base + f * WMMA_DIM * LDSBK + ko]);
+                        &B_tile[b_base + (nfrag0 + f) * WMMA_DIM * LDSBK + ko]);
             }
             #pragma unroll
-            for (int f = 0; f < NFRAG; ++f)
+            for (int f = 0; f < NFRAG_W; ++f)
                 acc[f] = MMA::mma(a_cur, b_cur[f], acc[f]);
             a_cur = a_nx;
             #pragma unroll
-            for (int f = 0; f < NFRAG; ++f) b_cur[f] = b_nx[f];
+            for (int f = 0; f < NFRAG_W; ++f) b_cur[f] = b_nx[f];
         }
 
         #pragma unroll
-        for (int f = 0; f < NFRAG; ++f) {
-            const int abs_n = block_n + f * WMMA_DIM + frag_col;
+        for (int f = 0; f < NFRAG_W; ++f) {
+            const int abs_n = block_n + (nfrag0 + f) * WMMA_DIM + frag_col;
             const float wsc = (abs_n < N)
                 ? __half2float(w_scales[abs_n * num_k_groups + g]) : 0.0f;
             #pragma unroll
@@ -176,13 +184,13 @@ __global__ void __launch_bounds__((BM / 16) * 32) gemm_tiled_kernel(
 
     #pragma unroll
     for (int e = 0; e < 8; ++e) {
-        const int lrow_m = warp_id * WMMA_DIM + frag_row0 + e;   // row within block
+        const int lrow_m = warp_m * WMMA_DIM + frag_row0 + e;   // row within block
         const int abs_m = block_m + lrow_m;
         if (abs_m >= M) continue;
         const float asc = act_scale_s[lrow_m];   // fused per-row act scale
         #pragma unroll
-        for (int f = 0; f < NFRAG; ++f) {
-            const int abs_n = block_n + f * WMMA_DIM + frag_col;
+        for (int f = 0; f < NFRAG_W; ++f) {
+            const int abs_n = block_n + (nfrag0 + f) * WMMA_DIM + frag_col;
             if (abs_n < N) out[abs_m * N + abs_n] = __float2half(running[f][e] * asc);
         }
     }

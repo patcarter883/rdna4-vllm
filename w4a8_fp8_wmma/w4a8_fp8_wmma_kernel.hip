@@ -2907,13 +2907,31 @@ void launch_mmq_fp8_gemm_gfx1201(
         // (tiled TileConfig is the served path moving forward); opt OUT with
         // VLLM_W4A8_DENSE_TILED_OFF to fall back to the standalone v5 kernel.
         if (std::getenv("VLLM_W4A8_DENSE_TILED_OFF") == nullptr) {
-            gemm_tiled_kernel<DenseWmmaFp8, V2_BM, V2_BN><<<grid, block, 0, stream>>>(
-                x_h,
-                w_packed.data_ptr<int>(),
-                reinterpret_cast<const __half*>(scales.data_ptr<at::Half>()),
-                w_zeros_ptr,
-                reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
-                M, N, K, group_size, weight_is_e2m1);
+            // BM=256 amortizes weight reuse at large M, but wastes ~BM/M of its rows on padding
+            // when M is small (grid.y=1, most rows masked). Small-M -> a BM=64 tile with WARPS_N=2
+            // (8 warps, 256 thr, NFRAG_W=2 -> low register pressure) gives a real grid (ceil(M/64)
+            // row-blocks) and full WGP occupancy. Bit-exact to BM=256 (same per-element math); the
+            // VLLM_W4A8_DENSE_SMALLM_OFF env reverts to the single BM=256 path.
+            if (M < 128 && std::getenv("VLLM_W4A8_DENSE_SMALLM_OFF") == nullptr) {
+                constexpr int SBM = 64, SWN = 2;
+                dim3 sblock((SBM / 16) * SWN * 32);
+                dim3 sgrid((N + V2_BN - 1) / V2_BN, (M + SBM - 1) / SBM);
+                gemm_tiled_kernel<DenseWmmaFp8, SBM, V2_BN, SWN><<<sgrid, sblock, 0, stream>>>(
+                    x_h,
+                    w_packed.data_ptr<int>(),
+                    reinterpret_cast<const __half*>(scales.data_ptr<at::Half>()),
+                    w_zeros_ptr,
+                    reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
+                    M, N, K, group_size, weight_is_e2m1);
+            } else {
+                gemm_tiled_kernel<DenseWmmaFp8, V2_BM, V2_BN, 1><<<grid, block, 0, stream>>>(
+                    x_h,
+                    w_packed.data_ptr<int>(),
+                    reinterpret_cast<const __half*>(scales.data_ptr<at::Half>()),
+                    w_zeros_ptr,
+                    reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
+                    M, N, K, group_size, weight_is_e2m1);
+            }
         } else {
             mmq_fp8_gemm_kernel_v5<<<grid, block, 0, stream>>>(
                 x_h,
