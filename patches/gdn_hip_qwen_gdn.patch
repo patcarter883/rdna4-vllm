@@ -1,0 +1,183 @@
+--- a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
++++ b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+@@ -82,6 +82,43 @@
+ 
+ logger = init_logger(__name__)
+ 
++# --- gdn_hip: native HIP GDN ops (gfx1201) ---------------------------------------------------
++# When VLLM_GDN_HIP=1 the Qwen GDN linear-attention compute (conv1d + gated-delta-rule +
++# gated RMSNorm) is routed through torch.ops.gdn_hip.* instead of the fla-Triton kernels, so the
++# layer never JIT/autotunes a Triton kernel (mirrors the zaya_cca integration). The ops are
++# AOT-compiled once for gfx1201 and registered (with fake/meta impls) on import. fp32 at the op
++# boundary: the recurrent state (conv_state + ssm_state) must be fp32 — forced in
++# MambaStateDtypeCalculator.gated_delta_net_state_dtype when this flag is on.
++import os as _os
++
++VLLM_GDN_HIP = _os.environ.get("VLLM_GDN_HIP", "0") == "1"
++# WMMA matrix-core chunked prefill is the default GDN prefill when gdn_hip is on (4.8-5.9x faster
++# than the scalar recurrent prefill); set VLLM_GDN_HIP_RECURRENT_ONLY=1 to force the recurrent path.
++VLLM_GDN_HIP_RECURRENT_ONLY = _os.environ.get("VLLM_GDN_HIP_RECURRENT_ONLY", "0") == "1"
++
++
++def _gdn_select_prefill(layer):
++    """Pick the GDN prefill op: WMMA matrix-core chunked prefill (4.8-5.9x faster) for 128-dim
++    Qwen3.5/3.6 GDN heads, else the scalar recurrent prefill (also forced by
++    VLLM_GDN_HIP_RECURRENT_ONLY=1). Both share the fp32 op boundary and the same state cache."""
++    if (not VLLM_GDN_HIP_RECURRENT_ONLY
++            and getattr(layer, "head_k_dim", 0) == 128
++            and getattr(layer, "head_v_dim", 0) == 128):
++        return torch.ops.gdn_hip.gdn_prefill_wmma
++    return torch.ops.gdn_hip.gdn_prefill
++_GDN_HIP = None
++if VLLM_GDN_HIP:
++    try:
++        from vllm.model_executor.layers.mamba.gdn_hip import op as _GDN_HIP  # noqa: F401
++
++        logger.info_once("Qwen GDN: native HIP gdn_hip ops ENABLED (no Triton JIT on the GDN path).")
++    except Exception:  # pragma: no cover - build/load failure -> fall back to fla-Triton
++        _GDN_HIP = None
++        logger.warning(
++            "VLLM_GDN_HIP=1 but gdn_hip failed to import; falling back to the fla-Triton GDN path.",
++            exc_info=True,
++        )
++
+ 
+ # TODO(arpera): remove ``_is_libs_cu13_install_intact`` and its caller in
+ # ``_resolve_gdn_prefill_backend`` once the upstream packaging bug is
+@@ -1284,6 +1321,18 @@
+         attn_metadata = attn_metadata_raw[self.prefix]  # type: ignore[index]
+         assert isinstance(attn_metadata, GDNAttentionMetadata)
+ 
++        # gdn_hip native path: route the non-spec prefill/decode GDN compute through the AOT HIP
++        # ops (no Triton JIT). Spec-decode (multi-query-per-seq) keeps the fla-Triton path — the
++        # gdn_hip ops are single-token-per-seq decode / varlen-recurrent prefill only.
++        if _GDN_HIP is not None and attn_metadata.spec_sequence_masks is None:
++            return self._forward_core_gdn_hip(
++                mixed_qkv=mixed_qkv,
++                b=b,
++                a=a,
++                core_attn_out=core_attn_out,
++                attn_metadata=attn_metadata,
++            )
++
+         if (
+             self.enable_packed_recurrent_decode
+             and attn_metadata.spec_sequence_masks is None
+@@ -1589,6 +1638,117 @@
+             core_attn_out=core_attn_out.reshape(-1),
+         )
+ 
++    def _forward_core_gdn_hip(
++        self,
++        mixed_qkv: torch.Tensor,
++        b: torch.Tensor,
++        a: torch.Tensor,
++        core_attn_out: torch.Tensor,
++        attn_metadata: GDNAttentionMetadata,
++    ):
++        """Native-HIP GDN core (no Triton JIT). Mirrors the fla-Triton ``_forward_core`` non-spec
++        path exactly — conv1d + gated-delta-rule + the gated RMSNorm output — but every op is an
++        AOT-compiled ``torch.ops.gdn_hip.*`` kernel. fp32 at the op boundary: the conv/ssm state
++        are fp32 (forced in gated_delta_net_state_dtype when VLLM_GDN_HIP=1) and the bf16
++        activations are cast ``.float()`` here; ``core_attn_out`` is written back in the layer
++        dtype by the caller's output projection.
++
++        Drops ``fused_post_conv_prep`` + ``l2norm_fwd``: the gdn_hip recurrence folds the q/k
++        L2-norm and the g/beta (softplus/sigmoid) computation in, consuming raw ``a, b``.
++        """
++        non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc
++        non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor  # noqa: E501
++        has_initial_state = attn_metadata.has_initial_state
++        self_kv_cache = self.kv_cache
++        # conv_state must be (..., dim, width-1) for the conv kernels (DS layout); SD needs a
++        # transpose. gdn_hip's conv kernels take that [slots, C, W-1] layout directly.
++        conv_state = (
++            self_kv_cache[0]
++            if is_conv_state_dim_first()
++            else self_kv_cache[0].transpose(-1, -2)
++        )
++        ssm_state = self_kv_cache[1]
++
++        # The gdn_hip kernels index state with hard-coded contiguous strides
++        # ([slots, C, W-1] / [slots, HV, V, K]); vLLM's mamba cache tensor is paged, so the
++        # per-layer state view is generally NON-contiguous (the SD->DS transpose, or a leading
++        # block dim). Run the kernels on a contiguous shadow and copy the in-place mutation back
++        # into the real cache so cross-step state persists. (The fla-Triton kernels accept the
++        # strided view directly; gdn_hip trades that for zero Triton JIT.)
++        conv_state_k = conv_state if conv_state.is_contiguous() else conv_state.contiguous()
++        ssm_state_k = ssm_state if ssm_state.is_contiguous() else ssm_state.contiguous()
++
++        num_actual_tokens = attn_metadata.num_actual_tokens
++
++        mixed_qkv = mixed_qkv[:num_actual_tokens]
++        b = b[:num_actual_tokens]
++        a = a[:num_actual_tokens]
++
++        conv_weights = self.conv1d.weight.view(
++            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
++        ).float()
++        state_indices = non_spec_state_indices_tensor[:num_actual_tokens].long()  # type: ignore[index]
++        scale = self.head_k_dim**-0.5
++        x = mixed_qkv.float().contiguous()
++        # A_log is fp32 by construction; dt_bias defaults fp32 but the loader may cast it to the
++        # model dtype — float() both so the fp32 gdn_hip kernels never see a bf16 input.
++        A_log = self.A_log.float()
++        dt_bias = self.dt_bias.float()
++
++        n_k = self.num_k_heads // self.tp_size
++        n_v = self.num_v_heads // self.tp_size
++
++        def _split_conv_qkv(conv_out: torch.Tensor):
++            q, k, v = conv_out.split(
++                [self.key_dim // self.tp_size,
++                 self.key_dim // self.tp_size,
++                 self.value_dim // self.tp_size],
++                dim=-1,
++            )
++            q = q.reshape(-1, n_k, self.head_k_dim).contiguous()
++            k = k.reshape(-1, n_k, self.head_k_dim).contiguous()
++            v = v.reshape(-1, n_v, self.head_v_dim).contiguous()
++            return q, k, v
++
++        if attn_metadata.num_prefills > 0:
++            # Varlen recurrent path (covers any decode-len-1 seqs in the same batch via cu_seqlens).
++            assert has_initial_state is not None
++            conv_out = torch.ops.gdn_hip.causal_conv1d_fwd(
++                x,
++                conv_weights,
++                None,
++                non_spec_query_start_loc,  # cu_seqlens int32
++                state_indices,
++                has_initial_state.to(torch.uint8),
++                conv_state_k,
++                1,  # SiLU
++            )
++            q, k, v = _split_conv_qkv(conv_out)
++            core = _gdn_select_prefill(self)(
++                q, k, v, a.float(), b.float(), A_log, dt_bias,
++                non_spec_query_start_loc, state_indices,
++                has_initial_state.to(torch.uint8), ssm_state_k, scale, 1,
++            )
++        else:
++            # Pure single-token-per-seq decode.
++            conv_out = torch.ops.gdn_hip.causal_conv1d_update(
++                x, conv_weights, None, conv_state_k, state_indices, 1,
++            )
++            q, k, v = _split_conv_qkv(conv_out)
++            core = torch.ops.gdn_hip.gdn_decode(
++                q, k, v, a.float(), b.float(), A_log, dt_bias,
++                ssm_state_k, state_indices, scale, 1,
++            )
++
++        # Copy the kernel's in-place state mutation back into the (possibly non-contiguous) cache.
++        if conv_state_k.data_ptr() != conv_state.data_ptr():
++            conv_state.copy_(conv_state_k)
++        if ssm_state_k.data_ptr() != ssm_state.data_ptr():
++            ssm_state.copy_(ssm_state_k)
++
++        core_attn_out[:num_actual_tokens] = core.to(core_attn_out.dtype)
++        return
++
+     def _forward_core_decode_non_spec(
+         self,
+         mixed_qkv: torch.Tensor,
