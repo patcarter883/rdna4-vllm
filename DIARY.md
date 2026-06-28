@@ -1087,3 +1087,65 @@ route GDN through the same fla recurrence): build one `.so`, call `torch.ops.gdn
   remaining throughput lever is a **WMMA/matrix-core chunked prefill** (the intra-chunk KK/KQ/solve
   matmuls); that, plus deleting the now-unused Triton GDN tree and a bf16-native state, is the
   open work.
+
+## Act XXII — the metrics stack and cloud-lease: infrastructure for runs the box can't hold
+
+Two pieces of plumbing landed on `main`, both CPU-only and both born of a loss. The first: we lost an
+all-day Laguna run's telemetry because vLLM's `/metrics` counters live *inside* the serve process and
+die with it — a removed container takes its logs too. So a **local Prometheus + Grafana stack**
+(`docker compose --profile monitoring up -d`, **no** GPU lease) now polls the host serve ports
+(8000/8001) and retains the series in a named volume (30-day retention). It is fully decoupled from the
+leased serve — start it once, leave it up, and it auto-captures every serve that comes and goes;
+Prometheus on `:9090`, a baked-in Grafana dashboard (throughput, TTFT/ITL, KV-cache, spec-decode
+acceptance) on `:3000`. The rule that fell out of this: *whenever you serve for real inference work,
+have the monitoring stack running* — query the TSDB after the fact, never the live `/metrics` or
+`docker logs`, which are gone the moment the serve stops.
+
+The second: **`cloud-lease`**, the cloud sibling of `gpu-lease` (`scripts/cloud-lease.sh`,
+`scripts/cloud_lease/`). The whole stack is *permanently local* — no cloud has gfx1201 — but the
+moment a workstream needed to *train* something that won't fit two 16 GB consumer cards (the TiDAR
+conversion below), we needed a way to rent a big box without inventing a bespoke launcher each time.
+`cloud-lease` provisions a cloud GPU (Vultr / RunPod, including **ROCm MI300X**, 192 GB), rsyncs the
+repo over, runs a command, and tears the box down on exit — the same *the-lock-is-the-process* model as
+`gpu-lease`, so a crash or Ctrl-C reaps the box instead of leaving it billing. The hardening all came
+from one real run drawing blood (Act XXIII): `--env NAME` writes a secret (`HF_TOKEN`) to a mode-600
+remote file over stdin so it never touches argv/`ps`; `--restart-on-crash N` relaunches the command so
+a trainer resumes from its box-local checkpoint; `--setup-timeout` fails a **wedged/dud pod** (we drew
+one whose GPU driver hung in `kfd_create_process` — six minutes of zero activity) instead of billing
+forever on a no-timeout `ssh.run`; `ssh.run_detached` survives a transient SSH drop. 20/20 tests.
+
+## Act XXIII — TiDAR: converting ZAYA1-8B to a diffusion model, and the experts lever
+
+The diffusion-spec thread (Act XIX) kept teaching the same lesson — *whether the drafter's distribution
+survives is the whole game* — and Zyphra answered it for us by shipping **ZAYA1-8B-Diffusion**. So the
+bet flipped from "train a drafter" to **convert ZAYA itself to TiDAR** (arXiv 2511.08923), which fuses a
+diffusion drafter and an AR verifier into a *single* forward: one model, draft-and-verify in one pass.
+This is the second *training* workstream here (after Titans), split across two worktrees —
+`feat/tidar-convert` (the conversion training) and `feat/tidar-serve` (wiring the fused path into the
+RDNA4 serve).
+
+The conversion objective is model-agnostic and built CPU-first (and CPU-tested): a **doubled
+`[clean | all-mask]` sequence**, the clean half trained AR-causal, the masked half trained as a
+**one-step block-bidirectional diffusion** denoise, combined as `1/(1+α)·[α·AR + Diff]` with `α=1`.
+The result is a ladder where *every rung helped*, and one rung dominated:
+
+| run | vehicle / data | diffusion acc | where |
+|---|---|---|---|
+| LoRA attn | param-efficient, wikitext-2 | 0.089 | A100 |
+| full-FT attn | attention unfrozen, wikitext-2 | 0.193 | A100 |
+| full-FT attn | +100× data (wikitext-103) | 0.213 | H100 (plateau) |
+| **full-FT ALL** | **+ MoE experts unfrozen** | **0.254** (1000 steps, converged) | MI300X |
+
+`0.089 → 0.254`, and the verdict is emphatic: **unfreezing the MoE experts is the biggest remaining
+lever** (the AR head rises with it too, 0.36 → 0.485). The full-FT-all run is the one that needed
+`cloud-lease` — an 8.84B-param full fine-tune doesn't fit the local 2×16 GB box, so it ran on a 192 GB
+**MI300X** (batch 64, `--no-device-map`, steady 70% VRAM with ~96% peaks on the 262k-vocab logit spike;
+batch 128 HSA-aborts on the longest-prefix step). The converged model is published to HF at
+**`pat883/zaya1-8b-tidar-experts`**.
+
+The run also *paid for* Act XXII's hardening by hitting every failure mode in sequence: a hardware-dud
+pod (→ `--setup-timeout`), a transient SSH drop (→ `run_detached` reconnect), and the keeper — a
+**read-only `HF_TOKEN`** that passed early validation and 403'd at push time *after* the full training
+run. The fix is a `create_repo` **pre-flight** the instant `--push-to-hub` is set, so a bad token aborts
+in seconds before any GPU time. **Next:** the serving half (`feat/tidar-serve`) consumes this checkpoint
+— diffusion-draft + AR-verify in one forward on the RDNA4 stack.

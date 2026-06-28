@@ -14,6 +14,10 @@ wheels/
 w4a8_fp8_wmma/build/
 w4a8_fp8_wmma/**/*.so
 w4a8_fp8_wmma/**/*.o
+# hipify-generated CUDA->HIP translations of the tracked kernel sources (build artifacts)
+w4a8_fp8_wmma/**/*_hip.cpp
+w4a8_fp8_wmma/**/*_hip.h
+w4a8_fp8_wmma/**/*_hip.hip
 **/__pycache__/
 *.egg-info/
 

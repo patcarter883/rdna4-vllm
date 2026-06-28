@@ -278,10 +278,28 @@ docker compose --profile zaya --profile rsa up
 
 ---
 
+## Observability & cloud training (landed on `main`)
+
+Two pieces of dev-infrastructure now ship on `main`, both CPU-only and decoupled from the GPU lease:
+
+- **Local metrics capture** (`docker compose --profile monitoring up -d` — **no** GPU lease). vLLM's
+  `/metrics` counters live in the serve process and vanish when it stops; a CPU-only Prometheus +
+  Grafana stack polls the host serve ports (8000/8001) and retains the series in a named volume
+  (30-day retention), so it auto-captures every serve that comes and goes. Start it once and leave it
+  up. Prometheus on `:9090`; a baked-in Grafana dashboard (throughput / TTFT-ITL / KV-cache /
+  spec-decode panels) on `:3000`. See the metrics-capture section in [`CLAUDE.md`](CLAUDE.md).
+- **`cloud-lease` — the cloud sibling of `gpu-lease`** (`scripts/cloud-lease.sh`). Provisions a cloud
+  GPU box (Vultr / RunPod, including **ROCm MI300X**), rsyncs the repo over, runs a command, and tears
+  the box down on exit — the same lock-is-the-process model as `gpu-lease`, for work that won't fit two
+  16 GB consumer cards (a from-scratch or full-fine-tune training run). Hardened for real runs: `--env`
+  keeps a secret (`HF_TOKEN`) off the argv/`ps`, `--restart-on-crash` resumes from a box-local
+  checkpoint, `--setup-timeout` fails a wedged/dud pod instead of billing forever. This is what drove
+  the TiDAR experts run below.
+
 ## In flight (feature branches, not on `main` yet)
 
-Three workstreams are live on their own worktrees; each has a fuller write-up in [`DIARY.md`](DIARY.md)
-(Acts XIX–XXI). Summary of where they stand:
+Four workstreams are live on their own worktrees; each has a fuller write-up in [`DIARY.md`](DIARY.md)
+(Acts XIX–XXIII). Summary of where they stand:
 
 - **DFlash speculative decoding** (`feat/dflash-spec`, `feat/zaya-dflash`). The infrastructure works —
   a non-causal `TRITON_ATTN` patch (`patches/dflash_triton_noncausal/`, the `vllm22-w4a8:dflash`
@@ -298,6 +316,16 @@ Three workstreams are live on their own worktrees; each has a fuller write-up in
   compile cliff goes away** (compile once, run any shape). Numeric parity ≤ ~1e-7; serves 4B TP1/TP2
   and 35B TP2 coherently. Gated `WITH_GDN_HIP` / `VLLM_GDN_HIP=1` (default off). Open work: a
   WMMA chunked-prefill path (the recurrent one is correct but ~4× slower than a matrix-core form).
+- **TiDAR — converting ZAYA1-8B to a diffusion model** (`feat/tidar-convert`, `feat/tidar-serve`,
+  arXiv 2511.08923). TiDAR fuses a diffusion drafter and an AR verifier into one forward; since Zyphra
+  shipped ZAYA1-8B-Diffusion, the bet is *convert-and-serve* rather than train-from-scratch. The
+  conversion half trains the TiDAR objective (a doubled `[clean | all-mask]` sequence — AR-causal plus a
+  one-step block-bidirectional diffusion loss) on ZAYA: a four-rung ladder (LoRA → full-FT attention →
+  +100× data → **+experts unfrozen**) lifted diffusion accuracy `0.089 → 0.254`, with **unfreezing the
+  MoE experts the emphatic biggest lever**. The converged full-FT-all model trained on an **MI300X via
+  `cloud-lease`** and is published on HF at `pat883/zaya1-8b-tidar-experts`. The serving half
+  (`feat/tidar-serve`) wires the diffusion-draft + AR-verify path into the RDNA4 stack and picks up that
+  checkpoint next.
 
 ---
 
