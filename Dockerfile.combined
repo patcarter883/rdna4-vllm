@@ -147,7 +147,14 @@ RUN set -eu; \
 # runtime is itself gated by VLLM_GDN_HIP (default 0), so even a built image is a no-op until the
 # env is set. Spec-decode keeps the fla-Triton path (gdn_hip is single-token decode / varlen
 # recurrent prefill only); the recurrent prefill trades long-context throughput for zero compiles.
-ARG WITH_GDN_HIP=0
+# DEFAULT ON (validated: WMMA matrix-core chunked prefill 2.18x + parity max|d| 1e-4 vs recurrent
+# oracle). Runtime defaults VLLM_GDN_HIP=1 (ENV below) with the WMMA prefill engaged.
+# ⚠ POWER SAFETY: the WMMA prefill saturates the matrix engine and the RDNA4 power controller cannot
+# damp the di/dt — a transient overshoot (~500W on a 374W cap) was observed. A power cap ALONE is
+# insufficient; you MUST also set a negative GPU clock offset (RDNA4 lacks RDNA3.5's power-ramp-speed
+# control). See patches/POWER_SAFETY.md before serving. Force the low-power scalar recurrent prefill
+# with VLLM_GDN_HIP_RECURRENT_ONLY=1; build --build-arg WITH_GDN_HIP=0 for a leaner W4A8-only image.
+ARG WITH_GDN_HIP=1
 COPY gdn_hip/ /tmp/gdn_hip_pkg/
 COPY patches/gdn_hip_qwen_gdn.patch patches/gdn_hip_state_dtype.patch /tmp/gdn_hip_patches/
 RUN set -eu; \
@@ -165,8 +172,41 @@ RUN set -eu; \
         patch -p1 < /tmp/gdn_hip_patches/gdn_hip_qwen_gdn.patch; \
         patch -p1 < /tmp/gdn_hip_patches/gdn_hip_state_dtype.patch; \
       python -c 'import ast; [ast.parse(open(f).read()) for f in ["/app/vllm/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py", "/app/vllm/vllm/model_executor/layers/mamba/mamba_utils.py"]]; print("[combined] gdn_hip overlay + patched files parse OK")'; \
-      echo "[combined] gdn_hip applied (set VLLM_GDN_HIP=1 at runtime to engage; default off)"; \
+      echo "[combined] gdn_hip applied (VLLM_GDN_HIP defaults 1; WMMA prefill on)"; \
     else echo "[combined] gdn_hip slot present but disabled (build --build-arg WITH_GDN_HIP=1 to enable)"; fi; \
     rm -rf /tmp/gdn_hip_pkg /tmp/gdn_hip_patches
+
+# --- 6. (DEFAULT ON) Native HIP attention (attn_decode + attn_prefill_paged) — Triton-free serving ---
+# Wires native gfx1201 HIP flash-decode + paged/chunked prefill (+fp8-KV) into vLLM's triton_attn
+# backend via an anchor-based idempotent patch (apply_vllm_patch.py), behind VLLM_ATTN_DECODE_HIP
+# (default 1 in ENV below). Bails safely to Triton for unsupported head_size/alibi/sinks/quant, so it
+# is a no-op for models it can't accelerate. Validated: ROUTED decode+prefill, 4/6 greedy token-diff.
+# ⚠ POWER SAFETY: the paged-prefill kernel is rocWMMA matrix-core work — same di/dt overshoot caveat
+# as the GDN WMMA prefill (see patches/POWER_SAFETY.md). Build --build-arg WITH_ATTN_HIP=0 to omit.
+ARG WITH_ATTN_HIP=1
+COPY attn_decode /tmp/attn_hip_pkg/attn_decode
+COPY attn_prefill_paged /tmp/attn_hip_pkg/attn_prefill_paged
+RUN set -eu; \
+    if [ "$WITH_ATTN_HIP" = "1" ]; then \
+      . /app/.venv/bin/activate; \
+      export PATH="/opt/rocm-7.2.1/lib/llvm/bin:/opt/rocm-7.2.1/bin:${PATH}"; \
+      L=/app/vllm/vllm/model_executor/layers; \
+      cp -r /tmp/attn_hip_pkg/attn_decode "$L"/attn_decode; \
+      cp -r /tmp/attn_hip_pkg/attn_prefill_paged "$L"/attn_prefill_paged; \
+      for d in attn_decode attn_prefill_paged; do \
+        cd "$L"/$d; rm -rf build *.egg-info; find . -name '*.so' -delete; find . -name '*_hip.*' -delete; \
+        GPU_ARCHS=gfx1201 python setup.py build_ext --inplace; \
+      done; \
+      cd "$L"/attn_decode; python apply_vllm_patch.py; \
+      python -c 'import ast, os, vllm; p=os.path.join(os.path.dirname(vllm.__file__), "v1/attention/backends/triton_attn.py"); ast.parse(open(p).read()); print("[combined] attn_hip overlay + triton_attn.py parses OK")'; \
+      echo "[combined] attn_hip applied (VLLM_ATTN_DECODE_HIP defaults 1)"; \
+    else echo "[combined] attn_hip slot present but disabled (build --build-arg WITH_ATTN_HIP=1 to enable)"; fi; \
+    rm -rf /tmp/attn_hip_pkg
+
+# Native HIP serve-path defaults ON (gfx1201 Triton-free). Override per-run to fall back to Triton:
+#   VLLM_GDN_HIP=0  VLLM_ATTN_DECODE_HIP=0   (or VLLM_GDN_HIP_RECURRENT_ONLY=1 for low-power prefill).
+# ⚠ Read patches/POWER_SAFETY.md and apply the power cap + negative GPU clock offset before serving.
+ENV VLLM_GDN_HIP=1 \
+    VLLM_ATTN_DECODE_HIP=1
 
 # Entry point inherited from the base (its tuned-attention vLLM launcher: `vllm serve "$@"`).

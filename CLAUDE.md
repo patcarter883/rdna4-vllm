@@ -75,6 +75,12 @@ Rules:
   so a non-leased `docker compose` call is unchanged. **Don't hand-set `HIP_VISIBLE_DEVICES`/ports
   for a leased run — gpu-lease owns them.**
 - CPU-only work (builds, static analysis, editing) needs no lease.
+- **⚠ POWER SAFETY (MANDATORY for the default `:combined`).** It now defaults the native HIP serve
+  path on (`VLLM_GDN_HIP=1`, `VLLM_ATTN_DECODE_HIP=1`); the GDN + attention **WMMA prefill** kernels
+  saturate the matrix engine and RDNA4 can't damp the di/dt (a ~500W transient on a 374W cap was
+  seen). A power cap **alone is insufficient** — you MUST also set a **negative GPU clock offset**
+  (RDNA4 lacks RDNA3.5's power-ramp-speed control). Apply both per `patches/POWER_SAFETY.md` before
+  serving, or fall back at runtime: `VLLM_GDN_HIP_RECURRENT_ONLY=1` + `VLLM_ATTN_DECODE_HIP=0`.
 
 ## Container testing protocol (MANDATORY)
 
