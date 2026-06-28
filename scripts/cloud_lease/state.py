@@ -54,11 +54,21 @@ def all_records():
 
 def pid_alive(pid):
     """True if `pid` is a live process. kill(pid, 0): no error => alive (ours),
-    PermissionError => alive (not ours), ProcessLookupError => dead."""
+    PermissionError => alive (not ours), ProcessLookupError => dead.
+
+    Guard non-positive pids FIRST: a corrupt/missing-pid record yields pid<=0, and
+    os.kill(0/-1, 0) targets the whole process group (always 'succeeds') — which would
+    misclassify a real orphan as alive and skip reaping it. Treat those as dead."""
     try:
-        os.kill(int(pid), 0)
+        pid = int(pid)
+    except (ValueError, TypeError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
         return True
     except PermissionError:
         return True
-    except (ProcessLookupError, ValueError, TypeError):
+    except ProcessLookupError:
         return False

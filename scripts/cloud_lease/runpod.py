@@ -10,11 +10,13 @@ import time
 
 from . import http
 from .backend import Backend, Instance
-from .config import LABEL_PREFIX
 from .gpu_map import runpod_gpu
 
 API = "https://rest.runpod.io/v1"
 _IMAGE = "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04"
+# Terminal states a pod can land in instead of coming up (e.g. unplaceable / preempted spot pod).
+# wait_ready must bail on these immediately rather than spin to provision_timeout while billing.
+_TERMINAL = {"EXITED", "TERMINATED", "FAILED", "DEAD"}
 
 
 class RunPodBackend(Backend):
@@ -34,9 +36,7 @@ class RunPodBackend(Backend):
             "ports": ["22/tcp"],
             "env": {"PUBLIC_KEY": sshkey_pub},
         }
-        st, resp = http.request("POST", f"{API}/pods", self.token, body)
-        if st >= 300:
-            raise RuntimeError(f"runpod provision failed [{st}]: {resp}")
+        st, resp = http.request_ok("POST", f"{API}/pods", self.token, body)
         return resp["id"]
 
     @staticmethod
@@ -55,7 +55,11 @@ class RunPodBackend(Backend):
         deadline = time.time() + timeout
         while time.time() < deadline:
             st, pod = http.request("GET", f"{API}/pods/{instance_id}", self.token)
-            if str(pod.get("desiredStatus") or pod.get("status")).upper() == "RUNNING":
+            status = str(pod.get("desiredStatus") or pod.get("status") or "").upper()
+            if status in _TERMINAL:
+                raise RuntimeError(f"runpod pod {instance_id} entered terminal state "
+                                   f"'{status}' before becoming reachable (preempted/unplaceable?)")
+            if status == "RUNNING":
                 host, port = self._ssh_endpoint(pod)
                 if host:
                     return Instance(id=instance_id, ssh_host=host, ssh_port=port,
@@ -64,16 +68,14 @@ class RunPodBackend(Backend):
         raise TimeoutError(f"runpod pod {instance_id} not ready (or no SSH port) in {timeout}s")
 
     def destroy(self, instance_id):
-        st, _ = http.request("DELETE", f"{API}/pods/{instance_id}", self.token)
-        if st not in (200, 204, 404):
-            raise RuntimeError(f"runpod destroy {instance_id} returned [{st}]")
+        http.request_ok("DELETE", f"{API}/pods/{instance_id}", self.token, ok=(200, 204, 404))
 
     def list_live(self):
         st, resp = http.request("GET", f"{API}/pods", self.token)
         pods = resp if isinstance(resp, list) else resp.get("pods", [])
         out = []
         for p in pods:
-            if not str(p.get("name", "")).startswith(LABEL_PREFIX):
+            if not self._owned(p.get("name")):
                 continue
             host, _ = self._ssh_endpoint(p)
             out.append({"id": p.get("id"), "label": p.get("name", ""),

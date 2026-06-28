@@ -26,10 +26,12 @@ def _ssh_e(inst):
     return "ssh -p %d %s" % (inst.ssh_port, " ".join(_OPTS))
 
 
-def run(inst, command, check=True, quiet=False):
-    """Run a one-shot command on the instance (captured/quiet)."""
+def run(inst, command, check=True, quiet=False, timeout=None):
+    """Run a one-shot command on the instance (captured/quiet). `timeout` (seconds) bounds the
+    whole command — without it a wedged remote (held apt lock, dead mirror) can hang the lease
+    indefinitely on a billing box."""
     cmd = ["ssh", "-p", str(inst.ssh_port), *_OPTS, _target(inst), f"bash -lc {shlex.quote(command)}"]
-    kw = {"check": check}
+    kw = {"check": check, "timeout": timeout}
     if quiet:
         kw["stdout"] = subprocess.DEVNULL
         kw["stderr"] = subprocess.DEVNULL
@@ -43,11 +45,14 @@ def run_stream(inst, command):
     return subprocess.run(cmd)
 
 
-def rsync_up(inst, local, remote, excludes=()):
+def rsync_up(inst, local, remote, excludes=(), delete=True):
+    """Push local -> remote. `delete=True` mirrors (removes remote files absent locally) — correct
+    for the code/dataset push to a fresh dir, but DANGEROUS for a checkpoint restore into a
+    possibly pre-seeded remote dir, so callers restoring pass delete=False."""
     ex = []
     for x in excludes:
         ex += ["--exclude", x]
-    cmd = ["rsync", "-az", "--delete", *ex, "-e", _ssh_e(inst),
+    cmd = ["rsync", "-az", *(["--delete"] if delete else []), *ex, "-e", _ssh_e(inst),
            local.rstrip("/") + "/", f"{_target(inst)}:{remote}"]
     return subprocess.run(cmd, check=True)
 

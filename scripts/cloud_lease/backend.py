@@ -7,6 +7,8 @@ the provider-specific control plane: create / poll / destroy / list.
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
+from .config import LABEL_PREFIX
+
 
 @dataclass
 class Instance:
@@ -38,4 +40,11 @@ class Backend(ABC):
     @abstractmethod
     def list_live(self) -> list:
         """Return [{id,label,gpu,ip,status}, ...] for cloud-lease-owned instances ONLY
-        (filtered by the LABEL_PREFIX), so unrelated account instances are never touched."""
+        (filtered via _owned()), so unrelated account instances are never touched."""
+
+    @staticmethod
+    def _owned(label) -> bool:
+        """The single chokepoint for the safety-critical ownership filter: an instance is
+        cloud-lease's iff its label/name carries the prefix. EVERY list_live MUST gate on this
+        so cloud-status --reap can never touch an unrelated account node."""
+        return str(label or "").startswith(LABEL_PREFIX)

@@ -9,7 +9,6 @@ import time
 
 from . import http
 from .backend import Backend, Instance
-from .config import LABEL_PREFIX
 from .gpu_map import vultr_plan
 
 API = "https://api.vultr.com/v2"
@@ -20,14 +19,12 @@ class VultrBackend(Backend):
     name = "vultr"
 
     def _sshkey_id(self, pub):
-        st, body = http.request("GET", f"{API}/ssh-keys?per_page=500", self.token)
+        st, body = http.request_ok("GET", f"{API}/ssh-keys?per_page=500", self.token)
         for k in body.get("ssh_keys", []):
             if k.get("ssh_key", "").strip() == pub.strip():
                 return k["id"]
-        st, body = http.request("POST", f"{API}/ssh-keys", self.token,
-                                 {"name": "cloud-lease", "ssh_key": pub})
-        if st >= 300:
-            raise RuntimeError(f"vultr ssh-key create failed [{st}]: {body}")
+        st, body = http.request_ok("POST", f"{API}/ssh-keys", self.token,
+                                   {"name": "cloud-lease", "ssh_key": pub})
         return body["ssh_key"]["id"]
 
     def provision(self, gpu, region, spot, label, sshkey_pub):
@@ -39,9 +36,7 @@ class VultrBackend(Backend):
             "label": label, "hostname": label,
             "sshkey_id": [key], "backups": "disabled",
         }
-        st, resp = http.request("POST", f"{API}/instances", self.token, body)
-        if st >= 300:
-            raise RuntimeError(f"vultr provision failed [{st}]: {resp}")
+        st, resp = http.request_ok("POST", f"{API}/instances", self.token, body)
         return resp["instance"]["id"]
 
     def wait_ready(self, instance_id, timeout):
@@ -58,15 +53,15 @@ class VultrBackend(Backend):
         raise TimeoutError(f"vultr instance {instance_id} not ready in {timeout}s")
 
     def destroy(self, instance_id):
-        st, _ = http.request("DELETE", f"{API}/instances/{instance_id}", self.token)
-        if st not in (204, 404):
-            raise RuntimeError(f"vultr destroy {instance_id} returned [{st}]")
+        # request_ok raises on status 0 (connection failure) too, so a transient blip surfaces
+        # as a retryable error to the caller's destroy-retry loop instead of being swallowed.
+        http.request_ok("DELETE", f"{API}/instances/{instance_id}", self.token, ok=(204, 404))
 
     def list_live(self):
         st, resp = http.request("GET", f"{API}/instances?per_page=500", self.token)
         out = []
         for i in resp.get("instances", []):
-            if not str(i.get("label", "")).startswith(LABEL_PREFIX):
+            if not self._owned(i.get("label")):
                 continue  # never surface unrelated account instances
             out.append({"id": i["id"], "label": i.get("label", ""),
                         "gpu": i.get("plan", ""), "ip": i.get("main_ip", ""),

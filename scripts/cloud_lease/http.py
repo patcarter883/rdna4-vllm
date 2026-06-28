@@ -30,3 +30,23 @@ def request(method, url, token=None, body=None, headers=None, timeout=30):
         return e.code, parsed
     except urllib.error.URLError as e:
         return 0, {"error": str(e)}
+
+
+class HttpError(RuntimeError):
+    """Raised by request_ok on a connection failure (status 0) or an unexpected status."""
+
+    def __init__(self, method, url, status, body):
+        self.status = status
+        self.body = body
+        super().__init__(f"{method} {url} -> [{status}] {body}")
+
+
+def request_ok(method, url, token=None, body=None, ok=range(200, 300), headers=None, timeout=30):
+    """Like request(), but RAISES HttpError on a connection-level failure (status 0, which a
+    plain `st >= 300` check silently passes) or any status outside `ok`. Use for control-plane
+    mutations (provision/destroy/key) that must fail loud; polls keep using request() so they
+    can tolerate-and-retry transient errors."""
+    st, resp = request(method, url, token, body, headers, timeout)
+    if st == 0 or st not in ok:
+        raise HttpError(method, url, st, resp)
+    return st, resp

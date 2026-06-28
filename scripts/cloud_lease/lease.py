@@ -10,10 +10,16 @@ skip it, which is exactly what cloud-status --reap exists to catch.
 import os
 import shlex
 import signal
+import subprocess
 import sys
 import threading
+import time
 
 from . import config, ssh, state
+
+# Signals we route into teardown, and block during teardown so they can't interrupt destroy().
+_CATCH = [s for s in (getattr(signal, "SIGINT", None), getattr(signal, "SIGTERM", None),
+                      getattr(signal, "SIGHUP", None)) if s is not None]
 
 
 def _log(msg):
@@ -30,30 +36,65 @@ class Lease:
         self.a = args
         self.instance = None
         self.instance_id = None
+        self.label = None
         self._stop = threading.Event()
         self._tore_down = False
 
     # --- teardown (idempotent) -----------------------------------------------------------------
     def _teardown(self):
-        if self._tore_down or self.instance_id is None:
+        if self._tore_down:
             return
         self._tore_down = True
-        iid = self.instance_id
-        a = self.a
-        if self.instance and a.checkpoint_dir and a.remote_out:
-            _log("final checkpoint sync-down (best-effort)…")
-            try:
-                ssh.rsync_down(self.instance, a.remote_out, a.checkpoint_dir, check=False)
-            except Exception as e:  # noqa: BLE001 — teardown must not raise past destroy
-                _log(f"WARN final sync failed: {e}")
-        _log(f"destroying instance {iid}…")
+        # Block the catchable signals so a second Ctrl-C / SIGTERM / SIGHUP can't unwind out of
+        # destroy() mid-call (the one action billing safety depends on). Best-effort on non-POSIX.
         try:
-            self.backend.destroy(iid)
-            state.remove(self.backend.name, iid)
-            _log(f"instance {iid} destroyed; lease released.")
+            signal.pthread_sigmask(signal.SIG_BLOCK, _CATCH)
+        except (AttributeError, ValueError, OSError):
+            pass
+        a = self.a
+        if self.instance_id is not None:
+            if self.instance and a.checkpoint_dir and a.remote_out:
+                _log("final checkpoint sync-down (best-effort)…")
+                try:
+                    ssh.rsync_down(self.instance, a.remote_out, a.checkpoint_dir, check=False)
+                except Exception as e:  # noqa: BLE001 — teardown must not raise past destroy
+                    _log(f"WARN final sync failed: {e}")
+            _log(f"destroying instance {self.instance_id}…")
+            self._destroy_with_retry(self.instance_id)
+        else:
+            # We have NO id — but a signal/crash mid-provision may have created a billing instance
+            # before provision() returned. Find it by our unique label and destroy it.
+            self._sweep_orphans_by_label()
+
+    def _destroy_with_retry(self, iid, attempts=4):
+        """Destroy is idempotent and billing-critical, so retry transient failures (a network
+        blip now surfaces as HttpError via request_ok rather than being silently swallowed)."""
+        for n in range(1, attempts + 1):
+            try:
+                self.backend.destroy(iid)
+                state.remove(self.backend.name, iid)
+                _log(f"instance {iid} destroyed; lease released.")
+                return True
+            except Exception as e:  # noqa: BLE001
+                _log(f"destroy attempt {n}/{attempts} failed: {e}")
+                if n < attempts:
+                    time.sleep(min(2 ** n, 15))
+        _log(f"WARN destroy FAILED after {attempts} attempts -> instance {iid} may still be "
+             f"BILLING. Run: cloud-status --reap")
+        return False
+
+    def _sweep_orphans_by_label(self):
+        if not self.label:
+            return
+        try:
+            live = self.backend.list_live()
         except Exception as e:  # noqa: BLE001
-            _log(f"WARN destroy FAILED: {e}")
-            _log(f"  -> the instance may still be BILLING. Run: cloud-status --reap")
+            _log(f"WARN orphan sweep could not list instances: {e} — run cloud-status --reap")
+            return
+        for inst in live:
+            if inst.get("label") == self.label:
+                _log(f"orphan sweep: leaked instance {inst.get('id')} ({self.label}) — destroying")
+                self._destroy_with_retry(inst.get("id"))
 
     # --- periodic checkpoint pull --------------------------------------------------------------
     def _sync_loop(self):
@@ -72,19 +113,22 @@ class Lease:
         def _on_signal(signum, _frame):
             _log(f"signal {signum} received — tearing down")
             raise KeyboardInterrupt
-        signal.signal(signal.SIGINT, _on_signal)
-        signal.signal(signal.SIGTERM, _on_signal)
+        for _sig in _CATCH:
+            signal.signal(_sig, _on_signal)
 
         pub = config.ensure_ssh_key()
         try:
-            label = config.LABEL_PREFIX + a.name   # all our instances carry the prefix so
-                                                   # cloud-status only ever sees/reaps ours
+            # Unique per-process label: carries LABEL_PREFIX (so cloud-status only ever
+            # sees/reaps ours) AND a pid suffix so the teardown orphan-sweep can pinpoint the
+            # instance THIS process created even if we never captured its id.
+            self.label = f"{config.LABEL_PREFIX}{a.name}-{os.getpid()}"
+            label = self.label
             _log(f"provisioning {a.gpu} on {self.backend.name}"
                  f"{' (spot)' if a.spot else ''} as '{label}'…")
             self.instance_id = self.backend.provision(a.gpu, a.region, a.spot, label, pub)
             state.write(self.backend.name, self.instance_id, gpu=a.gpu,
                         region=a.region or "", label=label, spot=a.spot,
-                        cmd=" ".join(a.command))
+                        cmd=shlex.join(a.command))
             _log(f"instance {self.instance_id} created; waiting for it to come up…")
             self.instance = self.backend.wait_ready(self.instance_id, a.provision_timeout)
             ssh.wait_ssh(self.instance, a.provision_timeout)
@@ -103,7 +147,9 @@ class Lease:
                 ssh.run(self.instance, f"mkdir -p {shlex.quote(a.remote_out)}", quiet=True)
                 if _nonempty_dir(a.checkpoint_dir):
                     _log("restoring checkpoint up to instance (resume)…")
-                    ssh.rsync_up(self.instance, a.checkpoint_dir, a.remote_out)
+                    # delete=False: never mirror-delete files already in remote_out (the image
+                    # may pre-seed it) — only add our checkpoint.
+                    ssh.rsync_up(self.instance, a.checkpoint_dir, a.remote_out, delete=False)
                 os.makedirs(a.checkpoint_dir, exist_ok=True)
                 threading.Thread(target=self._sync_loop, daemon=True).start()
 
@@ -111,7 +157,9 @@ class Lease:
                 _log("running setup…")
                 ssh.run(self.instance, f"cd {shlex.quote(a.remote_workdir)} && {a.setup}")
 
-            remote_cmd = " ".join(a.command)
+            # shlex.join quotes each token, so args with spaces/metachars survive the remote
+            # bash -lc re-parse instead of being re-split or interpreted.
+            remote_cmd = shlex.join(a.command)
             _log(f"launching: {remote_cmd}")
             rc = ssh.run_stream(
                 self.instance,
@@ -134,7 +182,12 @@ class Lease:
                  "(apt-get update -qq && apt-get install -y -qq rsync) >/dev/null 2>&1; "
                  "(command -v yum >/dev/null 2>&1 && yum -y -q install rsync) >/dev/null 2>&1; "
                  "command -v rsync >/dev/null 2>&1")
-        r = ssh.run(self.instance, check, check=False, quiet=True)
+        # Bound it: a held dpkg lock / dead mirror must not hang the lease on a billing box.
+        try:
+            r = ssh.run(self.instance, check, check=False, quiet=True, timeout=300)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("rsync bootstrap timed out (apt/yum hung) — use an image "
+                               "that ships rsync, or pre-install it via --setup")
         if r.returncode != 0:
             raise RuntimeError("rsync unavailable on the instance and could not be installed "
                                "(tried apt-get/yum) — use an image that ships rsync")
