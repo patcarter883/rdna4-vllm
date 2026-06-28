@@ -153,18 +153,33 @@ class Lease:
                 os.makedirs(a.checkpoint_dir, exist_ok=True)
                 threading.Thread(target=self._sync_loop, daemon=True).start()
 
+            env_prefix = self._write_remote_env()
+
             if a.setup:
                 _log("running setup…")
-                ssh.run(self.instance, f"cd {shlex.quote(a.remote_workdir)} && {a.setup}")
+                # Bound setup so a wedged box (e.g. torch's HIP init hanging in kfd_create_process on a
+                # dud GPU pod) FAILS -> teardown, instead of billing forever on a no-timeout ssh.run.
+                # Generous headroom for the real work (torch upgrade + a multi-GB model download).
+                ssh.run(self.instance, f"cd {shlex.quote(a.remote_workdir)} && {env_prefix}{a.setup}",
+                        timeout=a.setup_timeout)
 
             # shlex.join quotes each token, so args with spaces/metachars survive the remote
             # bash -lc re-parse instead of being re-split or interpreted.
             remote_cmd = shlex.join(a.command)
             _log(f"launching: {remote_cmd}")
-            rc = ssh.run_stream(
-                self.instance,
-                f"cd {shlex.quote(a.remote_workdir)} && {remote_cmd}").returncode
-            _log(f"command exited rc={rc}")
+            # run DETACHED + reconnect-poll so a transient SSH/network drop doesn't kill the run
+            # (the old run_stream returned 255 and tore down on any blip). On a non-zero exit,
+            # optionally RELAUNCH (--restart-on-crash): the trainer resumes from its box-local
+            # checkpoint, so a crash costs a few steps, not the whole run nor a 17.7GB sync.
+            attempt = 0
+            while True:
+                rc = ssh.run_detached(self.instance, f"{env_prefix}{remote_cmd}", a.remote_workdir)
+                _log(f"command exited rc={rc}")
+                if rc == 0 or attempt >= a.restart_on_crash:
+                    break
+                attempt += 1
+                _log(f"non-zero exit — relaunching (attempt {attempt}/{a.restart_on_crash}); "
+                     "trainer resumes from its box-local checkpoint")
             self._stop.set()
             return rc
         except KeyboardInterrupt:
@@ -173,6 +188,32 @@ class Lease:
         finally:
             self._stop.set()
             self._teardown()
+
+    def _write_remote_env(self):
+        """Resolve --env specs and write them to a mode-600 file on the box, returning a shell
+        prefix that sources it. A bare NAME pulls VALUE from OUR environment, so a secret (e.g.
+        HF_TOKEN, for the trainer's push_to_hub) never touches the cloud-lease command line nor the
+        box's process list — it's piped over stdin into the file. Returns "" when no --env given."""
+        a = self.a
+        pairs, missing = [], []
+        for spec in a.env:
+            if "=" in spec:
+                k, v = spec.split("=", 1)
+            else:
+                k, v = spec, os.environ.get(spec)
+                if v is None:
+                    missing.append(spec)
+                    continue
+            pairs.append((k, v))
+        if missing:
+            _log(f"--env not set locally, skipping: {', '.join(missing)}")
+        if not pairs:
+            return ""
+        body = "".join(f"export {k}={shlex.quote(v)}\n" for k, v in pairs)
+        remote = f"{a.remote_workdir}/.cloud_lease_env"
+        ssh.write_file(self.instance, remote, body, mode="600")
+        _log(f"wrote {len(pairs)} env var(s) to the box: {', '.join(k for k, _ in pairs)}")
+        return f"source {shlex.quote(remote)}; "
 
     # --- bootstrap -----------------------------------------------------------------------------
     def _ensure_remote_rsync(self):

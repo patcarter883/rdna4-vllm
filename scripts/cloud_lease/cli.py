@@ -77,6 +77,17 @@ def build_parser():
                        help="seconds between checkpoint sync-downs (default 300)")
     lease.add_argument("--provision-timeout", type=int, default=900)
     lease.add_argument("--setup", default=None, help="one-shot shell run on the box before CMD")
+    lease.add_argument("--setup-timeout", dest="setup_timeout", type=int, default=1800,
+                       help="seconds before a hung --setup is killed -> teardown (a wedged GPU pod "
+                            "can hang torch's HIP init forever on a no-timeout ssh; default 1800)")
+    lease.add_argument("--env", action="append", default=[], dest="env",
+                       help="NAME or NAME=VALUE exported on the box before setup+CMD (repeatable). "
+                            "A bare NAME pulls VALUE from OUR environment, so a secret (e.g. "
+                            "HF_TOKEN) stays off the command line; values are written to a mode-600 "
+                            "remote file via stdin and sourced before each remote step.")
+    lease.add_argument("--restart-on-crash", dest="restart_on_crash", type=int, default=0,
+                       help="relaunch CMD up to N times on a non-zero exit (the trainer resumes from "
+                            "its box-local checkpoint). For fast runs this is cheaper than syncing.")
     lease.add_argument("--exclude", action="append", default=[".git", "__pycache__", "*.pyc"],
                        help="rsync excludes for the working-dir upload (repeatable)")
     lease.add_argument("command", nargs=argparse.REMAINDER,

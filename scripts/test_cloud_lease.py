@@ -23,6 +23,10 @@ ssh.wait_ssh = lambda inst, timeout: None
 ssh.run = lambda inst, cmd, check=True, quiet=False, timeout=None: types.SimpleNamespace(returncode=0)
 ssh.rsync_up = lambda inst, local, remote, excludes=(), delete=True: None
 ssh.rsync_down = lambda inst, remote, local, check=True: None
+ssh.write_file = lambda inst, path, content, mode=None, timeout=30: None
+# The run path is now run_detached (replaced run_stream); delegate to the per-test run_stream stub so
+# the existing stubs/cases still drive it, returning the command's int rc.
+ssh.run_detached = lambda inst, cmd, workdir, **k: ssh.run_stream(inst, cmd).returncode
 
 
 class FakeBackend(Backend):
@@ -63,7 +67,8 @@ def _args(command):
         workdir=_TMP, remote_workdir="/workspace/repo",
         dataset=None, remote_dataset="/workspace/data",
         checkpoint_dir=None, remote_out=None, sync_every=300,
-        provision_timeout=10, setup=None, exclude=[], command=command)
+        provision_timeout=10, setup=None, setup_timeout=1800, exclude=[], env=[],
+        restart_on_crash=0, command=command)
 
 
 def _run(command, stream_impl, **be_kw):
@@ -146,6 +151,38 @@ def _capture(i, command):
     return types.SimpleNamespace(returncode=0)
 _run(["python", "train.py", "--note", "hello world"], _capture)
 check("command args are shell-quoted", "'hello world'" in captured.get("cmd", ""))
+
+# 10. (--restart-on-crash) a non-zero exit relaunches; the retry succeeds -> final rc 0, run twice
+calls = {"n": 0}
+def _flaky(i, c):
+    calls["n"] += 1
+    return types.SimpleNamespace(returncode=0 if calls["n"] > 1 else 7)
+be = FakeBackend()
+ssh.run_stream = _flaky
+args = _args(["true"]); args.restart_on_crash = 2
+rc = Lease(be, args).run()
+check("restart-on-crash relaunches then succeeds (rc 0)", rc == 0)
+check("restart-on-crash ran the command twice", calls["n"] == 2)
+check("restart-on-crash still destroys", be.destroyed == ["inst-123"])
+
+# 11. (--env) bare NAME pulls from our env, written to a mode-600 remote file, sourced before CMD
+os.environ["CLOUD_LEASE_TEST_SECRET"] = "s3 cr3t!"   # spaces/metachars -> must be shell-quoted
+written = {}
+ssh.write_file = lambda inst, path, content, mode=None, timeout=30: written.update(
+    path=path, content=content, mode=mode)
+runcmd = {}
+ssh.run_detached = lambda inst, cmd, workdir, **k: (runcmd.update(cmd=cmd) or types.SimpleNamespace(returncode=0)).returncode
+be = FakeBackend()
+ssh.run_stream = lambda i, c: types.SimpleNamespace(returncode=0)
+args = _args(["true"]); args.env = ["CLOUD_LEASE_TEST_SECRET", "MISSING_VAR_XYZ"]
+Lease(be, args).run()
+check("env: secret written to remote file (shell-quoted)",
+      "export CLOUD_LEASE_TEST_SECRET='s3 cr3t!'" in written.get("content", ""))
+check("env: remote file is mode 600", written.get("mode") == "600")
+check("env: command sources the env file", runcmd.get("cmd", "").startswith("source "))
+check("env: missing local var is skipped (not written)", "MISSING_VAR_XYZ" not in written.get("content", ""))
+# restore the delegating stub for any later reuse
+ssh.run_detached = lambda inst, cmd, workdir, **k: ssh.run_stream(inst, cmd).returncode
 
 ok = all(c for _, c in results)
 print(f"\n{'ALL PASS' if ok else 'FAILURES PRESENT'} ({sum(c for _, c in results)}/{len(results)})")

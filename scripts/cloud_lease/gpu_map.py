@@ -36,6 +36,7 @@ _RUNPOD = {
     "l40s-48": "NVIDIA L40S",
     "h100-80": "NVIDIA H100 80GB HBM3",
     "rtx4090-24": "NVIDIA GeForce RTX 4090",
+    "mi300x": "AMD Instinct MI300X OAM",     # 192GB, secure-only, ROCm — set CLOUD_LEASE_RUNPOD_IMAGE
 }
 
 

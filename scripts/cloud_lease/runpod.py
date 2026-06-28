@@ -6,6 +6,7 @@ runpod/pytorch images honour, and SSH is reached on the pod's mapped 22/tcp.
 ⚠ RunPod's runtime port schema has varied across API versions; the port-extraction below is
 defensive but the first smoke test (provision -> nvidia-smi -> destroy) is what confirms it.
 """
+import os
 import time
 
 from . import http
@@ -13,7 +14,10 @@ from .backend import Backend, Instance
 from .gpu_map import runpod_gpu
 
 API = "https://rest.runpod.io/v1"
-_IMAGE = "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04"
+# Default is the CUDA pytorch image; override via CLOUD_LEASE_RUNPOD_IMAGE for a ROCm box (MI300X)
+# — use a runpod/pytorch ROCm tag so the PUBLIC_KEY->sshd start script still gives cloud-lease SSH.
+_IMAGE = os.environ.get("CLOUD_LEASE_RUNPOD_IMAGE") or \
+    "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04"
 # Terminal states a pod can land in instead of coming up (e.g. unplaceable / preempted spot pod).
 # wait_ready must bail on these immediately rather than spin to provision_timeout while billing.
 _TERMINAL = {"EXITED", "TERMINATED", "FAILED", "DEAD"}
@@ -31,7 +35,7 @@ class RunPodBackend(Backend):
             "gpuCount": 1,
             "cloudType": "COMMUNITY" if spot else "SECURE",
             "interruptible": bool(spot),
-            "containerDiskInGb": 60,
+            "containerDiskInGb": 120,   # room for the 17.7GB HF model + a 17.7GB model-only ckpt (+tmp)
             "volumeInGb": 0,
             "ports": ["22/tcp"],
             "env": {"PUBLIC_KEY": sshkey_pub},
