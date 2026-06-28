@@ -90,6 +90,8 @@ class Lease:
             ssh.wait_ssh(self.instance, a.provision_timeout)
             _log(f"SSH ready: {self.instance.ssh_user}@{self.instance.ssh_host}:{self.instance.ssh_port}")
 
+            self._ensure_remote_rsync()
+
             _log(f"syncing working dir -> {a.remote_workdir}")
             ssh.run(self.instance, f"mkdir -p {shlex.quote(a.remote_workdir)}", quiet=True)
             ssh.rsync_up(self.instance, a.workdir, a.remote_workdir, excludes=a.exclude)
@@ -123,6 +125,20 @@ class Lease:
         finally:
             self._stop.set()
             self._teardown()
+
+    # --- bootstrap -----------------------------------------------------------------------------
+    def _ensure_remote_rsync(self):
+        """rsync is a hard dependency of the sync workflow but many ML images (e.g.
+        runpod/pytorch) don't ship it. Install it idempotently before the first sync."""
+        check = ("command -v rsync >/dev/null 2>&1 && exit 0; "
+                 "(apt-get update -qq && apt-get install -y -qq rsync) >/dev/null 2>&1; "
+                 "(command -v yum >/dev/null 2>&1 && yum -y -q install rsync) >/dev/null 2>&1; "
+                 "command -v rsync >/dev/null 2>&1")
+        r = ssh.run(self.instance, check, check=False, quiet=True)
+        if r.returncode != 0:
+            raise RuntimeError("rsync unavailable on the instance and could not be installed "
+                               "(tried apt-get/yum) — use an image that ships rsync")
+        _log("rsync present on instance")
 
     # --- dataset staging (design §13) ----------------------------------------------------------
     def _stage_dataset(self):

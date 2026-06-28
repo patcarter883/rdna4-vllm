@@ -41,14 +41,14 @@ class RunPodBackend(Backend):
 
     @staticmethod
     def _ssh_endpoint(pod):
-        ports = (pod.get("runtime") or {}).get("ports") or pod.get("portMappings") or []
-        for p in ports:
-            internal = str(p.get("privatePort") or p.get("internalPort") or "")
-            if internal == "22":
-                host = p.get("ip") or p.get("publicIp") or p.get("host")
-                port = p.get("publicPort") or p.get("externalPort") or p.get("port")
-                if host and port:
-                    return host, int(port)
+        # Confirmed live 2026-06-28: the SSH endpoint is top-level publicIp + portMappings
+        # ({"22": <external>}); `runtime` is empty. desiredStatus flips to RUNNING ~25s BEFORE
+        # these populate, so readiness must gate on the endpoint, not just status.
+        ip = pod.get("publicIp") or ""
+        mappings = pod.get("portMappings") or {}
+        port = mappings.get("22") or mappings.get(22)
+        if ip and port:
+            return ip, int(port)
         return None, None
 
     def wait_ready(self, instance_id, timeout):
