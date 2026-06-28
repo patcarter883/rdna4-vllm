@@ -25,6 +25,10 @@ _VULTR = {
 }
 
 # RunPod gpuTypeId values (display-name form). Confirm against --list-gpus.
+# gpuTypeIds confirmed live 2026-06-28 (GraphQL gpuTypes). a100-80/h100-80 are on both Secure and
+# Community (so --spot works for the 80 GB full-finetune path Vultr can't serve). a40-48 is
+# Secure-only (no community). Also live if needed: "AMD Instinct MI300X OAM" (192GB),
+# "NVIDIA A100-SXM4-40GB" (40GB, community-only — cheap LoRA).
 _RUNPOD = {
     "a100-80": "NVIDIA A100 80GB PCIe",
     "a6000-48": "NVIDIA RTX A6000",

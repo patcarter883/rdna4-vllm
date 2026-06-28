@@ -7,7 +7,9 @@ import urllib.request
 
 def request(method, url, token=None, body=None, headers=None, timeout=30):
     data = json.dumps(body).encode() if body is not None else None
-    h = {"Accept": "application/json"}
+    # RunPod's GraphQL host sits behind Cloudflare, which bans the default urllib UA
+    # (error 1010). A normal UA avoids it; harmless on the other providers.
+    h = {"Accept": "application/json", "User-Agent": "Mozilla/5.0 (cloud-lease/0.1)"}
     if data is not None:
         h["Content-Type"] = "application/json"
     if token:
