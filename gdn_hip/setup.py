@@ -21,6 +21,7 @@ setup(
         CUDAExtension(
             name="gdn_hip_C",
             sources=["bindings.cpp", "gdn_kernels.hip"],
+            include_dirs=["/opt/rocm-7.2.1/include"],  # rocwmma headers (gdn_prefill_wmma matrix-core)
             extra_compile_args={
                 "cxx": ["-O3", "-std=c++17", "-fPIC"],
                 "nvcc": [

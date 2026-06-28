@@ -23,6 +23,10 @@ void launch_gdn_prefill_chunked(const at::Tensor&, const at::Tensor&, const at::
                                 const at::Tensor&, const at::Tensor&, const at::Tensor&,
                                 const at::Tensor&, const at::Tensor&, const at::Tensor&,
                                 const at::Tensor&, at::Tensor&, at::Tensor&, double, int64_t);
+void launch_gdn_prefill_wmma(const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                             const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                             const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                             const at::Tensor&, at::Tensor&, at::Tensor&, double, int64_t);
 void launch_causal_conv1d_update(const at::Tensor&, const at::Tensor&,
                                  const c10::optional<at::Tensor>&, at::Tensor&, const at::Tensor&,
                                  at::Tensor&, int64_t);
@@ -65,6 +69,17 @@ at::Tensor gdn_prefill_chunked(const at::Tensor& q, const at::Tensor& k, const a
   return out;
 }
 
+at::Tensor gdn_prefill_wmma(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
+                            const at::Tensor& a, const at::Tensor& b, const at::Tensor& A_log,
+                            const at::Tensor& dt_bias, const at::Tensor& cu_seqlens,
+                            const at::Tensor& state_indices, const at::Tensor& has_initial_state,
+                            at::Tensor& ssm_state, double scale, int64_t use_l2norm) {
+  auto out = at::empty({v.size(0), v.size(1), v.size(2)}, v.options());
+  launch_gdn_prefill_wmma(q, k, v, a, b, A_log, dt_bias, cu_seqlens, state_indices,
+                          has_initial_state, ssm_state, out, scale, use_l2norm);
+  return out;
+}
+
 at::Tensor causal_conv1d_update(const at::Tensor& x, const at::Tensor& weight,
                                 const c10::optional<at::Tensor>& bias, at::Tensor& conv_state,
                                 const at::Tensor& state_indices, int64_t activation) {
@@ -101,6 +116,9 @@ TORCH_LIBRARY(gdn_hip, m) {
   m.def("gdn_prefill_chunked(Tensor q, Tensor k, Tensor v, Tensor a, Tensor b, Tensor A_log, "
         "Tensor dt_bias, Tensor cu_seqlens, Tensor state_indices, Tensor has_initial_state, "
         "Tensor(a!) ssm_state, float scale, int use_l2norm) -> Tensor");
+  m.def("gdn_prefill_wmma(Tensor q, Tensor k, Tensor v, Tensor a, Tensor b, Tensor A_log, "
+        "Tensor dt_bias, Tensor cu_seqlens, Tensor state_indices, Tensor has_initial_state, "
+        "Tensor(a!) ssm_state, float scale, int use_l2norm) -> Tensor");
   m.def("causal_conv1d_update(Tensor x, Tensor weight, Tensor? bias, Tensor(a!) conv_state, "
         "Tensor state_indices, int activation) -> Tensor");
   m.def("causal_conv1d_fwd(Tensor x, Tensor weight, Tensor? bias, Tensor cu_seqlens, "
@@ -113,6 +131,7 @@ TORCH_LIBRARY_IMPL(gdn_hip, CUDA, m) {
   m.impl("gdn_decode", gdn_decode);
   m.impl("gdn_prefill", gdn_prefill);
   m.impl("gdn_prefill_chunked", gdn_prefill_chunked);
+  m.impl("gdn_prefill_wmma", gdn_prefill_wmma);
   m.impl("causal_conv1d_update", causal_conv1d_update);
   m.impl("causal_conv1d_fwd", causal_conv1d_fwd);
   m.impl("rmsnorm_gated", rmsnorm_gated);
