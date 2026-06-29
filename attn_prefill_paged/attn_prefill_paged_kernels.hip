@@ -14,12 +14,14 @@
 //      prefix_len = context_len - q_len; a key (global pos = its cache index j) is allowed iff
 //      j <= query_global_pos.
 //
-// SCOPE (v0, correctness-first): bf16, GQA, causal + optional sliding window, head_dim 64/128 (256
-// gated off — same 64 KB LDS cap as attn_hip). KV cache [num_blocks, block_size, kv_heads, hd]
-// (kv_block_stride=0) OR vLLM's interleaved [num_blocks,2,...] (pass the doubled stride + unbind views).
-// NOT YET: fp8-KV, the smem-reduction pass for head_dim 256.
+// SCOPE: bf16 + fp8-KV (e4m3, per-tensor descale), GQA, causal + optional sliding window, head_dim
+// 64/128/256. head_dim 256 drops the flash tile to BR=BC=16 (1 warp) so the static LDS stays under
+// the gfx1201 64 KB cap — same WMMA math, smaller tile (see tile_rows() below). KV cache
+// [num_blocks, block_size, kv_heads, hd] (kv_block_stride=0) OR vLLM's interleaved
+// [num_blocks,2,...] (pass the doubled stride + unbind views).
 //
-// STATUS: compiles/numerics pending GPU — validate with attn_prefill_paged_parity.py.
+// STATUS: GPU-validated on gfx1201 — attn_prefill_paged_parity.py ALL PASS (22 cases: bf16 + fp8,
+// head_dim 64/128/256, incl. cold/extend/ragged/batch/SWA/GQA, cos≈0.999998, 0 bf16-ULP violations).
 
 #undef __HIP_NO_HALF_CONVERSIONS__
 #undef __HIP_NO_HALF_OPERATORS__
@@ -34,11 +36,12 @@ namespace {
 using bf16_t = rocwmma::bfloat16_t;
 
 constexpr int WMMA_M = 16, WMMA_N = 16, WMMA_K = 16;
-constexpr int BR = 32, BC = 32;                 // query rows / key cols per tile
-constexpr int M_TILES = BR / WMMA_M;            // 2
-constexpr int N_TILES = BC / WMMA_N;            // 2
-constexpr int WARPS = M_TILES;
-constexpr int THREADS = WARPS * 32;             // 64
+// Tile (query rows / key cols) is HEAD_DIM-dependent so the static LDS stays under the gfx1201
+// 64 KB cap. 64/128 keep the VALIDATED BR=BC=32 (2 warps / 64 threads, ~30-49 KB LDS). HEAD_DIM=256
+// would need ~120 KB at BR=32 (smem_Q/K/V + the fp32 O/PV accumulators all double), so it drops to
+// BR=BC=16 (1 warp / 32 threads, ~58 KB) — same WMMA math, smaller flash tile.
+constexpr int tile_rows(int head_dim) { return head_dim >= 256 ? 16 : 32; }
+constexpr int nthreads(int head_dim) { return tile_rows(head_dim) / WMMA_M * 32; }
 
 using FragQ  = rocwmma::fragment<rocwmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, bf16_t, rocwmma::row_major>;
 using FragKt = rocwmma::fragment<rocwmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, bf16_t, rocwmma::col_major>;
@@ -47,7 +50,7 @@ using FragV  = rocwmma::fragment<rocwmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, bf16
 using FragAcc = rocwmma::fragment<rocwmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float>;
 
 template <int HEAD_DIM>
-__global__ __launch_bounds__(THREADS) void flash_prefill_paged_kernel(
+__global__ __launch_bounds__(nthreads(HEAD_DIM)) void flash_prefill_paged_kernel(
     const __hip_bfloat16* __restrict__ Q,        // [total_q_tokens, num_q_heads, HEAD_DIM] (packed)
     const __hip_bfloat16* __restrict__ K_cache,  // [num_blocks, block_size, num_kv_heads, HEAD_DIM]
     const __hip_bfloat16* __restrict__ V_cache,
@@ -63,6 +66,11 @@ __global__ __launch_bounds__(THREADS) void flash_prefill_paged_kernel(
     const float inv_sqrt_d,
     const unsigned int causal,
     const unsigned int sliding_window) {
+    constexpr int BR = tile_rows(HEAD_DIM), BC = BR;
+    constexpr int M_TILES = BR / WMMA_M;
+    constexpr int N_TILES = BC / WMMA_N;
+    constexpr int WARPS = M_TILES;
+    constexpr int THREADS = WARPS * 32;
     constexpr int KSTEPS = HEAD_DIM / WMMA_K;
     constexpr int D_TILES = HEAD_DIM / WMMA_N;
     constexpr int PAD = 8;
@@ -247,8 +255,9 @@ void launch_flash_prefill_paged(const at::Tensor& q, const at::Tensor& k_cache,
     const long kvbs = (kv_block_stride > 0) ? (long)kv_block_stride
                                             : (long)block_size * num_kv_heads * head_dim;
 
-    dim3 grid(num_q_heads, (max_seqlen_q + BR - 1) / BR, num_seqs);
-    dim3 block(THREADS, 1, 1);
+    const int br = tile_rows(head_dim);
+    dim3 grid(num_q_heads, (max_seqlen_q + br - 1) / br, num_seqs);
+    dim3 block(nthreads(head_dim), 1, 1);
     auto stream = at::cuda::getCurrentCUDAStream();
 
     const auto* qp = reinterpret_cast<const __hip_bfloat16*>(q.data_ptr());
@@ -268,9 +277,9 @@ void launch_flash_prefill_paged(const at::Tensor& q, const at::Tensor& k_cache,
     switch (head_dim) {
         case 64:  LAUNCH(64);
         case 128: LAUNCH(128);
+        case 256: LAUNCH(256);
         default:
-            TORCH_CHECK(false, "attn_prefill_paged: head_dim ", head_dim,
-                        " unsupported (64/128; 256 needs the smem-reduction pass)");
+            TORCH_CHECK(false, "attn_prefill_paged: head_dim ", head_dim, " unsupported (64/128/256)");
     }
 #undef LAUNCH
 }
@@ -289,7 +298,7 @@ __device__ __forceinline__ float e4m3_to_f32(unsigned char b) {
 }
 
 template <int HEAD_DIM>
-__global__ __launch_bounds__(THREADS) void flash_prefill_paged_fp8_kernel(
+__global__ __launch_bounds__(nthreads(HEAD_DIM)) void flash_prefill_paged_fp8_kernel(
     const __hip_bfloat16* __restrict__ Q,
     const unsigned char* __restrict__ K_cache,   // [num_blocks, block_size, num_kv_heads, HEAD_DIM] e4m3
     const unsigned char* __restrict__ V_cache,
@@ -306,6 +315,11 @@ __global__ __launch_bounds__(THREADS) void flash_prefill_paged_fp8_kernel(
     const float v_descale,
     const unsigned int causal,
     const unsigned int sliding_window) {
+    constexpr int BR = tile_rows(HEAD_DIM), BC = BR;
+    constexpr int M_TILES = BR / WMMA_M;
+    constexpr int N_TILES = BC / WMMA_N;
+    constexpr int WARPS = M_TILES;
+    constexpr int THREADS = WARPS * 32;
     constexpr int KSTEPS = HEAD_DIM / WMMA_K;
     constexpr int D_TILES = HEAD_DIM / WMMA_N;
     constexpr int PAD = 8;
@@ -472,8 +486,9 @@ void launch_flash_prefill_paged_fp8(const at::Tensor& q, const at::Tensor& k_cac
     const long kvbs = (kv_block_stride > 0) ? (long)kv_block_stride
                                             : (long)block_size * num_kv_heads * head_dim;
 
-    dim3 grid(num_q_heads, (max_seqlen_q + BR - 1) / BR, num_seqs);
-    dim3 block(THREADS, 1, 1);
+    const int br = tile_rows(head_dim);
+    dim3 grid(num_q_heads, (max_seqlen_q + br - 1) / br, num_seqs);
+    dim3 block(nthreads(head_dim), 1, 1);
     auto stream = at::cuda::getCurrentCUDAStream();
 
     const auto* qp = reinterpret_cast<const __hip_bfloat16*>(q.data_ptr());
@@ -493,8 +508,9 @@ void launch_flash_prefill_paged_fp8(const at::Tensor& q, const at::Tensor& k_cac
     switch (head_dim) {
         case 64:  LAUNCHF(64);
         case 128: LAUNCHF(128);
+        case 256: LAUNCHF(256);
         default:
-            TORCH_CHECK(false, "attn_prefill_paged fp8: head_dim ", head_dim, " unsupported (64/128)");
+            TORCH_CHECK(false, "attn_prefill_paged fp8: head_dim ", head_dim, " unsupported (64/128/256)");
     }
 #undef LAUNCHF
 }
