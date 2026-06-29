@@ -1,0 +1,13 @@
+# Thin derived image for Titans Phase 0/1 work: combined stack + titans-pytorch deps.
+# The reference titans-pytorch source is mounted at runtime (PYTHONPATH=/work/ref-titans-pytorch)
+# so we can edit it (e.g. force-disable accelerated_scan) without rebuilding.
+#   docker build -f titans/Dockerfile.titans -t titans:dev .
+FROM vllm22-w4a8:combined
+RUN /app/.venv/bin/pip install --no-cache-dir \
+      assoc-scan axial_positional_embedding einx hyper-connections \
+      rotary-embedding-torch tensordict x-transformers tqdm adam-atan2-pytorch
+# fla fast-path: flash-linear-attention pulls fla-core (Triton gated-delta-rule kernels).
+# Verified on gfx1201: fla detects cuda (no CPU rollback), chunk_gated_delta_rule ~0.49ms/call @T=512.
+# This makes transformers' Qwen3_5GatedDeltaNet use the fla Triton scan instead of the slow torch
+# fallback (the causal_conv1d C++ "fast path" stays on the cheap torch conv; not worth a ROCm build).
+RUN /app/.venv/bin/pip install --no-cache-dir flash-linear-attention

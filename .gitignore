@@ -30,3 +30,19 @@ profiling/
 .vllm-cache*
 # gpu-lease runtime lock/label files (ephemeral; see scripts/gpu-lease.sh)
 .gpu-locks/
+
+# --- Titans / CAM experiment (titans/) ---
+# Vendored vLLM source snapshot + root scratch logs (reproducible, large)
+.vllm-src/
+_titans_*.log
+# Large model dumps (enwik8 training checkpoints incl. >100MB files GitHub rejects)
+titans/checkpoints-enwik8/
+titans/checkpoints-enwik8-smoke/
+# Nested reference clone (lucidrains titans-pytorch — has its own .git)
+titans/ref-titans-pytorch/
+# Heavy derived weight artifacts (the v0 memory + per-base translator cards, 50-80MB each)
+titans/warmstart/ckpt/cam_v0_L24.pt
+titans/warmstart/ckpt/translator_*.pt
+# Run logs (transient; conclusions live in the *.md results files)
+titans/warmstart/logs/
+# Keep the SMALL validated artifacts: warmstart/ckpt/probe/*, warmstart/ckpt/atlas/*
