@@ -73,6 +73,15 @@ see future masks *through the conv* — almost certainly not, since the conv sta
 parent), but structurally the causal conv is fine. Flag for the conversion session: confirm the
 diffusion fine-tune kept `conv_qk` causal.
 
+> ⚠ **CORRECTION (2026-06-29, `replica_diag.py`) — this "no bidirectional conv needed" holds only for
+> the TWO-FORWARD path.** In the FUSED single forward `[committed | S | R_0..R_{B-1}]` the replicas sit
+> AFTER the S drafts in the sequence, so each replica's leading `total_padding=2` tokens read the S
+> draft tokens through the causal conv (the conv ignores the attention mask) → corrupted leading drafts
+> (token-level match `[0,0,1,1]`: only the conv-window tokens wrong). The FUSED path therefore needs a
+> **SEGMENTED conv** (each R_r convolved over its own `[committed+first-r-drafts | mask*B]` segment) —
+> what `cca.py:_decode_verify_spec` already does. The two-forward `block_predict` is unaffected because
+> its mask block immediately follows the committed tokens. See §9 (single-forward entry).
+
 ---
 
 ## 2. TiDAR inference algorithm (as implemented for, per the paper)
@@ -309,10 +318,17 @@ prefix causal) map onto `qq_bias` with **no new kernel**.
 ### 7.3 Access to both logit streams (`p_AR`, `p_diff`) at the sampler — plumb the mask-block logits
 forward across steps as a captured static buffer.
 ### 7.4 SWA × structured-mask composition on sliding-window layers (§3).
-### 7.5 Whether the diffusion fine-tune kept `conv_qk` causal (§1.1) — confirm with the conversion
-session; if it made the conv non-causal for mask positions, the CCA op needs a branch.
-### 7.6 RoPE on mask tokens — mask positions sit at `prefix_len + block_len + j`; confirm position_ids
-for the mask block match what training used (else the draft logits are off-distribution).
+### 7.5 Whether the diffusion fine-tune kept `conv_qk` causal (§1.1) — **RESOLVED (2026-06-28, STEP 4): it stayed CAUSAL. See §9.**
+Confirmed on the checkpoint's real layer-0 `ZayaCCAProjection` (`cca_evict_gate.py`): appending tokens
+after position `p` does not change `p`'s q/k/v (max|Δ|=0.0); the FT kept `conv_qk` left-pad-only at the
+K=2 boundary (the mask patch only replaces `create_causal_mask`, never the conv). **No CCA non-causal
+branch needed.** (Earlier worry: if the FT made the conv non-causal for mask positions, the CCA op would
+have needed a branch — it didn't.)
+### 7.6 RoPE on mask tokens — **RESOLVED (2026-06-29, `bisect_fusion.py`).** Mask positions sit at
+`prefix_len + block_len + j` and all `block_len` replicas share the next-block positions
+`L+B..L+2B-1` (GATE A's scheme). The fused forward under this scheme is **fp32 bit-identical** to the
+causal verify forward on the real checkpoint, so the convention is correct. (Was: confirm the mask-block
+position_ids match training, else draft logits go off-distribution — now pinned. See §9.)
 
 ---
 
@@ -402,7 +418,265 @@ single-forward — most of the DFlash complexity dissolves.
   existing tree-attn callers are unaffected. *(Overlay is uncommitted per protocol; folding onto the
   installed kernel / real `cca.py` is a later checkpoint-stage step. The two mask off-by-one flags —
   `replica_offset`, `sampling_causal` — still await the conversion checkpoint.)*
-- [ ] then §31g capture (§5), paged-KV in attn_hip, coherence/throughput once a checkpoint lands.
+- [x] **β=1 COHERENCE GATE PASSED on the real checkpoint (§9 NEXT step 2) — 2026-06-28.** Checkpoint
+  `pat883/zaya1-8b-tidar-experts` (full-ft-all ZAYA1-8B-Diffusion, block_size=4, step 999) loaded via
+  the Zyphra fork (`serve_loader.py`, build-from-config + `load_state_dict`, 0 missing/0 unexpected)
+  and run on CPU (no lease — 17.7 GB bf16 fits host RAM, not a 16 GB card). **β=1 TiDAR decode ==
+  AR-greedy token-for-token on all 4 prompts** (incl. varied-token cases, not just the degenerate
+  `= = =` collapse), `coherence_gate.py` GATE B. This empirically pins **`replica_offset=0` +
+  `sampling_causal=True` + the verify/commit bookkeeping** on a genuinely TiDAR-trained model. The
+  lossless loop is the **two-forward** form (verify against a causal forward over `[committed|drafts]`;
+  diffusion drafts from a separate `[committed|mask*B]` block forward) — exactly what `tidar_loop.py`
+  uses. Acceptance avg 0.8–2.0 / 4 (drafts are hints; β=1 lossless regardless — throughput lever, not
+  a losslessness concern). Reusable artifacts: `serve_loader.py`, `coherence_gate.py`,
+  `diag_causality.py`, `diag_ar.py`, `zaya_mask_patch.py` (copied from convert), all in `zaya/tidar/`.
+  - **CRITICAL LOADER REQUIREMENT:** `attn_implementation="eager"`. The `zaya_mask_patch`
+    `create_causal_mask` monkeypatch is consumed ONLY by ZAYA's eager attention; under the default
+    **SDPA the injected bias is silently dropped** → the model is non-causal under appended tokens →
+    the gate diverges. (Confirmed: full-recompute AR under eager == native cached `generate()` AR,
+    `diag_ar.py` MATCH=True — methodology is sound once eager.)
+- [x] **§7.5/§1.1 — the fused single-forward "contamination" was a MISDIAGNOSIS: it is bf16 numerical
+  noise, NOT a sequence-global op. The FUSED single forward IS mathematically lossless → the ~2.4×
+  lever is UNLOCKED — 2026-06-29 (`bisect_fusion.py`).** GATE A (bf16) saw the S verify rows shift when
+  the `block_len²` mask replicas are present (max|Δlogit|≈1.8), and §7.5 *attributed* it to a
+  sequence-global op (MoE load-balance / global norm). **That attribution was wrong.** A layer-by-layer
+  S-row bisection (fused vs causal forward, real checkpoint) shows: (a) **fp32 ⇒ BIT-IDENTICAL at every
+  one of the 40 layers AND in the final logits (max|Δ|=0.0, no diverging layer)**; (b) bf16 ⇒ layers
+  0–3 bit-identical, then a *tiny* divergence (mean 4e-3) that grows gradually with depth (ballooning
+  only where ‖hidden‖ blows up, layers 35–38) — the signature of floating-point accumulation, not a
+  structural global op (which would jump sharply at one MoE layer from its first occurrence). A code
+  audit independently confirms ZAYA MoE routing + `ResidualScaling` are strictly **per-token** (no
+  capacity drop, no in-forward load-balance update, no cross-token norm). The bf16 seed is the
+  **grouped-MoE-GEMM batching** (S tokens sharing an expert with R tokens round differently in the
+  batched bf16 matmul — per-token in math, not bit-exact in bf16) + residual amplification. **Two
+  consequences:** (1) **§7.5 dissolved** — verify is bit-exact with the scratch present, so the
+  production path CAN be ONE fused forward (verify S + pre-draft R together) — 1 fwd/step instead of 2.
+  (MEASURED single-forward speedup is **~1.52× aggregate**, NOT the naive `(1.40+1)=2.4×` — the replicas
+  draft WEAKLY, see the single-forward entry below; 2.4–2.7× IS hit on prompts where drafts land.)
+  (2) **§7.6 pinned** — the bisection
+  used GATE A's replica-position scheme (all replicas at the next-block positions `L+B..L+2B-1`) and is
+  fp32 bit-exact, so that `position_ids` convention is VALIDATED on the real checkpoint. **bf16 caveat:**
+  β=1 isn't strictly *bit*-lossless under bf16 (rare borderline-argmax flips on low-entropy prompts —
+  same class as the two-forward divergence); mitigate by computing the few S verify-row logits in fp32,
+  or accept the noise-level flip. The "one-forward shortcut" (`tidar_loop.py` test E) is **REINSTATED.**
+- [x] **SINGLE-FORWARD TiDAR — implemented + measured: ~1.52× aggregate, lossless (fp32); the limiter
+  is replica DRAFT quality, not the architecture — 2026-06-29 (`single_forward_tidar.py`).** The loop:
+  ONE fused forward/step over `[committed | S=prev_drafts | R_0..R_{B-1}]` → verify S rows (β=1 accept k
+  + bonus) AND read replica `R_k` as the next block's drafts (`select_next_drafts_row_range`). Results
+  (real checkpoint, 4 prompts):
+  - **LOSSLESS in fp32** (committed == AR-greedy on all 4); **bf16 diverges on 2/4** (borderline-argmax
+    flips — confirms the bf16 caveat; strict losslessness needs fp32 verify-row logits).
+  - **Forward count: 0.656 fwd/token ⇒ 1.52× aggregate (≈41 tok/s)** vs AR; beats the two-forward 1.12×.
+    PER-PROMPT spread is wide: 0.375–0.417 fwd/tok (**2.4–2.7×**) when drafts land (avg_accept 2.0–2.5),
+    but **1.0 fwd/tok (1.0×)** on low-entropy/factual prompts ("2+2", "mitochondria": avg_accept 0.04–0.26).
+  - **Why not the naive 2.4× — ROOT-CAUSED to the §1.1 causal CONV (`replica_diag.py`, token-level):**
+    in the fused sequence `[committed | S=drafts | R_0..R_{B-1}]`, each replica's leading `total_padding=2`
+    tokens read their 2 *sequence-left* neighbors through the causal `conv_qk` — which are the **S draft
+    tokens**, NOT the committed/accepted context. The conv is a separate operator from attention and does
+    **not** respect the structured mask (so even though R is masked from S in *attention*, the *conv*
+    pulls S in). Token-level proof: R_k vs `bp_k = block_predict(committed+drafts[:k])` matches as
+    **`[0,0,1,1]`** — tokens 2–3 (conv window entirely inside the replica) are EXACT; only tokens 0–1
+    (conv window straddling the drafts) are wrong. **This is §1.1 materialized for the FUSED path** (the
+    "no bidirectional conv needed" note held only for the TWO-FORWARD path, where the mask block
+    immediately follows the committed tokens so the conv reads the right neighbors). Two construction
+    issues, both identified: (i) replica RoPE positions must be `[L+r, L+r+B-1]` not `[L+B, L+2B-1]`
+    (fixed in `single_forward_tidar.py`/`replica_diag.py` — necessary but not sufficient), and (ii) the
+    conv must be **SEGMENTED per replica** (each R_r sees `[committed+first-r-drafts | mask*B]` as its own
+    conv segment) — which is EXACTLY what `cca.py:_decode_verify_spec` already does for spec decode (the
+    "cca.py KV-cached path" the design anticipated). The post-forward bonus token is a separate, smaller
+    residual (k vs k+1 context), secondary to the conv.
+  - **Verdict:** the fused single forward is the RIGHT serving architecture (verify lossless, fewest
+    forwards, best aggregate so far, ~1.52×). The steady ~2.4× IS reachable but requires the
+    **segmented-conv serving path** (the real `cca.py` `_decode_verify_spec`-style conv, not the naive HF
+    dense flat-conv forward used in these CPU harnesses) + the replica-position fix; on the naive dense
+    forward the conv corrupts the replicas' leading 2 tokens → capped acceptance. Plus the standing lever
+    of a better-trained checkpoint. Realizing it = the segmented-conv fused forward on the live cca.py
+    runner (TP=2) — a real but well-scoped follow-on, no remaining unknowns.
+  - **Segmented-conv CONFIRMED as the cause; CPU construction-trick is too finicky — 2026-06-29
+    (`segmented_fused_tidar.py`).** Tried to realize the segmented conv WITHOUT the cca.py runner, via a
+    construction trick: insert each replica's correct 2-token conv context `ctx_r` before R_r in the
+    sequence, masked from attention so it only feeds the causal conv. Result: the replica's leading 2
+    tokens FLIPPED from wrong→correct (token-match went `[0,0,1,1]` flat → **`[1,1,0,0]`** segmented),
+    **proving the conv is genuinely the cause** — but the trick introduced a residual mismatch on the
+    *trailing* 2 tokens (a standalone-layout bug), so net acceptance didn't recover (0.52). Verify stayed
+    lossless throughout. **Takeaway:** the §1.1 conv is the confirmed root cause; the CLEAN fix is the
+    real `cca.py:_decode_verify_spec` segmented conv (native conv-state handling) on the live runner, NOT
+    a CPU-harness reconstruction. The algorithm is fully de-risked; only the (substantial) live cca.py
+    TP=2 integration remains. Diagnostic scripts: `bisect_fusion.py`, `single_forward_tidar.py`,
+    `replica_diag.py`, `segmented_fused_tidar.py`.
+- [x] **STEP 3 — structured mask WIRED into the real standard-attention backend + GPU-validated
+  (`gpu_validate.py` Part E) — 2026-06-28.** The kernel hooks (Route A `mask_bias`, Route B `qq_bias`)
+  were already validated (Parts C/D); step 3 adds the missing connective tissue so the per-step TiDAR
+  mask reaches the *standard* `self.attn` call (zaya.py:216 — CCA is only a QKV producer, §1, so the
+  mask lands on `self.attn`, NOT inside CCA):
+  - **`zaya/tidar/tidar_attn_metadata.py`** (NEW): `build_tidar_mask_meta(prefix_len, block_len, …)`
+    builds `TiDARMaskMeta` (Route-B `qq_bias` = the `additive_bias(d)[:, prefix_len:]` new-token slice
+    Part D drives the kernel with, verbatim; + optional Route-A square `mask_bias`), cudagraph-static
+    for a fixed block_len. A module-level **active-mask carrier** (`set_/get_/clear_active_tidar_mask`,
+    `update_active_tidar_mask_` for the §31g static-address in-place case) bridges the builder to the
+    backend without patching vLLM's frozen `ForwardContext`. A **backend hook** (`wrap_unified_attention`
+    / `install_tidar_attn_hook`) wraps triton_attn's module-bound `unified_attention` so it injects the
+    active `qq_bias`; null-safe (no active mask, or a caller that already passed `qq_bias` like
+    tree_attn, ⇒ byte-identical passthrough).
+  - **`cca_attn.py`**: `CCAAttentionMetadata` gains an optional `tidar_mask: TiDARMaskMeta | None = None`
+    field so the mask travels alongside the CCA conv-state metadata (§4.1); default None ⇒ zero change.
+  - **GPU gate (`gpu_validate.py` Part E, 1-card lease, `vllm22-w4a8:combined`):** mask built via the
+    serving builder, installed on the carrier, then the HOOK-WRAPPED `unified_attention` called WITHOUT
+    an explicit qq_bias (exactly what the stock backend does) over paged single-seq KV. RESULT for
+    block_len {4,8,16} × prefix {0,64,512}: **== boolean-masked fp32 SDPA** (cos 0.999997–0.999999,
+    ≤4 bf16-ULP, 0 outliers >6 ULP) AND **byte-identical to the explicit-qq_bias path** (max|Δ|=0.0 —
+    the wrap only changed where qq_bias came from). **Regression:** carrier cleared ⇒ wrapped ==
+    stock byte-identical (a plain decode step is untouched). Full A–E run: ALL PASS.
+  - *Single-sequence for now* (matches the β=1 coherence gate + the validation); batched-decode (one
+    qq_bias per sequence) + the Route-A attn_hip backend wiring are step-4 concerns once the loop is on
+    the real `cca.py` KV path. Overlay uncommitted per protocol.
+- [x] **STEP 4 — decode loop / β sampler / evict-on-reject FOLDED onto the real
+  `cca.py:_decode_verify_spec` KV+conv-state rollback — 2026-06-28.** The cca.py `(1 + num_spec)`
+  candidate-window conv + per-spec-position rollback IS the TiDAR evict-on-reject path: `num_spec`
+  maps to the TiDAR `block_len`, the verify processes the whole `[current state | block_len
+  candidates]` block writing the conv window + `prev_hs` ENDING at each candidate `j` to slot
+  `state_indices_2d[i, write_col[i,j]]`, and the next step reads `blk_scheduled_prev +
+  (num_accepted-1)` = the accepted-prefix end — appending the rejected tail then reading the accepted
+  column IS the evict (no physical truncation). This is the exact `IncrementalKVConv.commit_block`
+  contract.
+  - **REAL-MODEL equivalence gate (`zaya/tidar/cca_evict_gate.py`, CPU, no lease):** drives the
+    checkpoint's actual layer-0 `ZayaCCAProjection` (the conv producer cca.py caches as
+    `conv_states`/`prev_hs`) over `[committed | block_len-draft block]`, evicts the rejected tail, and
+    asserts the committed conv/`prev_hs` state == a from-scratch recompute of the accepted token
+    stream. **PASS, max|Δ|=0.0** (bit-identical) for `k_accept` ∈ {0..block_len} × prefix ∈ {4,16}.
+    Equivalence holds because the conv is CAUSAL — position `p`'s q/k/v + conv-window + recurrent
+    state are independent of any token appended after `p`. Verification is kept ISOLATED from the
+    `B*B` mask-replica scratch (the §7.5 fusion-contamination finding): the gate drives ONLY the conv
+    producer, never the replicas; the TiDAR structured mask rides the SEPARATE standard-attention
+    backend (active-mask carrier + `CCAAttentionMetadata.tidar_mask`, step 3), not this producer.
+  - **CONV-CAUSALITY confirmed (§1.1/§7.5) on the real conv:** appending tokens after position `p`
+    does NOT change `p`'s q/k/v (max|Δ|=0.0, prefix/tail ∈ {(4,4),(8,8),(16,4)}). The diffusion FT
+    kept `conv_qk` CAUSAL (left-pad only, `F.pad(.., (total_padding, 0))`, cca.py:380) at the K=2
+    (`cca_time0`/`cca_time1`) boundary — the mask patch only replaces `create_causal_mask` (the
+    *attention* mask), never the CCA conv. **No cca.py non-causal branch needed.**
+  - **β=1 losslessness re-confirmed after the fold:** `coherence_gate.py` GATE B still PASS (β=1
+    TiDAR == AR-greedy token-for-token, all 4 prompts). GATE A still reports fusion NOT viable
+    (max|Δlogit|≈1.84) — corroborating the isolation requirement the fold satisfies.
+  - **Additive cca.py wiring:** a null-safe `num_spec → block_len` doc anchor in
+    `_decode_verify_spec` (no code change to the rollback math — it was already generic over
+    `1+num_spec`); `num_spec==0` ⇒ the conv producer is byte-identical (non-TiDAR path untouched).
+    `test_tidar_loop.py` + `test_tidar_mask.py` 16/16 green (no stub regression).
+- [x] **SERVABLE BUILD — the TiDAR checkpoint now SERVES on vLLM TP=2 (gfx1201) — 2026-06-28.**
+  Unblocks throughput/§31g (a serve loop now exists). The checkpoint `model_latest.pt` is in the
+  **Zyphra HF-transformers-fork naming** (`qkv_proj.q_proj`, `conv_qk_depthwise/grouped`,
+  `qk_norm.temp`, fused `mlp.experts.gate_up_proj/down_proj`, `input_layernorm`); the vLLM `zaya`
+  overlay's `load_weights` is exact-match and needs **vLLM naming** (`self_attn.qkv.linear_q`,
+  `conv_qk.0/1`, `qkv.temp`, per-expert `zaya_block.experts.local_experts.N.linear_fc{1,2}`,
+  `input_norm`/`res_scale`, 40→80 split layers). The fp8 build serves because it was made from an
+  already-converted repr — **Zyphra ships BOTH formats as parallel snapshots** of `Zyphra/ZAYA1-8B`
+  (`67d34da`=HF-fork, `970cfc9f`=vLLM).
+  - **Converter (`zaya/tidar/hf2vllm_map.json` + derive/apply scripts):** used the two parallel
+    snapshots as a **byte-provenance oracle** — every one of the **2483 vLLM tensors matched an
+    HF-fork source byte-for-byte (0 ambiguous, 0 unmatched)**, yielding the exact name map incl. the
+    layer split (vLLM `2L`=ATT ← HF `L` self_attn/input_layernorm; `2L+1`=MoE ← post_attention_layernorm
+    /experts/router), expert de-fusion (`gate_up_proj[e]`→`linear_fc1`, `down_proj[e]`→`linear_fc2`),
+    router renames (`router_mlp.fc1`→`router_mlp.0`, `out_proj`→`router_mlp.4`, `norm`→`rmsnorm_eda`),
+    and the residual-scale chain (last layer's `post_mlp_residual_scale` → top-level `model.res_scale`).
+    Replicates the original converter's wiring from provenance — no reverse-engineering needed.
+  - **Servable dir** `/home/pat/code/zaya1-8b-tidar-serve`: map applied to `model_latest.pt` → 2483
+    vLLM-naming safetensors (16.5 GB) + the bf16 vLLM config (`970cfc9f`, 80 layers, 16 experts,
+    tie=None→overlay ties, no lm_head) + the TiDAR tokenizer (`<|tidar_mask|>` 262147).
+  - **Serve (compose profile `zaya-tidar`, TP=2 bf16, `gpu-lease -n 2`):** all **2483 weights loaded
+    0 missing / 0 unexpected** (the converter's proof — the HF-fork dir had failed here with a
+    `not initialized from checkpoint` ValueError), 8.48 GiB/card, KV 90k tok @ 2.75x, graphs captured,
+    **Application startup complete**. **Coherence:** "capital of France is" → " Paris" ✓ (then the
+    known overfit `= = =` tail), correct train-speed reasoning, coherent chat — proving the weights
+    are structurally correct, not just shape-loadable. **Baseline AR decode ≈ 27 tok/s** single-stream
+    (the eventual TiDAR-speedup denominator). Serve then torn down (cards freed); re-launch:
+    `ZAYA_MODELS_DIR=/home/pat/code gpu-lease -n 2 --detach --name zaya-tidar -- docker compose --profile zaya-tidar up -d`.
+- [~] **TiDAR proposer / model-runner integration (DONE for the per-step wiring; the live-runner
+  fused forward is §7.6-gated) — 2026-06-28:** the step-3 carrier+hook + step-4 evict are now wired
+  into a real per-step β=1 TiDAR decode loop via the NEW orchestration module
+  `zaya/tidar/tidar_proposer.py` — which implements **no** new mask/rollback math, only routes the
+  pinned primitives:
+  - `maybe_install_tidar_hook()` installs `install_tidar_attn_hook` once at model load; wired
+    ADDITIVELY into `ZayaForCausalLM.__init__` (overlay `zaya.py`), guarded so an import/install
+    failure is a silent no-op and an installed-but-inert hook (no carrier) is byte-identical to stock.
+  - `TidarProposer.run_block(prefix_len)` is the per-step set-before / clear-after carrier boundary
+    (fresh-alloc `build_tidar_mask_meta`; the in-place `update_active_tidar_mask_` is reserved for the
+    §31g capture step). It ALWAYS clears the carrier on exit (even on exception) so no mask leaks into
+    the next forward. `verify_commit` forwards to `tidar_loop.beta_verify` (β=1 lossless);
+    `evict_contract(num_accepted) → num_accepted-1` names the `cca.py:_decode_verify_spec` rollback
+    column (the step-4 fold; no new rollback math). Serve-enable flag: `VLLM_TIDAR_BLOCK_LEN` (unset ⇒
+    plain decode, hook inert).
+  - **CPU gate `test_tidar_proposer.py` (no lease, 7/7; full suite 23/23):** env-flag parsing,
+    carrier set/clear discipline (incl. clear-on-exception), `verify_commit==beta_verify`,
+    evict-column contract, and an end-to-end β=1==greedy-AR through the proposer surface (B∈{1,4,8}×3
+    seeds) on the `StubCCALM`.
+  - **GPU gate `gpu_validate.py` Part F (1-card lease, `vllm22-w4a8:combined`): RUNNER-PATH β=1 decode
+    loop == AR-greedy, token-for-token** — a full β=1 TiDAR decode driven through `TidarProposer`
+    (hook installed; carrier set BEFORE / cleared AFTER each block forward) over the **real RDNA4
+    triton_attn kernel** (the exact kernel `ZayaAttention.forward → self.attn → triton_attn`
+    dispatches to) commits the SAME stream as plain AR-greedy through that kernel — IDENTICAL for
+    B∈{1,4,8}×2 seeds, carrier-clean after every loop; PLUS the null-safety regression (carrier
+    cleared ⇒ byte-identical to stock, max|Δ|=0). RESULT: **ALL PASS** (A–F). This pins that the
+    *wiring* (proposer carrier + hooked real kernel) is itself lossless, complementing the standalone
+    `coherence_gate.py` GATE B that pins losslessness on the real **weights**.
+  - **§7.6 BOUNDARY (the explicit blocker, NOT this item):** driving the converted checkpoint through
+    this same triton_attn carrier on the live **vLLM runner** needs (a) TP=2 / a >16 GB fit (this item
+    is capped at `-n 1`) and (b) `position_ids` for the fused `[S | R_0..R_{B-1}]` replica block —
+    **§7.6, still un-pinned on-device**. The standalone β=1 coherence gate (real checkpoint, CPU)
+    sidesteps §7.6 by re-deriving R_0 from a fresh causal forward each step; Part F holds weights fixed
+    and exercises the wiring. The proposer deliberately emits NO replica position_ids (`run_block`
+    carries only the contiguous `[prefix | S]`/`[prefix | mask*B]` block); the live-runner fused
+    single forward is the §7.6 follow-on, the per-step proposer/runner wiring itself is DONE + lossless.
+- [x] **§31g FULL-cudagraph CAPTURE of the carrier + hooked block forward — DONE + GPU-VALIDATED
+  weight-independently at -n 1 (`gpu_validate.py` Part G) — 2026-06-28.** This is the §5 / step-6 capture
+  step: it exercises the one piece the eager Part D/E/F path skips and that capture REQUIRES — the
+  in-place, static-ADDRESS active-mask carrier (`update_active_tidar_mask_`) — and gates capture by
+  eager==replay BIT-EQUALITY (the honest weight-independent signal at -n 1; NOT torch.profiler
+  launch-count, which bypasses replay — memory [[profiler-bypasses-cudagraph-replay]]). **Evidence:
+  GPU-validated (1-card lease, real triton_attn kernel), reproduced across two independent runs — full
+  A–G ALL PASS; NOT checkpoint-driven (the live-runner fused single forward on real weights is the
+  §7.6-gated step-6 follow-on below, out of this `-n 1` item's scope).**
+  - **G1 (static-address carrier, OUTSIDE any graph):** after `update_active_tidar_mask_` copies a new
+    step's qq_bias INTO the already-active carrier buffer, the HOOK-wrapped `unified_attention` output
+    == the fresh-alloc `build_tidar_mask_meta` path (**max|Δ|=0.0**), AND the carrier buffer's
+    `id()`/`data_ptr()` are UNCHANGED across two in-place updates (**addr-stable=True**) for block_len
+    {4,8} × prefix {0,64,512}. This is the first exercise of the §5 "persistent static-address buffer"
+    contract the design names but never drove.
+  - **G2 (capture==replay, the core gate):** the carrier+hooked block forward is captured under
+    `torch.cuda.graph` at a FIXED capture size `q_len = block_len·(1+block_len)` (static q/KV/out
+    buffers + the static-address carrier); for a new step, new q/k/v are copied into the static buffers
+    + `update_active_tidar_mask_` updates the carrier in place, `g.replay()`, read static out. Replayed
+    out == the same EAGER hooked call **bit-equal (max|Δ|=0.0)** for block_len ∈ {4,8,16} × prefix
+    {0,64}, ≥2 distinct mask/input fills each (the carrier's `data_ptr()` asserted unmoved across every
+    replay). This pins the §5 "k-variability does **not** break capture" property: the forward's shape
+    is fixed at `block_len·(1+block_len)` regardless of accept-length k; only the post-forward
+    index/eviction math (NOT in the captured region) varies. **Full A–G run: ALL PASS** (1-card lease,
+    `vllm22-w4a8:combined`; attn_hip rebuilt; `attn_hip` NOT touched — the mask rides the standard
+    triton_attn carrier). Overlay uncommitted per protocol.
+  - **STILL-OPEN GATED FOLLOW-ONS (NOT this item):** the live-runner FULL_DECODE_ONLY *dispatch* probe
+    (launch-count) needs the §7.6 fused single forward + TP=2; paged-KV in attn_hip (step 7) and β<1
+    (step 8) remain.
+- [x] **THROUGHPUT measured — two-forward TiDAR ≈ 1.12× on this checkpoint (step 5) — 2026-06-29.**
+  `zaya/tidar/throughput_tidar.py`. The lossless production path is **two-forward** (a `[committed|mask*B]`
+  diffusion-draft forward + a `[committed|drafts]` causal-verify forward per step; CONTIGUOUS positions
+  ⇒ the §7.6 replica-`position_ids` unknown — which only blocks the §7.5-contaminated FUSED forward —
+  does NOT apply). Speedup is **cache-independent + exact via FORWARD COUNT**: AR = 1 fwd/token; TiDAR =
+  2 fwd/step → (k+1) committed tokens. Each forward costs ~the same (batch-1 8B decode is
+  **memory-bandwidth bound**: the 27 tok/s baseline = 16 GB/37 ms ≈ 430 GB/s ≈ card BW ⇒ a B-query block
+  forward ≈ a 1-token decode), so forward-count ratio = throughput ratio. **Measured on the real
+  checkpoint** (4 prompts, n_new=24, run on CPU — forward count + acceptance are hardware-independent;
+  the 2-GPU `device_map` run loaded+dispatched fine but truncated at the first PART-1 GPU forward, so the
+  device-independent CPU count is the reported signal): **avg accept 1.40/4, forward-count speedup 1.12×
+  (≈ 30 vs 27 tok/s)**, predicted `(avg+1)/2 = 1.20×`. Per-prompt 1.71× (accept 2.86/4) down to 0.86×.
+  - **Caveat (honest):** 1 of 4 prompts ("Q: What is 2+2? A:") **DIVERGED** from AR-greedy. β=1 is
+    lossless *by construction* (verify IS the AR argmax), but here AR and TiDAR are TWO different-shaped
+    bf16 forwards (`[committed]` vs `[committed+drafts]`/`[committed|mask*B]`), so a borderline argmax at
+    a low-entropy position can flip — an fp-nondeterminism artifact, not a logic bug (a real fused
+    single-model deploy verifies from its OWN forward, no separate baseline to diverge from). More likely
+    on this overfit, low-entropy checkpoint.
+  - **Verdict:** TiDAR serving works and gives a **modest** win on this checkpoint, gated by (i) the
+    two-forward constraint (the fused single forward would ≈ double it to `(k+1)/1 ≈ 2.4×` but is
+    §7.5-contaminated + §7.6-`position_ids`-gated) and (ii) low acceptance (1.4/4 — this checkpoint's
+    diffusion drafts are weak/overfit; a better-trained checkpoint is the real lever). The 4.6× blog
+    number assumes the fused forward + a clean model — neither holds here yet.
 
 GPU work: every job via `scripts/gpu-lease.sh -n 1 -- …` (TP=1); container `vllm22-w4a8:dflash-rxf`;
 warm Triton cache + `.env` (`HF_HOME` + `VLLM_HOST_TRITON_CACHE=/home/pat/code/.triton-cache-zaya-dflash`).

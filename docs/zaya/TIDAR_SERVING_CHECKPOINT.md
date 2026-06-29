@@ -62,16 +62,22 @@ they validate different things — check which exists (`ls /home/pat/code/vllm-g
   the mask goes in the attention backend, the evict reuses `cca.py:_decode_verify_spec`. See §1.
 
 ## NEXT (in order)
-1. **Loader designed to swap (§6.2).** Load the checkpoint into a serving harness. **Qwen-LoRA proxy
-   first** (no CCA, cheap) to validate mask/loop/sampler/coherence; then the **ZAYA** checkpoint for
-   the full path. Port `tidar_loop.py`'s forward/loop to call the real model's logits over
-   `[prefix | S | R_0..R_{B-1}]` with `additive_bias` (Route B `qq_bias` gate, or Route A attn_hip).
-2. **β=1 COHERENCE GATE — the losslessness pin (do this before anything else on the real model).**
-   Run the TiDAR single-forward decode loop at β=1 and assert the committed tokens are **identical**
-   to plain AR-greedy decode of the same model + prompts (the real-model analogue of `tidar_loop.py`
-   test D). This **empirically pins `replica_offset` + `sampling_causal` + the whole mask**. Start
-   with `replica_offset=0`. Only once this is token-identical do the off-by-one flags in §7.1 close.
-3. **Wire the mask into the real attention backend.** Route A (`attn_hip` square `mask_bias`,
+1. **[DONE 2026-06-28] Loader.** `zaya/tidar/serve_loader.py` loads the real ZAYA checkpoint
+   (`pat883/zaya1-8b-tidar-experts`, full-ft-all, block_size=4) via the Zyphra fork
+   (build-from-config + `load_state_dict`, 0 missing/0 unexpected). The Qwen-LoRA proxy was SKIPPED —
+   the real ZAYA checkpoint exists and loads cleanly, so the full CCA path was exercised directly.
+   ⚠ Loader MUST pass `attn_implementation="eager"` (the mask patch only works under eager; SDPA drops
+   the injected bias). Runs on CPU (17.7 GB bf16 fits host RAM, not a 16 GB card); fork venv at
+   `/home/pat/code/.venv-zaya-fork` ([[zaya-transformers-fork-reference]]).
+2. **[DONE 2026-06-28] β=1 COHERENCE GATE PASSED.** `zaya/tidar/coherence_gate.py` GATE B: β=1 TiDAR
+   decode == AR-greedy token-for-token on 4 prompts (varied tokens, not just `= = =`). Pins
+   **`replica_offset=0` + `sampling_causal=True`**. The lossless loop is **two-forward** (verify vs a
+   causal forward; diffusion drafts from a separate block forward) — the design's own `tidar_loop.py`
+   form. **NEW FINDING (GATE A):** the *fully-fused* single-forward (verify + B² mask replicas in one
+   pass) **contaminates the verify rows via a sequence-global op** (NOT attention) and is NOT viable on
+   ZAYA — production must keep verify isolated from the mask-replica scratch (refutes the one-forward
+   shortcut, `tidar_loop.py` test E). See design §9 + §7.5/§1.1.
+3. **[NEXT] Wire the mask into the real attention backend.** Route A (`attn_hip` square `mask_bias`,
    contiguous) for the first real run; **Route B** (`triton_overlay` `qq_bias` gate, paged) for
    production. Land the mask/metadata in `cca_attn.py` (the CCA attention metadata builder).
 4. **Fold the loop onto the real CCA path (ZAYA only).** Decode loop / β sampler / evict onto

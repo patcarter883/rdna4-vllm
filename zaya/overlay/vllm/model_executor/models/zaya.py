@@ -873,6 +873,29 @@ class ZayaForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsEagle3):
             self.model.make_empty_intermediate_tensors
         )
 
+        # TiDAR serving (step 3): install the triton_attn mask hook ONCE at model load so the
+        # standard self.attn path (ZayaAttention.forward -> self.attn -> triton_attn.unified_attention)
+        # can honor a per-step TiDAR mask carried on the module-level active-mask carrier
+        # (tidar_attn_metadata.py). The hook is ADDITIVE and NULL-SAFE: with no active mask on the
+        # carrier it calls through byte-identically (gpu_validate Part E), so installing it
+        # unconditionally is a no-op for a plain (non-TiDAR) decode serve. A request becomes a TiDAR
+        # step only when the proposer sets the carrier (TidarProposer.run_block) — never the hook's
+        # mere presence. Guarded: any import/install failure (CPU-only env, module not on path) is a
+        # silent no-op so a stock ZAYA serve is unaffected.
+        try:
+            from zaya.tidar.tidar_proposer import maybe_install_tidar_hook
+        except Exception:
+            try:  # the tidar dir may be mounted flat on PYTHONPATH (e.g. /tidar) rather than as a pkg
+                from tidar_proposer import maybe_install_tidar_hook  # type: ignore
+            except Exception:
+                maybe_install_tidar_hook = None  # type: ignore
+        if maybe_install_tidar_hook is not None:
+            try:
+                if maybe_install_tidar_hook():
+                    logger.info("TiDAR attn-mask hook installed (inert unless carrier set).")
+            except Exception:
+                logger.debug("TiDAR attn-mask hook install skipped.", exc_info=True)
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 

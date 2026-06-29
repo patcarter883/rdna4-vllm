@@ -887,6 +887,23 @@ class CCA(MambaBase, CustomOp):
         s = num_decode_seqs
         w = tp_pad + self.num_spec  # widened conv-state block width
         p = 1 + self.num_spec  # max candidate tokens per sequence
+        # TiDAR fold (serving step 4): this same (1 + num_spec) candidate-window
+        # conv + per-spec-position rollback IS the TiDAR evict-on-reject path.
+        # num_spec maps to the TiDAR block_len: the verify processes the whole
+        # [current state | block_len candidate tokens] block, writes the conv
+        # window + prev_hs ENDING at each candidate j to slot
+        # state_indices_2d[i, write_col[i, j]], and the next step reads slot
+        # (num_accepted - 1) = the accepted-prefix end. Appending the rejected
+        # tail then reading the accepted column IS the evict — no truncation.
+        # PROVEN equivalent to a from-scratch recompute of the accepted prefix on
+        # the REAL ZAYA conv/prev_hs (zaya/tidar/cca_evict_gate.py, max|Δ|=0.0 for
+        # k_accept 0..block_len) because conv_qk is causal (left-pad only). The
+        # TiDAR structured attention mask rides the SEPARATE standard-attention
+        # backend via the active-mask carrier (tidar_attn_metadata.py) +
+        # CCAAttentionMetadata.tidar_mask — NOT this conv producer, keeping verify
+        # ISOLATED from the mask-replica scratch (the §7.5 fusion-contamination
+        # finding). num_spec==0 ⇒ none of this runs (the elif-decode branch) ⇒
+        # the non-TiDAR path is byte-identical.
 
         # query_start_loc_d is None on steps the builder treats as plain
         # single-token decodes (no accepted-token layout): one token per seq.

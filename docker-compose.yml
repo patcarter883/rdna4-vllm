@@ -392,6 +392,52 @@ services:
       retries: 40
       start_period: 60s
 
+  # --- TiDAR serving bring-up: the converted ZAYA1-8B-Diffusion checkpoint (pat883/zaya1-8b-tidar-
+  #     experts) as a plain bf16 HF dir (built by repacking model_latest.pt -> safetensors + base
+  #     ZAYA config; the tied lm_head dropped). Unlike the fp8 `zaya` profile (-ep -dp=2 replicas,
+  #     fits 9 GB), the 16.5 GB bf16 weights need TP=2 to fit 2x16 GB → --tensor-parallel-size=2,
+  #     no -ep/-dp. This is the servable substrate for TiDAR throughput / §31g capture; the TiDAR
+  #     proposer/mask wiring (tidar_attn_metadata.py carrier + hook) rides on top later. ---
+  zaya-tidar:
+    <<: *combined-common
+    profiles: ["zaya-tidar"]
+    container_name: ${LEASE_NAME:-vllm22}-zaya-tidar
+    volumes:
+      - ${HF_HOME:-./.hf-cache}:/root/.cache/huggingface
+      - ${ZAYA_MODELS_DIR:-/home/pat/code}:/models:ro
+      - ${VLLM_HOST_TRITON_CACHE:-./.triton-cache-combined}:/root/.triton
+    ports:
+      - "${ZAYA_HOST_PORT:-8000}:8000"
+    environment:
+      <<: *combined-env
+      ROCR_VISIBLE_DEVICES: "${LEASE_ROCR_DEVICES:-0,1}"
+      HIP_VISIBLE_DEVICES: "${LEASE_HIP_DEVICES:-0,1}"
+      # bf16 weights: no quantized experts, so the W4A8 kernel never engages — leave it off.
+      VLLM_ROCM_USE_W4A8_FP8_WMMA: "${ZAYA_USE_W4A8:-0}"
+      ZAYA_CCA_HIP: "${ZAYA_CCA_HIP:-1}"
+      ZAYA_CCA_HIP_PREFILL: "${ZAYA_CCA_HIP_PREFILL:-1}"
+      ZAYA_CCA_DEBUG_PATHS: "${ZAYA_CCA_DEBUG_PATHS:-0}"
+    command:
+      - ${ZAYA_MODEL_ID:-/models/zaya1-8b-tidar-serve}
+      - --served-model-name=model
+      - --host=0.0.0.0
+      - --port=8000
+      - --trust-remote-code
+      - --dtype=bfloat16
+      - --tensor-parallel-size=2
+      - --max-model-len=${ZAYA_MAX_MODEL_LEN:-32768}
+      - --max-num-seqs=${ZAYA_MAX_NUM_SEQS:-16}
+      - --max-num-batched-tokens=${ZAYA_MAX_BATCHED:-32768}
+      - --mamba-cache-dtype=float32
+      - --gpu-memory-utilization=${ZAYA_GPU_MEMORY_UTIL:-0.92}
+      - --compilation-config=${VLLM_CUDAGRAPH_SIZES:-{"cudagraph_capture_sizes":[1,2,4,8,16,32,64]}}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=3).status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 60
+      start_period: 90s
+
   # --- RSA proxy: Recursive Self-Aggregation test-time compute, OpenAI-compatible shim in front
   #     of the zaya backend. Standalone, client-side, NO GPU (its own tiny image). ---
   rsa:
