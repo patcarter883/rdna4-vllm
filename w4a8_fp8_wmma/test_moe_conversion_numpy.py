@@ -111,8 +111,11 @@ def main():
              (3, 256, 64, 16), (1, 128, 128, 64)]
     res = [run_case(*c, rng=rng) for c in cases]
     print("=" * 50)
-    print("ALL PASSED" if all(res) else f"FAIL {sum(1 for r in res if not r)}/{len(res)}")
+    ok = all(res)
+    print("ALL PASSED" if ok else f"FAIL {sum(1 for r in res if not r)}/{len(res)}")
+    return ok
 
 
 if __name__ == "__main__":
-    main()
+    # Exit non-zero on failure so CI can gate on this (see .github/workflows/build-image.yml).
+    raise SystemExit(0 if main() else 1)

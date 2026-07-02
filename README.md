@@ -220,10 +220,12 @@ number always maps back to a commit.
 | stock, eager (profiling) | 510.8 | 1371.6 |
 
 - These are **offline** batched throughput (`bench_tp2.py`, fixed batch). The **served** HTTP
-  endpoint is memory-tighter: at the shipped `gpu-util=0.96` the 16 GB cards have ~no headroom,
-  so **heavy concurrent *streaming* load can OOM** (a single non-streaming burst of 32 sustained
-  ~900 tok/s gen, but `vllm bench serve` streaming at conc 16/32 hit `HIP out of memory`). For a
-  robust HTTP server under concurrent streaming, lower `gpu-util` (e.g. 0.90) or `max-num-seqs`.
+  endpoint is memory-tighter, so the `serve` profile now ships **`gpu-util=0.90`** (not the
+  bench's aggressive setting): at high util the 16 GB cards have ~no headroom, and **heavy
+  concurrent *streaming* load OOMs** (a single non-streaming burst of 32 sustained ~900 tok/s gen,
+  but `vllm bench serve` streaming at conc 16/32 hit `HIP out of memory` at 0.96). 0.90 trades a
+  little KV cache for a server that survives streaming out of the box; raise it via
+  `VLLM_GPU_MEMORY_UTIL` (or lower `max-num-seqs`) once you know your load fits.
 - **Cudagraphs are the throughput win: +87 %** decode over eager (957 vs 511) on this stack.
 - On the 35B, **W4A8 is ~4 % under stock** under graphs — it quantizes only the MoE experts and
   graphs don't help MoE; its dense-path win is on other models. (The graph-compat work's value

@@ -34,7 +34,11 @@ on:
         type: boolean
         default: false
   push:
+    branches: ["main"]    # lint + CPU tests on main
     tags: ["v*"]          # tag releases auto-build + push
+  pull_request:           # lint + CPU tests on every PR (no build/push — see the `build` job gate)
+  schedule:
+    - cron: "0 6 * * 1"   # weekly base-image drift guard (Mon 06:00 UTC) — see the `base-drift` job
 
 permissions:
   contents: read
@@ -60,12 +64,59 @@ jobs:
         run: docker compose config -q
       - name: het_tp helper CPU self-tests
         run: pip install -q torch --index-url https://download.pytorch.org/whl/cpu && python patches/het_tp.py
+      - name: W4A8 int4->fp8 conversion numerics (CPU, numpy-only)
+        # Pure-numpy golden checks of the MoE weight packing/dequant math (asymmetric + CT/symmetric):
+        # catches an axis/transpose/pack regression in the W4A8 kernel's host-side conversion without
+        # a GPU. These exit non-zero on failure. The GPU kernel/e2e tests still gate on real hardware.
+        run: |
+          pip install -q numpy
+          python w4a8_fp8_wmma/test_moe_conversion_numpy.py
+          python w4a8_fp8_wmma/test_moe_conversion_ct_numpy.py
       - name: patched Python files parse
         run: python -c "import ast,glob,sys; [ast.parse(open(f).read(), f) for f in glob.glob('patches/*.py')]; print('ast ok')"
       - name: shell scripts parse
         run: bash -n scripts/*.sh
 
+  # ---------------------------------------------------------------------------
+  # Weekly base-image drift guard. The stack pins the base by DIGEST
+  # (ARG BASE_IMAGE=tcclaviger/vllm22@sha256:... in Dockerfile.combined), so it
+  # cannot silently move under us — but two things still drift:
+  #   1. the pinned digest can be GC'd/deleted from the registry (then our build
+  #      breaks the next time it can't be pulled from cache), and
+  #   2. the mutable :dev tag can move to a newer base worth bumping to.
+  # This checks both WITHOUT pulling the ~28 GB image: it FAILS if the pinned
+  # digest no longer resolves, and WARNS (non-fatal) when :dev has drifted off
+  # the pin. Surfaces base rot on our schedule instead of in a user's build.
+  # ---------------------------------------------------------------------------
+  base-drift:
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pinned base digest still resolves; report :dev drift
+        run: |
+          set -euo pipefail
+          PIN="$(grep -oP 'ARG BASE_IMAGE=\K\S+' Dockerfile.combined)"
+          REPO="${PIN%@*}"; PIN_DIGEST="${PIN#*@}"
+          echo "Pinned base: $PIN"
+          if ! docker buildx imagetools inspect "$PIN" >/dev/null 2>&1; then
+            echo "::error::Pinned base digest no longer resolves: $PIN — the build will break. Re-pin per the bump procedure in Dockerfile.combined."
+            exit 1
+          fi
+          echo "Pinned digest resolves OK."
+          DEV_DIGEST="$(docker buildx imagetools inspect "$REPO:dev" --format '{{.Manifest.Digest}}' 2>/dev/null || true)"
+          if [ -n "$DEV_DIGEST" ] && [ "$DEV_DIGEST" != "$PIN_DIGEST" ]; then
+            echo "::warning::$REPO:dev has moved to $DEV_DIGEST (pinned $PIN_DIGEST). A newer base may be available — consider bumping the pin (Dockerfile.combined bump procedure) and re-running the ABI import check."
+          else
+            echo ":dev matches the pin (or was unavailable to compare)."
+          fi
+
   build:
+    # Heavy: pulls the ~28 GB base and builds the W4A8 layer, and (when push=true) writes to GHCR.
+    # Keep it to the pre-existing trigger surface — manual dispatch or a `v*` tag — so the new
+    # branch-push / pull_request / schedule triggers only ever run the cheap `lint` + `base-drift`
+    # jobs, never a build or a registry push.
+    if: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     steps:
       # Reclaim ~25 GB on GitHub-hosted runners (skipped on self-hosted).

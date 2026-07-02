@@ -126,7 +126,12 @@ services:
       # this memory budget on 16 GB TP=2. Cap concurrency at/below that (vLLM trims cudagraph
       # capture sizes to <= max_num_seqs automatically). Raise with more VRAM / higher util.
       - --max-num-seqs=${VLLM_MAX_NUM_SEQS:-8}
-      - --gpu-memory-utilization=${VLLM_GPU_MEMORY_UTIL:-0.95}
+      # 0.90, not 0.96/0.95: the HTTP server is memory-tighter than the offline bench. At high
+      # util the 16 GB cards have ~no headroom, and concurrent *streaming* load (vllm bench serve
+      # at conc 16/32) hits `HIP out of memory` — see README "Verifying / benchmarking". 0.90 trades
+      # a little KV cache for a server that survives real streaming out of the box; the offline
+      # headline still runs the aggressive setting via the `bench` profile. Raise with more VRAM.
+      - --gpu-memory-utilization=${VLLM_GPU_MEMORY_UTIL:-0.90}
       # Conservative cudagraph capture set for RDNA4/ROCm. The vLLM default (51 sizes up to 512)
       # under FULL_AND_PIECEWISE stalls/hangs capture on ROCm and wastes VRAM (vLLM #19579/#39010;
       # AMD/verl tuning guidance) — and these 16 GB cards serve low-batch anyway. Capture only the
