@@ -32,6 +32,17 @@
 # auto_gptq_qzeros). Conflict-checked against our patches before bumping: torch/py/triton
 # byte-identical (no W4A8 ABI break, Triton cache stays valid), het-TP + ZAYA + moe_wna16 sed
 # all apply clean, and the changes vs the prior 2026-06-14 base are additive / off our path.
+#   DRIFT STATUS 2026-07-02: `:dev` has since MOVED to
+#   sha256:8589bdc51eaa3725a5d53183b40bd4ffb370534feff6cb38c01736c38ca7a94a (our pin below is now
+#   also `:latest`). The new `:dev` is a substantial rebuild but off our path: it recompiles vLLM
+#   `_C` in-image from csrc/ (against the SAME torch 2.10.0+git8514f05 — no ABI shift), adds quant
+#   schemes rfa/rfi/rx2 + kvarn (KV-cache) + an rdna4_fp8 MoE path + a MiniMax-M3 fused op, adds an
+#   RCCL soname shim (librccl.so.1.0.70201 -> .70101), and deletes the old rfp458 files (rfp458 kept
+#   as a legacy alias -> RFAConfig). Static re-validation vs the new `:dev` PASSED: toolchain
+#   byte-identical (py 3.12.13 / torch git8514f05 / HIP 7.2.53211 / triton 3.6.0 / vllm 0.22.69),
+#   W4A8 kernel builds + imports OK (ABI intact), and moe_wna16 sed + het-TP + gdn_hip + ZAYA + attn
+#   patches all apply + parse. Pin is INTENTIONALLY held at ad046fde pending the on-hardware gfx1201
+#   serve smoke (the one step that can't run off-GPU); bump only after that passes.
 #   Bump procedure: `docker pull tcclaviger/vllm22:dev` then
 #   `docker inspect tcclaviger/vllm22:dev --format '{{index .RepoDigests 0}}'`, paste the new
 #   `name@sha256:...` here, and re-run the in-image import check (CONTRIBUTING.md) before relying on it.
