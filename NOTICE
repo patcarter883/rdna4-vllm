@@ -6,29 +6,37 @@ It would not exist without the following. Please preserve this NOTICE and the
 upstream licenses in any redistribution.
 
 The ONLY original contributions in this repository are:
-  - the gfx1201 (RDNA4) enablement edits to vLLM / aiter / flash-attention,
-  - the Docker build/inject packaging and compose profiles, and
-  - the W4A8-FP8-WMMA MoE kernel (w4a8_fp8_wmma/).
+  - the native HIP compute kernels — GDN (gdn_hip/), attention decode +
+    paged prefill (attn_decode/, attn_prefill_paged/), ZAYA CCA (zaya/cca_hip/),
+    and the W4A8-FP8-WMMA MoE kernel (w4a8_fp8_wmma/) — framework-agnostic
+    torch.ops extensions co-developed with, and shared by, the sibling
+    minisgl-rdna4 project. These now carry the heavy compute and superseded the
+    earlier aiter / flash-attention / Composable-Kernel path (a dead end here).
+  - the gfx1201 (RDNA4) vLLM platform-enablement edits, and
+  - the Docker build/inject packaging and compose profiles.
 Everything else is upstream, credited below.
 
 Upstream projects and people
 ----------------------------
-- The base image — tcclaviger/vllm22:dev (@tcclaviger), the collaborator's
-  tuned-attention vLLM 0.22.69 build for RDNA4 (gfx1201): ROCm 7.2.1, torch 2.10,
-  Python 3.12. The combined image is `FROM` this base, and almost everything runs
-  here: the serving engine, the RDNA4-tuned attention (the collaborator built the
-  entire attention half independently), and the RXF ("Rotated eXtra Fast") W4A8
-  quant path (successor to RFP458). aiter and flash-attention are vendored inside
-  this base too (see below).
+- The base image — tcclaviger/vllm22:dev (@tcclaviger): the vLLM 0.22.69 serving
+  engine and the RDNA4 (gfx1201) runtime — ROCm 7.2.1, torch 2.10, Python 3.12.
+  The combined image is `FROM` this base and runs vLLM's engine and scheduler;
+  the heavy compute now runs through our native HIP kernels (above) rather than
+  the base's attention/GEMM backends.
 - vLLM — vllm-project/vllm (Apache-2.0). The serving engine, shipped by the base
   image (vLLM 0.22.69). Our changes are a small ROCm platform-enablement edit plus
   the moe_wna16 tp_size fix (a generic upstream bug — owed back as a PR; see
   patches/upstream/). Thanks to @micah and the ROCm vLLM team.
-- AMD aiter — ROCm/aiter (MIT/Apache) — and Dao-AILab flash-attention
-  (Dao-AILab/flash-attention, BSD-3-Clause) with ROCm Composable Kernel
-  (ROCm/composable_kernel, MIT) as the CK FMHA backend. These come from the base
-  image. The five A8W8 GEMM config JSONs originate from @carhuang's
-  `carhuang/gfx1201_silu_and_mul_and_a8w8_configs_rebased` branch. Thanks to @tridao.
+- mini-SGLang / SGLang (sgl-project) — the serving-systems design lineage the
+  sibling minisgl-rdna4 project draws on, and the context in which the shared
+  native HIP kernels were developed. See docs/MINISGLANG_PATHWAYS.md.
+- AMD aiter (ROCm/aiter, MIT/Apache), Dao-AILab flash-attention
+  (Dao-AILab/flash-attention, BSD-3-Clause) and ROCm Composable Kernel
+  (ROCm/composable_kernel, MIT, the CK FMHA backend) — evaluated as the
+  attention/GEMM backends, but the shipped path moved to our native HIP kernels
+  and no longer uses them. Kept for credit/history. The five A8W8 GEMM config
+  JSONs from @carhuang's `carhuang/gfx1201_silu_and_mul_and_a8w8_configs_rebased`
+  branch informed the early tuning. Thanks to @tridao.
 - AMD ROCm / TheRock — the base of the *retired* wheel-distribution path, which
   built three gfx1201 wheels (vLLM / aiter / flash-attention) from source against
   AMD's TheRock (rocm/vllm-dev:nightly-therock714, ROCm 7.14) and the torch/triton

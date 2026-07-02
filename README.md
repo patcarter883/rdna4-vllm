@@ -19,16 +19,18 @@
 
 This repo brings up [vLLM](https://github.com/vllm-project/vllm) on **AMD RDNA4** GPUs —
 gfx1201 (RX 9070 XT / 9070) — which the stock ROCm vLLM image does not support. It layers
-our **W4A8-FP8-WMMA MoE kernel** (built in-image from the in-repo `w4a8_fp8_wmma/` source)
-plus a surgical `moe_wna16` source fix onto the collaborator's tuned-attention vLLM 0.22.69
-base image (`tcclaviger/vllm22:dev`), which provides the engine + RDNA4 attention. The goal
-is: clone, set one env var, `docker compose up`.
+our **native HIP compute kernels** (GDN, attention, and the W4A8-FP8-WMMA MoE kernel from the
+in-repo `gdn_hip/`, `attn_decode/`, `attn_prefill_paged/`, `w4a8_fp8_wmma/` sources) plus a
+surgical `moe_wna16` source fix onto the base image (`tcclaviger/vllm22:dev`), which provides
+the vLLM engine + ROCm/torch runtime. The goal is: clone, set one env var, `docker compose up`.
 
-> ⚠️ **This is overwhelmingly other people's work.** The serving engine is vLLM;
-> the base image is the collaborator's (`tcclaviger/vllm22:dev`), which provides the
-> tuned RDNA4 attention and the RXF quant path, and in turn builds on AMD ROCm, aiter,
-> and Dao-AILab flash-attention. See [NOTICE](NOTICE) for full credits. The only
-> original parts here are the gfx1201 enablement, the packaging, and the W4A8 kernel.
+> ⚠️ **The serving engine and runtime are other people's work.** The vLLM engine
+> and the ROCm/torch runtime come from the base image (`tcclaviger/vllm22:dev`,
+> @tcclaviger). The heavy compute, though, now runs through our own **native HIP
+> kernels** (GDN, attention, ZAYA CCA, and the W4A8-FP8-WMMA MoE kernel) — shared with
+> the sibling `minisgl-rdna4` project and drawing on SGLang's design lineage. They
+> replaced the earlier aiter / flash-attention / Composable-Kernel path, which was a
+> dead end here. See [NOTICE](NOTICE) for full credits.
 
 ---
 
