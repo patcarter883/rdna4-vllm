@@ -19,10 +19,12 @@ Everything else is upstream, credited below.
 Upstream projects and people
 ----------------------------
 - The base image — tcclaviger/vllm22:dev (@tcclaviger): the vLLM 0.22.69 serving
-  engine and the RDNA4 (gfx1201) runtime — ROCm 7.2.1, torch 2.10, Python 3.12.
-  The combined image is `FROM` this base and runs vLLM's engine and scheduler;
-  the heavy compute now runs through our native HIP kernels (above) rather than
-  the base's attention/GEMM backends.
+  engine, the RDNA4 (gfx1201) runtime (ROCm 7.2.1, torch 2.10, Python 3.12), and
+  the RXF ("Rotated eXtra Fast") W4A8 quant path — int8×int8 with an IQ4-NL
+  codebook + FWHT-32 activation rotation — which still ships directly from
+  upstream, unmodified by us. The combined image is `FROM` this base and runs
+  vLLM's engine and scheduler; the attention / GDN / CCA compute now runs through
+  our native HIP kernels (above) rather than the base's attention/GEMM backends.
 - vLLM — vllm-project/vllm (Apache-2.0). The serving engine, shipped by the base
   image (vLLM 0.22.69). Our changes are a small ROCm platform-enablement edit plus
   the moe_wna16 tp_size fix (a generic upstream bug — owed back as a PR; see

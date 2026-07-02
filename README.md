@@ -22,15 +22,16 @@ gfx1201 (RX 9070 XT / 9070) — which the stock ROCm vLLM image does not support
 our **native HIP compute kernels** (GDN, attention, and the W4A8-FP8-WMMA MoE kernel from the
 in-repo `gdn_hip/`, `attn_decode/`, `attn_prefill_paged/`, `w4a8_fp8_wmma/` sources) plus a
 surgical `moe_wna16` source fix onto the base image (`tcclaviger/vllm22:dev`), which provides
-the vLLM engine + ROCm/torch runtime. The goal is: clone, set one env var, `docker compose up`.
+the vLLM engine, the ROCm/torch runtime, and the upstream RXF W4A8 quant path. The goal is:
+clone, set one env var, `docker compose up`.
 
-> ⚠️ **The serving engine and runtime are other people's work.** The vLLM engine
-> and the ROCm/torch runtime come from the base image (`tcclaviger/vllm22:dev`,
-> @tcclaviger). The heavy compute, though, now runs through our own **native HIP
-> kernels** (GDN, attention, ZAYA CCA, and the W4A8-FP8-WMMA MoE kernel) — shared with
-> the sibling `minisgl-rdna4` project and drawing on SGLang's design lineage. They
-> replaced the earlier aiter / flash-attention / Composable-Kernel path, which was a
-> dead end here. See [NOTICE](NOTICE) for full credits.
+> ⚠️ **The serving engine and runtime are other people's work.** The vLLM engine, the
+> ROCm/torch runtime, and the upstream **RXF** W4A8 quant path come from the base image
+> (`tcclaviger/vllm22:dev`, @tcclaviger). The attention / GDN / CCA compute, though, now
+> runs through our own **native HIP kernels** (plus the W4A8-FP8-WMMA MoE kernel) — shared
+> with the sibling `minisgl-rdna4` project and drawing on SGLang's design lineage. They
+> replaced the earlier aiter / flash-attention / Composable-Kernel path, which was a dead
+> end here. See [NOTICE](NOTICE) for full credits.
 
 ---
 
