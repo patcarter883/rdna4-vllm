@@ -25,8 +25,9 @@ base image (`tcclaviger/vllm22:dev`), which provides the engine + RDNA4 attentio
 is: clone, set one env var, `docker compose up`.
 
 > ⚠️ **This is overwhelmingly other people's work.** The serving engine is vLLM;
-> the kernels are AMD aiter, Dao-AILab flash-attention, and Composable Kernel; the
-> base image is AMD's TheRock. See [NOTICE](NOTICE) for full credits. The only
+> the base image is the collaborator's (`tcclaviger/vllm22:dev`), which provides the
+> tuned RDNA4 attention and the RXF quant path, and in turn builds on AMD ROCm, aiter,
+> and Dao-AILab flash-attention. See [NOTICE](NOTICE) for full credits. The only
 > original parts here are the gfx1201 enablement, the packaging, and the W4A8 kernel.
 
 ---

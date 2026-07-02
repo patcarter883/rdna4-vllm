@@ -13,19 +13,27 @@ Everything else is upstream, credited below.
 
 Upstream projects and people
 ----------------------------
-- vLLM — vllm-project/vllm (Apache-2.0). The entire serving engine. Our gfx1201
-  vLLM wheel is built from the ROCm/vllm fork's `micah/therock-nightly` branch;
-  thanks to @micah and the ROCm vLLM team. Our changes are a small ROCm
-  platform-enablement edit plus the moe_wna16 tp_size fix (a generic upstream
-  bug — owed back as a PR).
-- AMD ROCm / TheRock — the base image rocm/vllm-dev:nightly-therock714, the
-  ROCm 7.14 SDK, and the torch/triton nightlies (various AMD/OSS licenses).
-- AMD aiter — ROCm/aiter (MIT/Apache). Our aiter wheel is their tree plus
-  gfx1201 enablement. The five A8W8 GEMM config JSONs come directly from
-  @carhuang's `carhuang/gfx1201_silu_and_mul_and_a8w8_configs_rebased` branch.
-- Dao-AILab flash-attention — Dao-AILab/flash-attention (BSD-3-Clause), and
-  ROCm Composable Kernel (ROCm/composable_kernel, MIT) for the CK FMHA backend.
-  Thanks to @tridao.
+- The base image — tcclaviger/vllm22:dev (@tcclaviger), the collaborator's
+  tuned-attention vLLM 0.22.69 build for RDNA4 (gfx1201): ROCm 7.2.1, torch 2.10,
+  Python 3.12. The combined image is `FROM` this base, and almost everything runs
+  here: the serving engine, the RDNA4-tuned attention (the collaborator built the
+  entire attention half independently), and the RXF ("Rotated eXtra Fast") W4A8
+  quant path (successor to RFP458). aiter and flash-attention are vendored inside
+  this base too (see below).
+- vLLM — vllm-project/vllm (Apache-2.0). The serving engine, shipped by the base
+  image (vLLM 0.22.69). Our changes are a small ROCm platform-enablement edit plus
+  the moe_wna16 tp_size fix (a generic upstream bug — owed back as a PR; see
+  patches/upstream/). Thanks to @micah and the ROCm vLLM team.
+- AMD aiter — ROCm/aiter (MIT/Apache) — and Dao-AILab flash-attention
+  (Dao-AILab/flash-attention, BSD-3-Clause) with ROCm Composable Kernel
+  (ROCm/composable_kernel, MIT) as the CK FMHA backend. These come from the base
+  image. The five A8W8 GEMM config JSONs originate from @carhuang's
+  `carhuang/gfx1201_silu_and_mul_and_a8w8_configs_rebased` branch. Thanks to @tridao.
+- AMD ROCm / TheRock — the base of the *retired* wheel-distribution path, which
+  built three gfx1201 wheels (vLLM / aiter / flash-attention) from source against
+  AMD's TheRock (rocm/vllm-dev:nightly-therock714, ROCm 7.14) and the torch/triton
+  nightlies. That path is archived on `archive/aiter-wheel-distribution`; the
+  current stack no longer uses it (the base image above supersedes it).
 - tilelang — the Qwen3_5Moe linear-attention (MHC) kernel path (upstream
   integration PR #43679).
 - @kyuz0 — prior gfx1201 vLLM / ROCm-on-RDNA4 containers and PRs (e.g. the ViT
