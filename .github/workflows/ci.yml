@@ -1,0 +1,90 @@
+# CI for the gfx1201 vLLM stack.
+#
+# This repo is GLUE ON TOP OF the upstream base image (tcclaviger/vllm22, pinned by digest in
+# Dockerfile.combined): the W4A8 kernel builds in-image from w4a8_fp8_wmma/, and users bring the
+# stack up locally with `docker compose up --build` (README quick start). We no longer build or
+# publish a combined image to GHCR — everything layers on the upstream image — so CI does two
+# things only:
+#   1. cheap lint + CPU-only numeric tests on our glue (no GPU, no base pull), and
+#   2. a weekly guard that the pinned upstream base still resolves, plus a heads-up when the
+#      mutable :dev tag has moved to a newer base worth bumping to.
+# Real image/kernel validation still happens on gfx1201 hardware per CLAUDE.md (a GPU smoke is
+# not something a hosted runner can do without a self-hosted card).
+
+name: ci
+
+on:
+  push:
+    branches: ["main"]    # lint + CPU tests on main
+  pull_request:           # lint + CPU tests on every PR
+  schedule:
+    - cron: "0 6 * * 1"   # weekly base-image drift guard (Mon 06:00 UTC) — see the `base-drift` job
+  workflow_dispatch:      # run lint + the drift check on demand
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Non-GPU lint/sanity + CPU numeric tests. Runs on every push + PR; no hardware,
+  # no base-image pull. Catches the cheap regressions (broken compose, a patch
+  # helper that no longer self-tests, an unparseable patched file, a W4A8
+  # conversion-math regression) before anyone burns a GPU window.
+  # ---------------------------------------------------------------------------
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: docker compose config is valid
+        run: docker compose config -q
+      - name: het_tp helper CPU self-tests
+        run: pip install -q torch --index-url https://download.pytorch.org/whl/cpu && python patches/het_tp.py
+      - name: W4A8 int4->fp8 conversion numerics (CPU, numpy-only)
+        # Pure-numpy golden checks of the MoE weight packing/dequant math (asymmetric + CT/symmetric):
+        # catches an axis/transpose/pack regression in the W4A8 kernel's host-side conversion without
+        # a GPU. These exit non-zero on failure. The GPU kernel/e2e tests still gate on real hardware.
+        run: |
+          pip install -q numpy
+          python w4a8_fp8_wmma/test_moe_conversion_numpy.py
+          python w4a8_fp8_wmma/test_moe_conversion_ct_numpy.py
+      - name: patched Python files parse
+        run: python -c "import ast,glob,sys; [ast.parse(open(f).read(), f) for f in glob.glob('patches/*.py')]; print('ast ok')"
+      - name: shell scripts parse
+        run: bash -n scripts/*.sh
+
+  # ---------------------------------------------------------------------------
+  # Weekly base-image drift guard. The stack pins the base by DIGEST
+  # (ARG BASE_IMAGE=tcclaviger/vllm22@sha256:... in Dockerfile.combined), so it
+  # cannot silently move under us — but two things still drift:
+  #   1. the pinned digest can be GC'd/deleted from the registry (then a fresh
+  #      `docker compose build` can't pull the base), and
+  #   2. the mutable :dev tag can move to a newer base worth bumping to.
+  # This checks both WITHOUT pulling the ~5 GB image: it FAILS if the pinned
+  # digest no longer resolves, and WARNS (non-fatal) when :dev has drifted off
+  # the pin. Surfaces base rot on our schedule instead of in a user's build.
+  # ---------------------------------------------------------------------------
+  base-drift:
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pinned base digest still resolves; report :dev drift
+        run: |
+          set -euo pipefail
+          PIN="$(grep -oP 'ARG BASE_IMAGE=\K\S+' Dockerfile.combined)"
+          REPO="${PIN%@*}"; PIN_DIGEST="${PIN#*@}"
+          echo "Pinned base: $PIN"
+          if ! docker buildx imagetools inspect "$PIN" >/dev/null 2>&1; then
+            echo "::error::Pinned base digest no longer resolves: $PIN — a fresh build can't pull the base. Re-pin per the bump procedure in Dockerfile.combined."
+            exit 1
+          fi
+          echo "Pinned digest resolves OK."
+          DEV_DIGEST="$(docker buildx imagetools inspect "$REPO:dev" --format '{{.Manifest.Digest}}' 2>/dev/null || true)"
+          if [ -n "$DEV_DIGEST" ] && [ "$DEV_DIGEST" != "$PIN_DIGEST" ]; then
+            echo "::warning::$REPO:dev has moved to $DEV_DIGEST (pinned $PIN_DIGEST). A newer base may be available — consider bumping the pin (Dockerfile.combined bump procedure) and re-running the ABI import check."
+          else
+            echo ":dev matches the pin (or was unavailable to compare)."
+          fi

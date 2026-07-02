@@ -96,5 +96,5 @@ def main():
 
 
 if __name__ == "__main__":
-    # Exit non-zero on failure so CI can gate on this (see .github/workflows/build-image.yml).
+    # Exit non-zero on failure so CI can gate on this (see .github/workflows/ci.yml).
     raise SystemExit(0 if main() else 1)

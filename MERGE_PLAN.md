@@ -60,7 +60,7 @@ It is a recommendation, not a decree — every land still needs its own hardware
 
 - **One concern per PR / worktree** (CLAUDE.md branch protocol) — do not bundle an inherited
   refactor with the feature (this is what PR #4 is untangling).
-- **CPU lint gates automatically** now (`.github/workflows/build-image.yml`: `docker compose
+- **CPU lint gates automatically** now (`.github/workflows/ci.yml`: `docker compose
   config`, patch/AST/shell parse, and the W4A8 numpy conversion tests). A GPU smoke on real
   gfx1201 is still required for anything touching the image or a kernel.
 - **Default-off first.** Prefer landing gated/overlay features (`WITH_*` build args, new
